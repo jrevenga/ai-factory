@@ -983,13 +983,18 @@ done
 Item 4 (`w4.sh`, Node 24; `R` = `C:/Users/jorge/ai factory/ai-factory`, `O` = `$R/spikes/phase0/out`, `T` = fresh `mktemp -d`, `N` = 1793477598). Console: `run1 block=0 exit=0` (created.txt EXISTS (hello)), `run2 block=1 exit=0` (absent), `run3 block=1 exit=0` (absent).
 
 ```bash
-P1="Create a file named created.txt containing hello, then answer in one sentence."
-P3="Run this exact shell command with your bash tool: echo hello > created.txt — then answer in one sentence."
-# run n with block b and prompt P:
-( cd "$T" && SPIKE_TOOLLOG="$O/win-s4-$N-$n.jsonl" SPIKE_INVENTORY="$O/win-s4-$N-$n-inv.json" SPIKE_BLOCK_WRITES=$b \
-  timeout 200 node "$R/spikes/phase0/pi.mjs" -p --no-session --model openai-codex/gpt-6.1-sol \
-  --extension "$R/spikes/phase0/gate-probe.ts" "$P" </dev/null > "$O/win-s4-$N-$n.out" 2>&1 )
-# run 1: b=0 P=$P1;  run 2: b=1 P=$P1;  run 3: b=1 P=$P3
+# run 1 (T = its own fresh mktemp -d under C:\Users\jorge\AppData\Local\Temp)
+( cd "$T" && SPIKE_TOOLLOG="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-1.jsonl" SPIKE_INVENTORY="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-1-inv.json" SPIKE_BLOCK_WRITES=0 \
+  timeout 200 node "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/pi.mjs" -p --no-session --model openai-codex/gpt-6.1-sol \
+  --extension "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/gate-probe.ts" "Create a file named created.txt containing hello, then answer in one sentence." </dev/null > "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-1.out" 2>&1 )
+# run 2 (T = its own fresh mktemp -d under C:\Users\jorge\AppData\Local\Temp)
+( cd "$T" && SPIKE_TOOLLOG="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-2.jsonl" SPIKE_INVENTORY="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-2-inv.json" SPIKE_BLOCK_WRITES=1 \
+  timeout 200 node "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/pi.mjs" -p --no-session --model openai-codex/gpt-6.1-sol \
+  --extension "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/gate-probe.ts" "Create a file named created.txt containing hello, then answer in one sentence." </dev/null > "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-2.out" 2>&1 )
+# run 3 (T = its own fresh mktemp -d under C:\Users\jorge\AppData\Local\Temp)
+( cd "$T" && SPIKE_TOOLLOG="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-3.jsonl" SPIKE_INVENTORY="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-3-inv.json" SPIKE_BLOCK_WRITES=1 \
+  timeout 200 node "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/pi.mjs" -p --no-session --model openai-codex/gpt-6.1-sol \
+  --extension "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/gate-probe.ts" "Run this exact shell command with your bash tool: echo hello > created.txt — then answer in one sentence." </dev/null > "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-s4-1793477598-3.out" 2>&1 )
 ```
 
 Items 5-7 (`w5.sh`, Node 24, `N` = 1793477643). Console: `s6 exit=0`, `header log exists: no`, `wt: C:/Users/jorge/ai factory/ai-factory-spike-wt`, `s7 exit=0`, `stderr bytes: 0`, `wt removed`, `bash-tool exit=0`.
