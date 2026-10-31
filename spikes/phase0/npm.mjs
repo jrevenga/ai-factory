@@ -1,15 +1,11 @@
 // Isolated npm/npx runner. Usage: node spikes/phase0/npm.mjs <scenario> <npm|npx> <args...>
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
+import { cleanEnv, realInside, realTarget } from "./pi.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-
-function inside(parent, child) {
-  const rel = path.relative(parent, child);
-  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
-}
 
 function fail(msg) {
   throw new Error(`npm.mjs: ${msg}`);
@@ -32,12 +28,12 @@ export function runNpm(tool, args, opts) {
   if (!scenario || !/^[A-Za-z0-9_-]+$/.test(scenario)) fail("a simple scenario name is required");
   const prefix = path.join(root, `.npm-global-${scenario}`);
   const cache = path.join(root, "out", `npm-cache-${scenario}`);
-  if (!inside(root, prefix) || !inside(root, cache)) fail("prefix/cache resolve outside spikes/phase0");
-  const env = { ...process.env, ...(opts.env ?? {}), npm_config_prefix: prefix, npm_config_cache: cache };
-  for (const k of Object.keys(env)) if (k.startsWith("ANTHROPIC_")) delete env[k];
-  for (const k of ["npm_config_prefix", "npm_config_cache"]) {
-    if (!inside(root, path.resolve(env[k]))) fail(`${k} escaped isolation`);
+  for (const [name, p] of [["npm_config_prefix", prefix], ["npm_config_cache", cache]]) {
+    if (!realInside(p)) fail(`${name}=${p} resolves outside spikes/phase0 or to ~/.pi/agent (real path ${realTarget(p)})`);
   }
+  const env = cleanEnv({ ...process.env, ...(opts.env ?? {}) });
+  env.npm_config_prefix = prefix;
+  env.npm_config_cache = cache;
   const entry = npmEntry(tool);
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [entry, ...args], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
