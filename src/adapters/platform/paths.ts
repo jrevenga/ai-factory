@@ -1,7 +1,8 @@
 // Every filesystem location the factory reads or writes, derived from FACTORY_HOME and
 // PI_CODING_AGENT_DIR (defaults ~/.factory and ~/.pi/agent).
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { resolveFactoryHome, resolvePiAgentDir } from "../../core/paths/homes.ts";
 
 export interface FactoryPaths {
   home: string;
@@ -20,16 +21,9 @@ export interface FactoryPaths {
   piExtensions: string;
 }
 
-/** Expands a leading `~` the way Pi does for PI_CODING_AGENT_DIR, then makes the path absolute. */
-function absolute(p: string): string {
-  if (p === "~") return homedir();
-  if (p.startsWith("~/") || (process.platform === "win32" && p.startsWith("~\\"))) return join(homedir(), p.slice(2));
-  return resolve(p);
-}
-
 export function factoryPaths(env: NodeJS.ProcessEnv = process.env): FactoryPaths {
-  const home = env.FACTORY_HOME ? absolute(env.FACTORY_HOME) : join(homedir(), ".factory");
-  const piAgentDir = env.PI_CODING_AGENT_DIR ? absolute(env.PI_CODING_AGENT_DIR) : join(homedir(), ".pi", "agent");
+  const home = resolveFactoryHome(env, homedir());
+  const piAgentDir = resolvePiAgentDir(env, homedir());
   return {
     home,
     config: join(home, "config.json"),

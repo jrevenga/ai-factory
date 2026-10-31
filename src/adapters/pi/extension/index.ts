@@ -3,10 +3,9 @@
 // personal config parses and that FACTORY_HOME is writable, then emits `factory:handshake` for the
 // guard (ruling 8). While the handshake has failed, its own tool_call handler blocks every tool except
 // the read-only ones, which covers "loaded but handshake failed" even without the guard file.
-import { randomBytes } from "node:crypto";
-import { readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PersonalConfig } from "../../../core/config/schema.ts";
@@ -17,18 +16,11 @@ import {
   READ_ONLY_TOOLS,
   type HandshakeResult,
 } from "../../../core/handshake.ts";
+import { resolveFactoryHome } from "../../../core/paths/homes.ts";
 import { FactoryState } from "../../../core/state/schema.ts";
+import { storeWritable } from "./store-probe.ts";
 
 const PACKAGE_JSON = fileURLToPath(new URL("../../../../package.json", import.meta.url));
-
-/** Same resolution as src/adapters/platform/paths.ts (which the extension may not import). */
-function factoryHome(env: NodeJS.ProcessEnv): string {
-  const p = env.FACTORY_HOME;
-  if (!p) return join(homedir(), ".factory");
-  if (p === "~") return homedir();
-  if (p.startsWith("~/") || (process.platform === "win32" && p.startsWith("~\\"))) return join(homedir(), p.slice(2));
-  return resolve(p);
-}
 
 type Read = { kind: "missing" } | { kind: "json"; value: unknown } | { kind: "error" };
 
@@ -71,19 +63,8 @@ async function configOk(home: string): Promise<boolean> {
   return r.kind === "json" && PersonalConfig.safeParse(r.value).success;
 }
 
-async function storeWritable(home: string): Promise<boolean> {
-  const probe = join(home, `.handshake-probe-${process.pid}-${randomBytes(4).toString("hex")}`);
-  try {
-    await writeFile(probe, "", { flag: "wx" });
-  } catch {
-    return false;
-  }
-  await unlink(probe).catch(() => undefined);
-  return true;
-}
-
 async function runHandshake(env: NodeJS.ProcessEnv = process.env): Promise<HandshakeResult> {
-  const home = factoryHome(env);
+  const home = resolveFactoryHome(env, homedir());
   const [expectedVersion, version, config, writable] = await Promise.all([
     installedVersion(home),
     packageVersion(),

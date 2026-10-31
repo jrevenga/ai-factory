@@ -53,6 +53,19 @@ async function setup(stateVersion: string | undefined) {
   return { dir: t.dir, env, out, agentDir: env.PI_CODING_AGENT_DIR as string };
 }
 
+/** A blocked run still completes normally; the write's tool result carries the handshake reason. */
+async function expectBlocked(s: Awaited<ReturnType<typeof setup>>, extensions: string[], reasons: string) {
+  const log = join(s.dir, "observed.jsonl");
+  s.env.OBSERVE_FILE = log;
+  const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [...extensions, OBSERVER] });
+  expect(r.timedOut).toBe(false);
+  expect(r.code, r.stderr).toBe(0);
+  expect(existsSync(s.out)).toBe(false);
+  expect(r.stderr).toContain(`factory handshake failed: ${reasons}`);
+  const writes = observed(log).filter((o) => o.event === "tool_result" && o.toolName === "write");
+  expect(writes).toEqual([{ event: "tool_result", toolName: "write", isError: true, text: `factory handshake failed: ${reasons}` }]);
+}
+
 describe("Pi startup handshake (e2e, faux provider)", () => {
   it("harness self-check: the faux provider alone performs the scripted write", async () => {
     const s = await setup(undefined);
@@ -69,17 +82,11 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
   }, 120_000);
 
   it("state at another version: the write is blocked and the output names version-mismatch", async () => {
-    const s = await setup("9.9.9");
-    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION] });
-    expect(existsSync(s.out)).toBe(false);
-    expect(r.stdout + r.stderr).toContain("version-mismatch");
+    await expectBlocked(await setup("9.9.9"), [FAUX, EXTENSION], "version-mismatch");
   }, 120_000);
 
   it("no state: the write is blocked as not-installed", async () => {
-    const s = await setup(undefined);
-    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [EXTENSION, FAUX] });
-    expect(existsSync(s.out)).toBe(false);
-    expect(r.stdout + r.stderr).toContain("not-installed");
+    await expectBlocked(await setup(undefined), [EXTENSION, FAUX], "not-installed");
   }, 120_000);
 
   it("emits factory:handshake to other extensions in either load order", async () => {
@@ -108,7 +115,9 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
       { tool: "bash", args: { command: "echo hi" } },
       { tool: "write", args: { path: s.out, content: "x" } },
     ]);
-    await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER] });
+    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER] });
+    expect(r.timedOut).toBe(false);
+    expect(r.code, r.stderr).toBe(0);
     const o = observed(log);
     expect(o.find((x) => x.event === "handshake")).toEqual({
       event: "handshake",
@@ -124,17 +133,15 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
     expect(existsSync(s.out)).toBe(false);
   }, 120_000);
 
-  it("an invalid personal config or an unwritable store fails the handshake", async () => {
+  it("an invalid personal config fails the handshake", async () => {
     const s = await setup("0.1.0");
     writeFileSync(join(s.env.FACTORY_HOME as string, "config.json"), "{ not json");
-    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION] });
-    expect(existsSync(s.out)).toBe(false);
-    expect(r.stderr).toContain("factory handshake failed: config-invalid");
+    await expectBlocked(s, [FAUX, EXTENSION], "config-invalid");
+  }, 120_000);
 
-    const s2 = await setup("0.1.0");
-    s2.env.FACTORY_HOME = join(s2.dir, "missing home");
-    const r2 = await runPiPrint({ cli, agentDir: s2.agentDir, cwd: s2.dir, env: s2.env, extensions: [FAUX, EXTENSION] });
-    expect(existsSync(s2.out)).toBe(false);
-    expect(r2.stderr).toContain("factory handshake failed: not-installed, store-unwritable");
+  it("a missing (unwritable) store fails the handshake", async () => {
+    const s = await setup("0.1.0");
+    s.env.FACTORY_HOME = join(s.dir, "missing home");
+    await expectBlocked(s, [FAUX, EXTENSION], "not-installed, store-unwritable");
   }, 120_000);
 });
