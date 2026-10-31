@@ -595,12 +595,35 @@ What it cannot enforce: hosted tools (web search), commands hidden in opaque she
 
 ## S10 Windows
 
-**Question:** TBD
+**Question:** Do the S1 probe, the isolated Pi install, install-by-tag with marker, the persistent CLI install and the one-command bootstrap work on Windows (Git Bash) as on Linux, on Node 22.19.0 and 24, and what does the install cost in time?
 
-**Method:** TBD
+### CI matrix
 
-**Evidence:** TBD
+**Method:** `.github/workflows/spike-phase0.yml` (`workflow_dispatch` only; owner-approved push to `jrevenga/ai-factory` master, 2026-10-31), matrix `os: [ubuntu-latest, windows-latest]` x `node: ["22.19.0", "24"]`, `fail-fast: false`, `shell: bash` (Git Bash on Windows), `permissions: contents: read`, git `insteadOf` rewrite with `github.token` for `https://github.com/`, `ssh://git@github.com/` and `git@github.com:` (token never printed). Each job runs `node spikes/phase0/ci-checks.mjs`, which runs in order: `sqlite-fts.mjs` (S1), the isolated Pi 1.4.0 install into `spikes/phase0/.prefix`, `s2-probe.mjs load` (install by tag `spike-pkg-v0.1.0` and marker with fresh nonce), `npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0` into an empty prefix and run of the executable in a new process (POSIX `<prefix>/bin/factory-spike`; Windows `<prefix>/factory-spike.cmd` via `cmd.exe /d /s /c`), and `npx -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install` from an empty prefix followed by running the executable in a new process. `npm_config_update_notifier=false`.
 
-**Verdict:** TBD
+**Evidence:** Run https://github.com/jrevenga/ai-factory/actions/runs/41219133823 (commit `b908165`), first attempt, no re-runs. All four jobs concluded `success`; every check in every job had `ok: true`. Runner Node: 22.19.0 and 24.22.1.
 
-**Design impact:** TBD
+| Job | Node | S1 | Pi install | install-by-tag + marker | CLI install + run | Bootstrap | totalMs |
+|---|---|---|---|---|---|---|---|
+| ubuntu-latest | 22.19.0 | ok 32 ms | ok 11.3 s | ok 2.7 s | ok 12.5 s | ok 19.6 s | 46179 |
+| ubuntu-latest | 24.22.1 | ok 149 ms | ok 11.4 s | ok 2.6 s | ok 12.2 s | ok 18.0 s | 44250 |
+| windows-latest | 22.19.0 | ok 48 ms | ok 17.8 s | ok 4.0 s | ok 20.5 s | ok 35.8 s | 78113 |
+| windows-latest | 24.22.1 | ok 223 ms | ok 28.2 s | ok 4.0 s | ok 28.2 s | ok 50.7 s | 111347 |
+
+Windows specifics observed in the logs: the executable was `D:\a\ai-factory\ai-factory\spikes\phase0\.npm-global-ci-cli\factory-spike.cmd` (directly in the prefix, as predicted) and printed `factory-spike ok v22.19.0` (exit 0) in a new process; the bootstrap prefix behaved the same. The spike package's `install` branch (npm resolved relative to `process.execPath`) and `npm.mjs` (`<node-dir>/node_modules/npm/bin/npm-cli.js` on Windows) both worked with `actions/setup-node` Node. The `install-by-tag` check asserted the marker with this run's nonce (not just exit code). The private-repo access went through the `insteadOf` token rewrite for both the `git+https` install and the `github:` shorthand (no SSH fallback issue appeared). S1 on Windows: `node:sqlite` FTS5 and accent folding true (SQLite 3.53.4, no warning on Node 24; Node 22.19.0 results in the CI JSON).
+
+**Genuine platform findings:** none failed. Windows is roughly 1.7x (Node 22) to 2.5x (Node 24) slower than Linux for the same install work.
+
+**Harness bugs fixed:** none (no failing attempt; no fix commits).
+
+**Install-time input (< 10 min target):** the full five-check sequence, which includes a duplicate Pi install and two package installs, takes at most 111 s on a clean Windows runner and 46 s on Linux; the bootstrap alone is 18-20 s (Linux) and 36-51 s (Windows). Caveat: CI runners have fast networks, warm npm mirrors and no antivirus beyond Defender defaults; the owner's machine may differ.
+
+**Limits:** CI proves install/CLI/marker behaviour and the `.cmd` shim on Windows; it does not cover login, Codex, the bridge, worktrees or Pi's `bash` tool via Git Bash (no credentials on runners). Those are the owner checklist below.
+
+### Owner Windows checklist - pending
+
+Not yet run. Checklist: `spikes/phase0/windows-checklist.md`. Results (outputs per item, bridge-on-Windows status) will be pasted here.
+
+**Verdict:** TBD (CI portion passes; final verdict after the owner checklist).
+
+**Design impact:** TBD (after the owner checklist).
