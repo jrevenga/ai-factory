@@ -33,6 +33,17 @@ describe("changelog", () => {
     const out = changelogBetween(md, "0.1.0", "0.2.0");
     expect(out).toBe("## [0.2.0] - x\n\n- two");
   });
+  it("ignores headings inside fenced code blocks", () => {
+    const md = [
+      "## [0.2.0] - x", "", "   ```md", "## Configuration", "## [0.1.5] - fake", "   ```", "", "after", "",
+      "~~~~", "## Other", "~~~", "still fenced", "~~~~", "tail", "", "## [0.1.0] - y", "", "- one", "",
+    ].join("\n");
+    const out = changelogBetween(md, "0.1.0", "0.2.0");
+    expect(out).toBe(md.split("\n").slice(0, 15).join("\n").trimEnd());
+    expect(out).toContain("## Configuration");
+    expect(out).toContain("tail");
+    expect(out).not.toContain("[0.1.0]");
+  });
   it("lists versions", () => {
     expect(changelogVersions(MD)).toEqual(["0.3.0", "0.2.0", "0.1.0"]);
   });

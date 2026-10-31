@@ -13,7 +13,22 @@ export function changelogVersions(markdown: string): string[] {
 export function changelogBetween(markdown: string, from: string, to: string): string {
   const sections: Array<{ version: string; lines: string[] }> = [];
   let current: { version: string; lines: string[] } | undefined;
+  let fence: { ch: string; len: number } | undefined;
   for (const line of markdown.split(/\r?\n/)) {
+    const f = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (f) {
+      const ch = f[1]![0]!;
+      const len = f[1]!.length;
+      if (!fence) {
+        if (ch !== "`" || !f[2]!.includes("`")) fence = { ch, len };
+      } else if (ch === fence.ch && len >= fence.len && f[2]!.trim() === "") fence = undefined;
+      current?.lines.push(line);
+      continue;
+    }
+    if (fence) {
+      current?.lines.push(line);
+      continue;
+    }
     const v = HEADING.exec(line)?.[1];
     if (v !== undefined) {
       current = { version: v, lines: [line] };
