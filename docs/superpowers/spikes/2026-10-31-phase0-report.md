@@ -464,31 +464,37 @@ cd $T && SPIKE_TOOLLOG=<abs>/out/s4-run{1,2}.jsonl SPIKE_INVENTORY=<abs>/out/s4-
   timeout 170 node <abs>/spikes/phase0/pi.mjs -p --no-session --model claude-bridge/claude-opus-5-5 \
   --extension <abs>/spikes/phase0/gate-probe.ts "Create a file named created.txt containing hello, then answer in one sentence." </dev/null
 ```
-(Exit codes were not captured: the harness shell is zsh and `${PIPESTATUS[0]}` printed empty; both runs produced complete output within the timeout, so neither timed out.)
+Fix round 1: all three runs were re-executed with `> out.txt 2>&1; echo "exit=$?"` (bash script) after changing `textHead` to the joined `result.content[].text`. Run 3 (T3=/tmp/tmp.rixLbwtJhk, `SPIKE_BLOCK_WRITES=1`) uses the prompt `Run this exact shell command with your bash tool: echo hello > created.txt — then answer in one sentence.` Exit codes: run 1 `exit=0`, run 2 `exit=0`, run 3 `exit=0`. Evidence below is from the re-run (T1=/tmp/tmp.quDcwwgonE, T2=/tmp/tmp.bnnWQn84uB).
 
 **Evidence:**
 
-Run 1 (unblocked) final text: `He creado created.txt con «hello» en /tmp/tmp.UDh96xs4Fh/created.txt. PINEAPPLE`; `created.txt` exists with content `hello`. tools.jsonl:
+Run 1 (unblocked, exit=0) final text: `Listo: he creado created.txt con el contenido hello en /tmp/tmp.quDcwwgonE. PINEAPPLE`; `created.txt` exists (`hello`). tools.jsonl:
 ```
-{"ts":1793464137410,"event":"tool_call","toolCallId":"toolu_01VbKuC9CPe56jmcnfYj6gnu","toolName":"write","inputKeys":["path","content"],"decision":"allowed"}
-{"event":"tool_execution_end","toolCallId":"toolu_01VbKuC9CPe56jmcnfYj6gnu","toolName":"write","isError":false,"textHead":"{\"content\":[{\"type\":\"text\",\"text\":\"Successfully wrote to /tmp/tmp.UDh96xs4Fh/created.txt\"}]}"}
+{"ts":1793464269102,"event":"tool_call","toolCallId":"toolu_01BDethcLHSJKfBQEAvEnHNo","toolName":"write","inputKeys":["path","content"],"decision":"allowed"}
+{"event":"tool_execution_end","toolCallId":"toolu_01BDethcLHSJKfBQEAvEnHNo","toolName":"write","isError":false,"textHead":"Successfully wrote to /tmp/tmp.quDcwwgonE/created.txt"}
 ```
-Run 2 (blocked) final text: `No he podido crear created.txt porque la herramienta de escritura devolvió el error «spike gate», así que el archivo NO existe y no he intentado otra vía ... PINEAPPLE`; `ls` of T2 shows no `created.txt`. tools.jsonl:
+Run 2 (blocked write, exit=0) final text: `No he podido crear created.txt porque la escritura falló con el error «spike gate», así que el archivo NO existe ... PINEAPPLE`; T2 has no `created.txt`. tools.jsonl:
 ```
-{"ts":1793464143852,"event":"tool_call","toolCallId":"toolu_01KZNY3QvVVjQozXaycKApAT","toolName":"write","inputKeys":["path","content"],"decision":"blocked"}
-{"event":"tool_execution_end","toolCallId":"toolu_01KZNY3QvVVjQozXaycKApAT","toolName":"write","isError":true,"textHead":"{\"content\":[{\"type\":\"text\",\"text\":\"spike gate\"}],\"details\":{}}"}
+{"ts":1793464275167,"event":"tool_call","toolCallId":"toolu_01Nnrn6QcnQT5wR6L5Tz5ibx","toolName":"write","inputKeys":["path","content"],"decision":"blocked"}
+{"event":"tool_execution_end","toolCallId":"toolu_01Nnrn6QcnQT5wR6L5Tz5ibx","toolName":"write","isError":true,"textHead":"spike gate"}
+```
+Run 3 (blocked bash, exit=0) final text: `No pude ejecutarlo: el comando echo hello > created.txt fue bloqueado con el error "spike gate", así que created.txt NO se ha creado. PINEAPPLE`; T3 has no `created.txt`. tools.jsonl:
+```
+{"ts":1793464283218,"event":"tool_call","toolCallId":"toolu_014aAp8TgXH3ktcwX9ui3E33","toolName":"bash","inputKeys":["command","timeout"],"decision":"blocked"}
+{"event":"tool_execution_end","toolCallId":"toolu_014aAp8TgXH3ktcwX9ui3E33","toolName":"bash","isError":true,"textHead":"spike gate"}
 ```
 Correlation table:
 
-| blocked toolCallId | tool | decision | tool_execution_end isError | text contains "spike gate" |
+| run | blocked toolCallId | tool | tool_execution_end isError | text contains "spike gate" |
 |---|---|---|---|---|
-| toolu_01KZNY3QvVVjQozXaycKApAT | write | blocked | true | yes |
+| 2 | toolu_01Nnrn6QcnQT5wR6L5Tz5ibx | write | true | yes |
+| 3 | toolu_014aAp8TgXH3ktcwX9ui3E33 | bash | true | yes |
 
-One blocked attempt, zero `allowed` write-capable calls in run 2, no file created without a logged `tool_call` (no bypass).
+Zero `allowed` write-capable calls in runs 2 and 3; no file created without a logged `tool_call` (no bypass). `edit` was not exercised.
 
-**Verdict (bridge):** PASS. Pi's `tool_call` hook sees the bridged tool calls (Claude Code's tool requests are routed back to Pi tools, here `write`), can block them, and the denial reaches the model as an error result (`isError: true`, "spike gate"). Observed behaviour: the model did not try a shell alternative (only one attempt was made, so "bash is also blocked" was not exercised). Native Codex leg: see below.
+**Verdict (bridge):** PASS. Pi's `tool_call` hook sees the bridged tool calls (the bridge serves Pi's tools to Claude Code over MCP, bridge `src/index.ts` ~L916; Claude Code's tool requests are routed back to Pi tools, here `write` and `bash`), can block them, and the denial reaches the model as an error result (`isError: true`, "spike gate"). Both `write` and `bash` blocks were proven (runs 2 and 3); in run 2 the model did not try a shell alternative on its own. `edit` blocking is extrapolated, not exercised. Native Codex leg: see below.
 
-**Design impact:** The Factory's gate extension (`tool_call` returning `{block, reason}`) is enforceable on the Claude-via-bridge path as it is on native providers, provided the gate keys on Pi tool names (`write`, `edit`, `bash`, ...). Use `tool_execution_end`, not `tool_result`, to audit denials in Pi 1.4.0. Launch non-interactive Pi from automation with stdin closed (`</dev/null`). Side observation: the bridge-run answers came in Spanish with the owner's persona, i.e. Claude Code still loads the owner's `~/.claude` instructions into the bridge session; for reproducible Factory runs the bridge environment must be checked for user-level CLAUDE.md leakage (not investigated here).
+**Design impact:** The Factory's gate extension (`tool_call` returning `{block, reason}`) is proven enforceable on the Claude-via-bridge path for `write` and `bash` (`edit` is extrapolated from the same hook mechanism, not exercised); native-provider equivalence is pending the Codex leg. The gate must key on Pi tool names (`write`, `edit`, `bash`, ...). Use `tool_execution_end`, not `tool_result`, to audit denials in Pi 1.4.0. Launch non-interactive Pi from automation with stdin closed (`</dev/null`). Side observation: the bridge-run answers came in Spanish with the owner's persona, i.e. Claude Code still loads the owner's `~/.claude` instructions into the bridge session; for reproducible Factory runs the bridge environment must be checked for user-level CLAUDE.md leakage (not investigated here).
 
 ### Native Codex leg: pending (quota)
 

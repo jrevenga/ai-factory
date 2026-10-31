@@ -20,7 +20,7 @@ export default function gateProbe(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_end", (event) => {
-		const text = JSON.stringify(event.result ?? "");
+		const text = (Array.isArray(event.result?.content) ? event.result.content : []).map((c: any) => c?.text ?? "").join("");
 		log({ event: "tool_execution_end", toolCallId: event.toolCallId, toolName: event.toolName, isError: event.isError, textHead: text.slice(0, 200) });
 	});
 
