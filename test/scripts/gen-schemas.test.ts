@@ -13,12 +13,13 @@ describe("gen-schemas", () => {
       "profile.schema.json",
       "project-config.schema.json",
       "release.schema.json",
+      "state.schema.json",
     ]);
   });
   it("committed schemas are fresh", () => {
     expect(checkSchemas(resolve(root, "schemas"))).toEqual([]);
   });
   it("reports a stale directory", () => {
-    expect(checkSchemas(resolve(root, "test"))).toHaveLength(5);
+    expect(checkSchemas(resolve(root, "test"))).toHaveLength(6);
   });
 });
