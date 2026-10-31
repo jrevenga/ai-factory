@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { installCommand, piPrintEnv, TEST_PI_VERSION } from "./pi-harness.ts";
 
@@ -7,20 +7,22 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-const AGENT = join("/tmp", "run 1", "pi agent");
+// Resolved like piPrintEnv resolves it, so Windows gets the current drive letter on both sides.
+const AGENT = resolve("/tmp", "run 1", "pi agent");
+const DEFAULT_HOME = join(dirname(AGENT), "factory home");
 
 describe("piPrintEnv", () => {
   it("without env: isolated FACTORY_HOME next to the agent dir, host FACTORY_HOME ignored", () => {
     vi.stubEnv("FACTORY_HOME", join(homedir(), ".factory"));
     const env = piPrintEnv(AGENT);
-    expect(env.FACTORY_HOME).toBe(join("/tmp", "run 1", "factory home"));
+    expect(env.FACTORY_HOME).toBe(DEFAULT_HOME);
     expect(env.PI_CODING_AGENT_DIR).toBe(AGENT);
     expect(env.PI_OFFLINE).toBe("1");
     expect(env.PI_TELEMETRY).toBe("0");
   });
 
   it("env without FACTORY_HOME gets the isolated default; a given FACTORY_HOME is kept", () => {
-    expect(piPrintEnv(AGENT, { PATH: "/bin" }).FACTORY_HOME).toBe(join("/tmp", "run 1", "factory home"));
+    expect(piPrintEnv(AGENT, { PATH: "/bin" }).FACTORY_HOME).toBe(DEFAULT_HOME);
     expect(piPrintEnv(AGENT, { FACTORY_HOME: "/x y" }).FACTORY_HOME).toBe("/x y");
   });
 
