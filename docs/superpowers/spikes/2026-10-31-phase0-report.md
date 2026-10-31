@@ -895,7 +895,7 @@ workdir: /tmp/tmp.s8Qw6pXIBh
 model: gpt-6.1-sol
 approval: never
 sandbox: workspace-write [workdir, /tmp, $TMPDIR]
-warning: `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.   # expected: printed once per hook load when the bypass flag is set (appears twice in the transcript)
+warning: `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.   # expected warning when the bypass flag is set; it appears twice in this transcript (cause not investigated)
 hook: PreToolUse
 2026-10-31T19:37:58.608709Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: spike gate. Command: echo spike-deny > denied.txt
 hook: PreToolUse Blocked
