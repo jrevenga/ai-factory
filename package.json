@@ -1,0 +1,10 @@
+{
+  "name": "ai-factory-spike",
+  "version": "0.1.0",
+  "description": "Throwaway Phase 0 spike package (S2)",
+  "keywords": ["pi-package"],
+  "bin": { "factory-spike": "bin/factory-spike.mjs" },
+  "pi": { "extensions": ["./extensions/probe.ts"] },
+  "dependencies": { "ms": "2.1.3" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" }
+}
