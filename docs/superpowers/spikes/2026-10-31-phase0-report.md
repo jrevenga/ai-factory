@@ -1002,7 +1002,7 @@ Item 8 (`w6.sh`, Node 24, `N` = 1793479889; `R`, `O`, `T` as in item 4, `T` a fr
 
 ```bash
 timeout 300 node spikes/phase0/pi.mjs install npm:pi-claude-bridge@0.9.3 </dev/null
-timeout 120 node spikes/phase0/pi.mjs --list-models </dev/null | grep -E "claude-bridge.*opus-5-5"
+timeout 120 node spikes/phase0/pi.mjs --list-models </dev/null | grep -E "claude-bridge.*opus-5-5"   # exit code not captured (piped through grep); verbatim output line: "claude-bridge  claude-opus-5-5    1M       128K     yes       yes"
 # run 1 (block=0, P1)
 ( cd "$T" && SPIKE_TOOLLOG="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-br-1793479889-1.jsonl" SPIKE_INVENTORY="C:/Users/jorge/ai factory/ai-factory/spikes/phase0/out/win-br-1793479889-1-inv.json" SPIKE_BLOCK_WRITES=0 \
   timeout 300 node "C:/Users/jorge/ai factory/ai-factory/spikes/phase0/pi.mjs" -p --no-session --model claude-bridge/claude-opus-5-5 \
