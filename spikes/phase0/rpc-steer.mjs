@@ -1,7 +1,7 @@
 // S8 driver: prompt (sleep 5 via bash), steer ~1.5 s after bash tool_execution_start, then follow_up.
 // usage: SPIKE_EVENTLOG=<abs path> node spikes/phase0/rpc-steer.mjs <provider/model>
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { SPIKE, isolatedEnv } from "./pi.mjs";
 
@@ -9,6 +9,8 @@ const model = process.argv[2];
 if (!model || !process.env.SPIKE_EVENTLOG) throw new Error("need <model> and SPIKE_EVENTLOG");
 const evlog = path.resolve(process.env.SPIKE_EVENTLOG); // relative paths resolve against the cwd, then are passed absolute to the child
 mkdirSync(path.dirname(evlog), { recursive: true });
+writeFileSync(evlog, ""); // fresh state per evidence: never inherit rows from an earlier run
+const START_TS = Date.now(); // belt and braces: only rows from this invocation count
 const TIMEOUT_MS = Number(process.env.SPIKE_TIMEOUT_MS ?? 180000);
 const failures = [];
 const drv = (event, detail = null) => appendFileSync(evlog, JSON.stringify({ ts: Date.now(), event: "driver:" + event, detail }) + "\n");
@@ -51,7 +53,7 @@ await done; clearTimeout(t);
 child.stdin.end();
 if (!exited) { child.kill(); }
 // Required evidence: both queued inputs and agent_settled must be in the log.
-const rows = readFileSync(evlog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+const rows = readFileSync(evlog, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.ts >= START_TS);
 const has = (p) => rows.some(p);
 if (!has((r) => r.event === "input" && r.detail?.streamingBehavior === "steer")) failures.push("missing input(steer)");
 if (!has((r) => r.event === "input" && r.detail?.streamingBehavior === "followUp")) failures.push("missing input(followUp)");
