@@ -6,6 +6,48 @@
 - Pi version: 1.4.0
 - Bridge version: pi-claude-bridge@0.9.3
 
+## Summary
+
+Task 11 outcome: one row per question S1-S10, per **[verify]** marker in the two specs (`A` = `specs/2026-10-31-ai-factory-design.md`, `M` = `specs/2026-10-31-factory-methodology-design.md`) and per controller carry-forward item (C1-C11). Rows are merged only where a marker or carry item maps 1:1 to a question. Verdicts: `confirmed` (design holds; evidence link added at most), `changed` (spec section edited), `blocked`, `pending (owner)` (related marker kept as an explicitly named deferral).
+
+| Item | Verdict | Evidence | Design change |
+|---|---|---|---|
+| S1 `node:sqlite` FTS5 + accent folding on Node 22.19 and 24 | confirmed | [S1](#s1-sqlite), [S10](#s10-windows) | A §4 Platform: evidence link; FTS queries limited to features common to the bundled SQLite versions (3.50.4 / 3.51.2) |
+| S2 private-git `pi install` by tag, TS extension + dependency, failure modes | changed | [S2](#s2-package-from-private-git) | A §6.1: extensions ship as TS source, load proven only by the handshake; A §6.2: ref validation (C1), launcher paragraph corrected for the bad-ref crash, `doctor` credential diagnostics |
+| S3 persistent CLI via `npm install -g` and `npx` bootstrap | changed | [S3](#s3-cli-install-path) | A §6.2: npx entry point + npm fallback (C6), npm location (C3), `doctor` checks `npm prefix -g` writable; A §18 updated |
+| S4 Pi `tool_call` sees and gates every write-capable call (bridge and native Codex) | confirmed | [S4](#s4-bridge-tools-and-gates) | A §8.4: evidence added; `edit` blocking not exercised, goes into the gate test suite; audit denials from `tool_execution_end` |
+| S5 prompt sections reach the model (bridge and native Codex) | confirmed | [S5](#s5-prompt-sections), [S4 Codex leg](#s4-bridge-tools-and-gates) | A §7.2: evidence link only |
+| A §8.4 [verify]: Claude Code built-ins not exposed alongside Pi tools through the bridge | confirmed | [S5](#s5-prompt-sections) | A §8.4: marker replaced by the verified fact (bridge starts Claude Code with `tools: []`; only Pi tools in inventory/log); adversarial attempt not run, added to the gate suite |
+| S6 limit signals per provider | changed | [S6](#s6-limit-signals) | A §13: Claude exhaustion is `unified-status: rejected` + error text (status stays 200), not a 429; A §6.2 step 3 writes `transport: "sse"` |
+| A §13 [verify]: what Pi's native Codex provider exposes | changed | [S6 Codex live](#native-codex-live-observation) | A §13: `known` only with `transport: "sse"` (x-codex-primary/secondary used-percent, window, reset); `auto` never fired the hook; factory forces `sse` by default (C5) |
+| S7 RPC subagent (`RpcClient`, native Codex, worktree, hooks active) | confirmed | [S7](#s7-rpc-subagent) | A §7.3: evidence added; lifecycle requirement under C7 |
+| S8 input/steering lifecycle = M §3.4 [verify] (how a queued input is detected as consumed) = C8 | changed | [S8](#s8-inputsteering-lifecycle) | M §3.4: marker replaced by the mechanism (user `message_start` after the first message of a run as primary trigger; provisional FIFO from `input` with `streamingBehavior`; gate denies modifying tools until `set_route`; clear at `agent_settled` and on `clear_queue`) |
+| S9 Codex CLI hooks = A §7.5 [verify] (hook mechanism for Codex gates) | changed | [S9](#s9-codex-cli-hooks-desk-check) | A §7.5: layered Codex adapter (sandbox flags, `.rules`, managed PreToolUse hook to `GatePolicy`, optional app-server broker), fail-open caveats, defence-in-depth statement |
+| S9 positive live hook denial | pending (owner) | [S9 live smoke](#live-smoke-partial-negative-control-only-positive-run-pending-owner-action) | A §7.5: `**[verify]** deferred — pending (owner): S9 positive live hook denial` |
+| S10 Windows CI matrix (S1, Pi install, install-by-tag + marker, CLI install, bootstrap) | confirmed | [S10 CI](#ci-matrix) | A §6.1/§6.2: Windows CI cited; `.cmd` shim location stated. Install times (≤ 111 s for the five checks) are well inside the < 10 min target (A §3), no change |
+| S10 Windows owner checklist (login, Codex gate/sections/limits, RPC worktree, Git Bash `bash` tool, bridge on Windows) = A §15 Phase 0 acceptance | pending (owner) | [S10 owner checklist](#owner-windows-checklist---pending) | A §15 Phase 0 row: status note + `**[verify]** deferred — pending (owner): S10 Windows owner checklist` |
+| C1 validate a package ref before writing it to Pi settings | changed | [S2 bad ref](#3-bad-ref-install-then-startup) | A §6.2 install step 2 (also update/rollback); launcher paragraph: guard extension cannot cover this crash |
+| C2 global install pulls the Pi peer (122 packages) and runs dependency install scripts | changed | [S2](#s2-package-from-private-git) item 6, [S3](#s3-cli-install-path) | A §6.2 install-path requirements: no second Pi version (`--omit=peer`/`--legacy-peer-deps` or exact peer pin, **[builder]**, untested); dependency scripts reviewed with the release manifest; A §6.1 cross-reference |
+| C3 locate npm via `npm_execpath` / PATH, not `process.execPath` | changed | [S3](#s3-cli-install-path) | A §6.2 install-path requirements |
+| C4 bridge sessions load the owner's `~/.claude` configuration (persona/language leak) | changed (default chosen, owner to confirm) | [S4](#s4-bridge-tools-and-gates) | A §7.2: default = exclude user-level Claude Code instructions/hooks from factory bridge runs without touching the login; mechanism after root cause **[builder]**; fallback = documented risk + `doctor` warning |
+| C5 Codex transport for limit signals (`auto` vs `sse`) | changed (default chosen, owner to confirm) | [S6 Codex live](#native-codex-live-observation) | A §13 and §6.2 step 3: default = force `transport: "sse"` + `doctor` assertion; error-message detection kept as backstop |
+| C6 one-command `npx` bootstrap, `npm install -g` fallback | changed | [S3](#s3-cli-install-path), [S10 CI](#ci-matrix) | A §6.2 install path paragraph; A §18 |
+| C7 `RpcClient` spawns `node` without detach/tree kill | changed | [S7](#s7-rpc-subagent), [S2](#s2-package-from-private-git) items 7-9 | A §7.3: runner owns timeouts, cancellation, awaited tree teardown, orphan detection; Windows path not exercised |
+| C8 `needs_reclassification` mechanism | changed | merged into the S8 row | see S8 row |
+| C9 untrusted project-local Codex hooks do not load (fail open): preflight must assert hook trust | changed | [S9 live smoke](#live-smoke-partial-negative-control-only-positive-run-pending-owner-action) (negative control) | A §7.5: launcher preflight asserts hook loaded/trusted and settings not weakened, fail closed |
+| C10 `pi -p` from automation needs stdin closed | changed | [S4](#s4-bridge-tools-and-gates) | A §7.3: non-interactive Pi invocations run with stdin closed |
+| C11 Codex CLI self-updates (0.163 → 0.166 in one day) | changed | [S9](#s9-codex-cli-hooks-desk-check) | A §7.5: adapter contract tests pinned to a Codex CLI version; `doctor` reports drift |
+
+Counts: 6 confirmed, 16 changed, 0 blocked, 2 pending (owner). The C8 row is only a pointer to the S8 row and is not counted separately.
+
+**Blocked items:** none.
+
+**Decisions for owner confirmation** (the spec carries the recommended default, marked **[call]** "pending owner confirmation"):
+1. C4, A §7.2: isolate factory bridge runs from user-level Claude Code instructions and hooks (default) vs only document the leak as a known risk. Isolation must not move or copy the Claude login; the leak's cause was not investigated in Phase 0, so the mechanism is still open.
+2. C5, A §13 / §6.2: force `transport: "sse"` in the managed Pi settings to get per-call Codex limit headers (default) vs keep `auto` and rely only on error-message detection (limits `unknown` until exhaustion). Cost of SSE vs WebSocket was not measured, and since managed settings are Pi's global settings, the user's own Pi Codex sessions would also use SSE (per-key ownership, §5.2, lets the user override it).
+
+**Not proven by the evidence (stated in the specs where relevant):** blocking of `edit`; an adversarial attempt to call a Claude Code built-in through the bridge; both exhaustion paths (desk checks only); the `handled`/`clear_queue` FIFO edge cases and the TUI input path (S8); macOS and a credential-less clean machine (S3); Windows tree teardown (S7/C7); the `--omit=peer` / exact peer pin variants (C2).
+
 ## S1 sqlite
 
 **Question:** Can the memory store use Node's built-in `node:sqlite` with FTS5 and diacritic folding (`unicode61 remove_diacritics 2`) on the declared minimum Node 22.19 and on Node 24, without flags?
