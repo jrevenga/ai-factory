@@ -612,7 +612,7 @@ Values are fresh on every call (reset-after counts down by ~2 s per call). Probe
 
 **Question:** Can a Factory "subagent" be a child Pi process driven over RPC with `RpcClient`, using native Codex, running inside a git worktree, with our extension hooks (tool logging and prompt section) active and the isolated env applied?
 
-**Method:** Pi 1.4.0, Node as installed on the host, model `openai-codex/gpt-6.1-sol` (catalog id), default transport `auto`. `RpcClient` is exported from the package root (`dist/index.js`, imported from `.prefix`). Its `start()` runs `spawn("node", [cliPath, "--mode","rpc", "--model", ..., ...args], { cwd, env: {...process.env, ...options.env} })`, so `cliPath` = absolute `pi.mjs` works; `pi.mjs` in CLI mode sets `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` and `npm_config_prefix` itself inside the child process (RpcClient only passes extra env: `SPIKE_TOOLLOG`, `SPIKE_INVENTORY`). Isolation was confirmed indirectly: the Codex login exists only in `spikes/phase0/.agent`, and the run authenticated. Script: `spikes/phase0/rpc-subagent.mjs` (`promptAndWait` waits for `agent_settled`; `final` from `getLastAssistantText`, `usage` from `getSessionStats`). Prompt: `Read README.md if it exists, otherwise list the files, and summarize in one sentence.` Single run, no retries (re-run once after fix round 1 added the per-run nonce; the evidence below is from that run).
+**Method:** Pi 1.4.0, Node as installed on the host, model `openai-codex/gpt-6.1-sol` (catalog id), default transport `auto`. `RpcClient` is exported from the package root (`dist/index.js`, imported from `.prefix`). Its `start()` runs `spawn("node", [cliPath, "--mode","rpc", "--model", ..., ...args], { cwd, env: {...process.env, ...options.env} })`, so `cliPath` = absolute `pi.mjs` works; `pi.mjs` in CLI mode sets `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` and `npm_config_prefix` itself inside the child process (RpcClient only passes extra env: `SPIKE_TOOLLOG`, `SPIKE_INVENTORY`). Isolation was confirmed indirectly: the Codex login exists only in `spikes/phase0/.agent`, and the run authenticated. Script: `spikes/phase0/rpc-subagent.mjs` (`promptAndWait` waits for `agent_settled`; `final` from `getLastAssistantText`, `usage` from `getSessionStats`). Prompt: `Read README.md if it exists, otherwise list the files, and summarize in one sentence.` Evidence below is from one run (the re-run after fix round 1 added the per-run nonce; an earlier nonce-less run behaved the same: 4711 ms, 3213 tokens).
 
 ```
 git worktree add ../ai-factory-spike-wt -b spike/wt master
@@ -623,18 +623,46 @@ git worktree remove ../ai-factory-spike-wt && git branch -D spike/wt
 git worktree list                       # only the main checkout
 ```
 
-**Evidence:** exit code 0, stderr empty. Printed result (usage trimmed to the relevant fields):
+**Evidence:** exit code 0, stderr empty. Printed result (verbatim, single run, nonce dc24efc9):
 ```
-"nonce": "dc24efc9",
-"toolLog": ".../spikes/phase0/out/s7-dc24efc9-tools.jsonl",
-"final": "No `README.md` exists; this directory contains `docs/`, `spikes/`, `.github/`, and `.git/`. PINEAPPLE",
-"toolCalls": [ { "name": "bash", "args": { "command": "if [ -f README.md ]; then printf 'README_EXISTS\\n'; else ls -a; fi", "timeout": null } } ],
-"durationMs": 4711,
-"usage": { "userMessages": 1, "assistantMessages": 2, "toolCalls": 1, "toolResults": 1,
-  "tokens": { "input": 1728, "output": 77, "cacheRead": 1408, "cacheWrite": 0, "total": 3213 }, "cost": 0.00437,
-  "contextUsage": { "tokens": 1635, "contextWindow": 500000, "percent": 0.327 } }
+{
+  "nonce": "dc24efc9",
+  "toolLog": "/home/jorge/projects/ai-factory/spikes/phase0/out/s7-dc24efc9-tools.jsonl",
+  "final": "No `README.md` exists; this directory contains `docs/`, `spikes/`, `.github/`, and `.git/`. PINEAPPLE",
+  "toolCalls": [
+    {
+      "name": "bash",
+      "args": {
+        "command": "if [ -f README.md ]; then printf 'README_EXISTS\\n'; else ls -a; fi",
+        "timeout": null
+      }
+    }
+  ],
+  "durationMs": 7990,
+  "usage": {
+    "sessionId": "01a19324-6383-720b-b81b-ff42687adc9d",
+    "userMessages": 1,
+    "assistantMessages": 2,
+    "toolCalls": 1,
+    "toolResults": 1,
+    "totalMessages": 5,
+    "tokens": {
+      "input": 1728,
+      "output": 77,
+      "cacheRead": 1408,
+      "cacheWrite": 0,
+      "total": 3213
+    },
+    "cost": 0.0043668000000000005,
+    "contextUsage": {
+      "tokens": 1635,
+      "contextWindow": 500000,
+      "percent": 0.327
+    }
+  }
+}
 ```
-Child hook log `spikes/phase0/out/s7-dc24efc9-tools.jsonl` (exit=0, stderr empty; usage and duration figures below are from the first run, the re-run printed the same shape):
+Child hook log `spikes/phase0/out/s7-dc24efc9-tools.jsonl` from the same run:
 ```
 {"event":"tool_call","toolName":"bash","inputKeys":["command"],"decision":"allowed", ...}
 {"event":"tool_execution_end","toolName":"bash","isError":false,"textHead":".\n..\ndocs\n.git\n.github\nspikes\n"}
