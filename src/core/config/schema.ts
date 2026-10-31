@@ -28,7 +28,12 @@ export const CoreConfig = z.looseObject({
   maintainer: z.boolean().default(false),
   gates: z
     .looseObject({
-      hard: z.array(HardGateId).default([...HARD_GATES]),
+      hard: z
+        .array(HardGateId)
+        .refine((l) => l.length === HARD_GATES.length && HARD_GATES.every((g, i) => l[i] === g), {
+          message: "gates.hard must equal the fixed hard gate list",
+        })
+        .default([...HARD_GATES]),
       soften: z.array(SoftGateId).default([]),
     })
     .default({ hard: [...HARD_GATES], soften: [] }),

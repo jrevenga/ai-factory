@@ -65,7 +65,45 @@ describe("resolveConfig", () => {
   });
 });
 
+describe("structural merge", () => {
+  it("keeps dotted machine keys literal and empty objects", () => {
+    const personal = PersonalConfig.parse({ schema: 1, profile: "x", machine: { "cpu.arch": "amd64" }, budgets: { claude: {} } });
+    const r = resolveConfig({ core, personal });
+    expect(r.value.machine).toEqual({ "cpu.arch": "amd64" });
+    expect(r.value.budgets).toEqual({ claude: {} });
+    expect(resolveConfig({ core, personal: PersonalConfig.parse({ schema: 1, profile: "x", machine: {} }) }).value.machine).toEqual({});
+  });
+  it("never pollutes Object.prototype", () => {
+    // Bypass zod so resolveConfig itself is exercised with own "__proto__" keys.
+    const personal = (
+      JSON.parse('{"schema":1,"profile":"x","machine":{"__proto__":"p","constructor":"c"},"budgets":{"claude":{"__proto__":{"polluted":1}}}}')
+    ) as PersonalConfig;
+    const r = resolveConfig({ core, personal });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(Object.getPrototypeOf(r.value.machine)).toBe(Object.prototype);
+    expect(Object.hasOwn(r.value.machine ?? {}, "__proto__")).toBe(true);
+    expect(Object.prototype).toEqual(Object.getPrototypeOf({}));
+    expect(Object.keys(Object.prototype)).toEqual([]);
+  });
+  it("deep merge keeps untouched values and provenance", () => {
+    const seeded = CoreConfig.parse({ schema: 1, budgets: { claude: { weeklyTokens: 1 }, codex: { weeklyTokens: 2 } } });
+    const personal = PersonalConfig.parse({ schema: 1, profile: "x", budgets: { claude: { weeklyTokens: 9 } } });
+    const r = resolveConfig({ core: seeded, personal });
+    expect(r.value.budgets).toEqual({ claude: { weeklyTokens: 9 }, codex: { weeklyTokens: 2 } });
+    expect(r.provenance.get("budgets.codex.weeklyTokens")).toEqual({ source: "core", overridden: [] });
+    expect(r.provenance.get("budgets.claude.weeklyTokens")).toEqual({
+      source: "personal",
+      overridden: [{ source: "core", value: 1 }],
+    });
+  });
+});
+
 describe("schemas", () => {
+  it("rejects weakened gates.hard", () => {
+    const h = core.gates.hard;
+    for (const hard of [[], h.slice(1), [...h, h[0]], [...h].reverse()])
+      expect(() => CoreConfig.parse({ schema: 1, gates: { hard } })).toThrow();
+  });
   it("rejects unknown override keys", () => {
     expect(() => ProjectConfig.parse({ schema: 1, overrides: { autonomy: "high" } })).toThrow();
   });
