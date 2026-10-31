@@ -1,7 +1,6 @@
 // Isolated npm/npx runner. Usage: node spikes/phase0/npm.mjs <scenario> <npm|npx> <args...>
-import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { cleanEnv, realInside, realTarget } from "./pi.mjs";
+import { cleanEnv, realInside, realTarget, spawnBounded } from "./pi.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -35,15 +34,7 @@ export function runNpm(tool, args, opts) {
   env.npm_config_prefix = prefix;
   env.npm_config_cache = cache;
   const entry = npmEntry(tool);
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [entry, ...args], { env, shell: false, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
-  });
+  return spawnBounded(process.execPath, [entry, ...args], { env, stdio: ["ignore", "pipe", "pipe"] }, opts);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

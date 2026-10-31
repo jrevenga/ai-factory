@@ -1,6 +1,7 @@
 // Isolated Pi launcher. Usage: node spikes/phase0/pi.mjs <pi args...>
 // Also usable as RpcClient's cliPath. Never touches ~/.pi/agent.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdirSync, rmSync } from "node:fs";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -53,6 +54,76 @@ export function cleanEnv(base) {
   return env;
 }
 
+// Kill a child and its whole process tree. POSIX: children are spawned detached
+// (own process group) so -pid reaches every descendant; SIGTERM, then SIGKILL after a grace period.
+function killTree(child, graceMs = 2000) {
+  if (child.pid === undefined) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    return;
+  }
+  const send = (sig) => {
+    try {
+      process.kill(-child.pid, sig);
+    } catch {}
+  };
+  send("SIGTERM");
+  setTimeout(() => send("SIGKILL"), graceMs).unref();
+}
+
+// Spawn with stdout/stderr capture, optional stdin, timeoutMs and AbortSignal.
+// Resolves { code, stdout, stderr, timedOut } and (on timeout/abort) only after the child has exited.
+export function spawnBounded(cmd, args, spawnOpts, { input, timeoutMs, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { ...spawnOpts, shell: false, detached: process.platform !== "win32" });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    const stop = () => {
+      timedOut = true;
+      killTree(child);
+    };
+    const timer = timeoutMs ? setTimeout(stop, timeoutMs) : undefined;
+    if (signal) signal.aborted ? stop() : signal.addEventListener("abort", stop, { once: true });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: timedOut ? null : code ?? 1, stdout, stderr, timedOut });
+    });
+    if (child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(input ?? "");
+    }
+  });
+}
+
+// Delete and recreate guarded scratch paths (only if the guard confirms they are inside spikes/phase0/).
+export function resetPaths(paths) {
+  for (const p of paths) {
+    if (!realInside(p)) throw new Error(`resetPaths: ${p} resolves outside ${root} or to ~/.pi/agent`);
+  }
+  for (const p of paths) {
+    rmSync(p, { recursive: true, force: true });
+    mkdirSync(p, { recursive: true });
+  }
+}
+
+// Fresh state for a scenario: agent dir, npm prefix, npm cache (and extra scratch dirs).
+export function resetScenario(scenario, extra = []) {
+  if (!scenario || !/^[A-Za-z0-9_-]+$/.test(scenario)) throw new Error("a simple scenario name is required");
+  resetPaths([
+    path.join(root, `.agent-${scenario}`),
+    path.join(root, `.npm-global-${scenario}`),
+    path.join(root, "out", `npm-cache-${scenario}`),
+    ...extra,
+  ]);
+}
+
 function die(msg) {
   process.stderr.write(`pi.mjs isolation guard: ${msg}\n`);
   process.exit(2);
@@ -88,22 +159,7 @@ export function isolatedEnv(scenario, extra = {}) {
 
 export function runPi(args, opts = {}) {
   const env = isolatedEnv(opts.scenario, opts.env);
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [piBin(), ...args], {
-      cwd: opts.cwd ?? process.cwd(),
-      env,
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
-    child.stdin.on("error", () => {});
-    child.stdin.end(opts.input ?? "");
-  });
+  return spawnBounded(process.execPath, [piBin(), ...args], { cwd: opts.cwd ?? process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] }, opts);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === SPIKE.launcher) {
