@@ -675,15 +675,74 @@ Child cwd was the worktree: the `ls -a` output lists only tracked content (`docs
 
 ## S8 input/steering lifecycle
 
-**Question:** TBD
+**Question:** When a user message arrives mid-run (steering or queued follow-up), which extension events fire, which event marks the moment the agent actually consumes it, and can an extension intercept, transform or hold it? This decides how methodology 3.4 detects "a queued input has been consumed" for `needs_reclassification`.
 
-**Method:** TBD
+**Method:** Pi 1.4.0, model `openai-codex/gpt-6.1-sol`, one model run. `spikes/phase0/lifecycle-probe.ts` (observe-only; `input` returns `{action:"continue"}`) appends `{ts,event,detail}` to `SPIKE_EVENTLOG`. `spikes/phase0/rpc-steer.mjs` starts Pi through `spikes/phase0/pi.mjs` in RPC mode (`--no-session`), sends a `prompt` that makes the model run `sleep 5`, sends `steer` 1.5 s after the bash `tool_execution_start` and `follow_up` 0.5 s later, and waits for `agent_settled`. Driver lines are prefixed `driver:` (RPC `response`, `queue_update` and assistant text as seen on stdout).
 
-**Evidence:** TBD
+```
+rm -f /home/jorge/projects/ai-factory/spikes/phase0/out/events-s8-1793470198.jsonl
+SPIKE_EVENTLOG=/home/jorge/projects/ai-factory/spikes/phase0/out/events-s8-1793470198.jsonl node spikes/phase0/rpc-steer.mjs openai-codex/gpt-6.1-sol   # exit=0
+```
 
-**Verdict:** TBD
+**Evidence:** full log `/home/jorge/projects/ai-factory/spikes/phase0/out/events-s8-1793470198.jsonl` (nonce `1793470198`, git-ignored). Verbatim from that single run (timestamps in ms, start of the run at ...199451):
 
-**Design impact:** TBD
+```
+{"ts":1793470199451,"event":"input","detail":{"source":"rpc","streamingBehavior":null,"textHead":"Run the bash command `sleep 5`, then rep"}}
+{"ts":1793470199452,"event":"before_agent_start","detail":null}
+{"ts":1793470199457,"event":"agent_start","detail":null}
+{"ts":1793470199459,"event":"driver:response","detail":{"command":"prompt","success":true,"data":{"disposition":"started"}}}
+{"ts":1793470199461,"event":"message_start","detail":{"role":"user"}}
+{"ts":1793470199461,"event":"message_end","detail":{"role":"user"}}
+{"ts":1793470202365,"event":"message_end","detail":{"role":"assistant"}}
+{"ts":1793470202366,"event":"tool_execution_start","detail":{"toolName":"bash"}}
+{"ts":1793470203868,"event":"driver:send","detail":{"type":"steer","message":"STEER: also say BLUE."}}
+{"ts":1793470203869,"event":"input","detail":{"source":"rpc","streamingBehavior":"steer","textHead":"STEER: also say BLUE."}}
+{"ts":1793470203870,"event":"driver:queue_update","detail":{"steering":["STEER: also say BLUE."],"followUp":[]}}
+{"ts":1793470203871,"event":"driver:response","detail":{"command":"steer","success":true,"data":{"disposition":"queued"}}}
+{"ts":1793470204368,"event":"driver:send","detail":{"type":"follow_up","message":"FOLLOWUP: say GREEN."}}
+{"ts":1793470204368,"event":"input","detail":{"source":"rpc","streamingBehavior":"followUp","textHead":"FOLLOWUP: say GREEN."}}
+{"ts":1793470204369,"event":"driver:queue_update","detail":{"steering":["STEER: also say BLUE."],"followUp":["FOLLOWUP: say GREEN."]}}
+{"ts":1793470204369,"event":"driver:response","detail":{"command":"follow_up","success":true,"data":{"disposition":"queued"}}}
+{"ts":1793470207387,"event":"tool_execution_end","detail":{"toolName":"bash"}}
+{"ts":1793470207388,"event":"message_start","detail":{"role":"toolResult"}}
+{"ts":1793470207388,"event":"message_end","detail":{"role":"toolResult"}}
+{"ts":1793470207390,"event":"turn_end","detail":null}
+{"ts":1793470207394,"event":"turn_start","detail":null}
+{"ts":1793470207396,"event":"message_start","detail":{"role":"user"}}
+{"ts":1793470207396,"event":"driver:queue_update","detail":{"steering":[],"followUp":["FOLLOWUP: say GREEN."]}}
+{"ts":1793470207396,"event":"message_end","detail":{"role":"user"}}
+{"ts":1793470207601,"event":"message_start","detail":{"role":"assistant"}}
+{"ts":1793470210816,"event":"message_end","detail":{"role":"assistant"}}
+{"ts":1793470210816,"event":"driver:assistant_text","detail":"DONE BLUE"}
+{"ts":1793470210816,"event":"turn_end","detail":null}
+{"ts":1793470210817,"event":"turn_start","detail":null}
+{"ts":1793470210818,"event":"message_start","detail":{"role":"user"}}
+{"ts":1793470210818,"event":"message_end","detail":{"role":"user"}}
+{"ts":1793470210818,"event":"driver:queue_update","detail":{"steering":[],"followUp":[]}}
+{"ts":1793470211146,"event":"message_start","detail":{"role":"assistant"}}
+{"ts":1793470212406,"event":"message_end","detail":{"role":"assistant"}}
+{"ts":1793470212406,"event":"driver:assistant_text","detail":"GREEN"}
+{"ts":1793470212406,"event":"turn_end","detail":null}
+{"ts":1793470212407,"event":"agent_end","detail":null}
+{"ts":1793470212408,"event":"agent_settled","detail":null}
+```
+
+(`message_start/end` of role `system` and the first `user` message, lines omitted above for brevity, are in the file.) Final assistant texts: `DONE BLUE` (steer consumed) then `GREEN` (follow-up consumed).
+
+Reading of the log:
+1. **`input` fires for both.** Steer and follow-up each fire `input` with `source:"rpc"` and `streamingBehavior:"steer"` / `"followUp"` (idle prompt: `streamingBehavior:null`), at submission time, while the bash tool is still running.
+2. **Neither fires `before_agent_start`** (only the original prompt did, once; also no second `agent_start`). Both were consumed inside the same run (single `agent_start` ... `agent_end`).
+3. **Consumption marker = `message_start`/`message_end` with `role:"user"` after a `turn_start`.** Steer: bash `tool_execution_end` (...207387) -> toolResult message -> `turn_end` -> `turn_start` -> `message_start` user (...207396), i.e. mid-run after the tool result and before the next LLM call. Follow-up: only after the model's next turn ended with no tool calls (...210816), still before `agent_end` (...212407). RPC `queue_update` (not an extension event) drops the item at the same instant (...207396, ...210818).
+4. **Intercept: transform or drop, not hold.** `InputEventResult` = `continue | transform{{text,images?}} | handled` (`dist/core/extensions/types.d.ts:922-930`; `InputEvent.streamingBehavior` at :919, `InputSource` at :908). Desk check of source: `_queueUserInput` runs `_runInputHandlers` before queuing; `handled` returns undefined so the message is never queued and the RPC disposition is `"handled"`; `transform` queues the replacement text (`dist/core/agent-session.js:1590-1602, 1752-1767`; RPC wiring `dist/modes/rpc/rpc-mode.js:319-326`; `emitInput` chains handlers and short-circuits on `handled`, `dist/core/extensions/runner.js:1201-1221`; docs `docs/rpc-commands.md`, steer/follow_up sections). There is no "hold and release later" result: `handled` discards the text unless the extension stores it itself and re-injects it later with `pi.sendUserMessage()` (which then re-enters `input` with `source:"extension"`, `types.d.ts:334`). Not exercised at runtime; the `handled` path was not run.
+
+**Verdict:** Steering and follow-up fire `input` (with `streamingBehavior`) but never `before_agent_start`; consumption is observable as `message_start` role `user` inside a running turn sequence (steer: right after the tool result; follow-up: after the model stops, still inside the run). An extension can transform or drop a queued input at `input` time, not defer it.
+
+**Design impact (mechanism for `needs_reclassification`, methodology 3.4 [verify]):**
+- On `input`: if `event.streamingBehavior` is `"steer"` or `"followUp"`, push the input onto an extension-held FIFO per kind (`pendingSteer`, `pendingFollowUp`) and persist it with `appendEntry`. An `input` with `streamingBehavior === undefined` and `source !== "extension"` starts a new request and is handled by `before_agent_start` as today (route declared fresh).
+- On `message_start` with `message.role === "user"`: if a pending queue is non-empty (steer queue first, since Pi delivers steering before follow-ups), pop one and set route state to `needs_reclassification`. The first user message of a run (right after `agent_start`, no pending entry) is not a trigger. Matching is by FIFO count, not by text, because later `input` handlers or prompt-template expansion can alter the delivered text.
+- While `needs_reclassification`, the `tool_call` gate denies modifying tools until `set_route` re-declares the route for that input; `set_route` clears the state. Do NOT set the state at `input` time: a queued steer is not yet seen by the model, and the in-flight tool calls of the current turn were requested under the old route. Setting it at consumption time is exactly when the model first sees the new request, and the gate then protects the very next turn.
+- Residual risk: a steer that arrives after the last tool call of a turn still lands before the next LLM call, so the window between `input` and consumption contains only already-approved calls; a follow-up consumed after the final turn adds a user message in the same run, so the state must be checked per run, not reset on `agent_start`. `before_agent_start` cannot be relied on for queued inputs. If stricter control is wanted, an `input` handler may return `handled` for a steer that arrives while a change route is active, record it, and surface it to the user instead of delivering it (loses the message unless the extension re-sends it).
+- Caveat: only RPC `source` was exercised; interactive TUI uses the same `_queueUserInput` path (source defaults `"interactive"`), not run here. One model run, no repeat needed.
 
 ## S9 Codex CLI hooks (desk check)
 
