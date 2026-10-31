@@ -87,14 +87,27 @@ describe("checkLayers", () => {
     expect(checkLayers(root).map((x) => x.rule)).toEqual(["pi-import-type-only"]);
   });
 
-  it("extension non-relative imports other than pi types -> extension-core-only", async () => {
+  it("extension non-relative imports other than node builtins and pi types -> extension-core-only", async () => {
     const root = await tree({
       "src/adapters/pi/extension/n.ts": 'import fs from "node:fs";\nimport { z } from "zod";\nimport type { T } from "@earendil-works/pi-ai";\nexport { fs, z };\nexport type U = T;\n',
     });
     const v = checkLayers(root);
-    expect(v.map((x) => [x.rule, x.specifier])).toEqual([
-      ["extension-core-only", "node:fs"],
-      ["extension-core-only", "zod"],
+    expect(v.map((x) => [x.rule, x.specifier])).toEqual([["extension-core-only", "zod"]]);
+  });
+
+  it("extension may import node builtins, prefixed or bare (ruling R6)", async () => {
+    const root = await tree({
+      "src/adapters/pi/extension/b.ts":
+        'import { readFile } from "node:fs/promises";\nimport { join } from "path";\nimport os from "os";\nimport { pathToFileURL } from "node:url";\nexport { readFile, join, os, pathToFileURL };\n',
+    });
+    expect(checkLayers(root)).toEqual([]);
+  });
+
+  it("extension importing a non-builtin package that shadows a builtin-like name stays a violation", async () => {
+    const root = await tree({ "src/adapters/pi/extension/p.ts": 'import x from "fs-extra";\nimport y from "node-fetch";\nexport { x, y };\n' });
+    expect(checkLayers(root).map((x) => [x.rule, x.specifier])).toEqual([
+      ["extension-core-only", "fs-extra"],
+      ["extension-core-only", "node-fetch"],
     ]);
   });
 

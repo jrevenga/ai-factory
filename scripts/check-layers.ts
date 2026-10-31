@@ -2,6 +2,7 @@
 // Run via `npm run lint` (through jiti, no build step) or import `checkLayers` in tests.
 import { parse } from "@babel/parser";
 import { readdirSync, readFileSync } from "node:fs";
+import { isBuiltin } from "node:module";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -140,6 +141,8 @@ export function checkLayers(root: string): LayerViolation[] {
         if (zone === "extension" && tz !== "core" && tz !== "extension") add("extension-core-only");
         continue;
       }
+      // Ruling R6: the extension runs inside Pi and needs Node builtins (fs/path/os) for the handshake.
+      if (zone === "extension" && isBuiltin(spec)) continue;
       if (zone === "extension" && !spec.startsWith(PI_SCOPE)) {
         add("extension-core-only");
         continue;
