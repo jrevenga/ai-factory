@@ -12,11 +12,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         node: ["22.19.0", "24"]
+    env:
+      # Windows legs check out into a directory whose name contains a space (as in a typical user profile path).
+      CHECKOUT_DIR: ${{ matrix.os == 'windows-latest' && 'ai factory' || '.' }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: ${{ env.CHECKOUT_DIR }}
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
@@ -33,11 +38,20 @@ jobs:
           npm --version
           git --version
       - name: Run ci-checks
-        run: node spikes/phase0/ci-checks.mjs
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        run: |
+          echo "checkout path: $PWD"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            case "$PWD" in
+              *" "*) ;;
+              *) echo "expected a checkout path containing a space on Windows" >&2; exit 1 ;;
+            esac
+          fi
+          node spikes/phase0/ci-checks.mjs
       - name: Upload spike output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: spike-out-${{ matrix.os }}-node${{ matrix.node }}
-          path: spikes/phase0/out/marker-*.json
+          path: ${{ env.CHECKOUT_DIR }}/spikes/phase0/out/marker-*.json
           if-no-files-found: ignore

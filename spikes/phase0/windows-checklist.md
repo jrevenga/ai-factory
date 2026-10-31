@@ -4,7 +4,8 @@ Prerequisites: a Windows machine with Git for Windows (Git Bash) and Node >= 22.
 
 1. Clone the repo (private; use your GitHub credentials) and install the isolated Pi:
    `npm install --prefix spikes/phase0/.prefix --ignore-scripts @earendil-works/pi-coding-agent@1.4.0`
-2. `node spikes/phase0/ci-checks.mjs` - record the JSON summary and exit code.
+   Clone into a path that contains a space (for example under your user profile, `C:\Users\<First Last>\...`, or a folder such as `ai factory`); CI only proves the space case if the owner-approved run with the updated workflow passes, so this local run is the real-machine check. Record the checkout path.
+2. `node spikes/phase0/ci-checks.mjs` - record the JSON summary and exit code. In the `cli-install-run` and `bootstrap-empty-prefix` details, confirm the `factory-spike.cmd` path contains the space and the run printed `factory-spike ok v...`.
 3. `node spikes/phase0/pi.mjs`, then `/login` with ChatGPT (Codex subscription).
 4. Task 5 Steps 3-4 and 6 (Codex gate and prompt sections).
 5. Task 6 Step 1 (Codex).

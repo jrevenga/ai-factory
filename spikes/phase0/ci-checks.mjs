@@ -48,8 +48,12 @@ async function runInstalled(scenario) {
   const env = { ...process.env };
   delete env.npm_config_prefix;
   delete env.NPM_CONFIG_PREFIX;
-  const [cmd, args] = win ? [process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", exe]] : [exe, []];
-  const r = await spawnBounded(cmd, args, { env, cwd: os.tmpdir(), stdio: ["ignore", "pipe", "pipe"] }, { timeoutMs: 60000 });
+  // Windows: `cmd /s /c` strips the first and last quote of the command string, so the quoted shim path gets one
+  // extra pair of quotes and is passed verbatim (no Node re-quoting); this keeps paths with spaces intact.
+  const [cmd, args, extra] = win
+    ? [process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", `""${exe}""`], { windowsVerbatimArguments: true }]
+    : [exe, [], {}];
+  const r = await spawnBounded(cmd, args, { env, cwd: os.tmpdir(), stdio: ["ignore", "pipe", "pipe"], ...extra }, { timeoutMs: 60000 });
   const ok = r.code === 0 && /factory-spike ok v/.test(r.stdout);
   return { ok, detail: `${exe}\n${summarize("run", r)}` };
 }
