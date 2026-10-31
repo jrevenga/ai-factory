@@ -66,10 +66,6 @@ function staticString(n: unknown): string | undefined {
   return undefined;
 }
 
-function allTypeSpecifiers(specs: unknown, kindKey: "importKind" | "exportKind"): boolean {
-  return Array.isArray(specs) && specs.length > 0 && specs.every((sp) => isNode(sp) && sp[kindKey] === "type");
-}
-
 function findRefs(src: string, file: string): Ref[] {
   let ast: Node;
   try {
@@ -90,13 +86,16 @@ function findRefs(src: string, file: string): Ref[] {
     };
     switch (node.type) {
       case "ImportDeclaration":
-        add(staticString(node.source), node.importKind === "type" || allTypeSpecifiers(node.specifiers, "importKind"));
+        add(staticString(node.source), node.importKind === "type");
         break;
       case "ExportNamedDeclaration":
       case "ExportAllDeclaration":
         if (node.source) {
-          add(staticString(node.source), node.exportKind === "type" || allTypeSpecifiers(node.specifiers, "exportKind"));
+          add(staticString(node.source), node.exportKind === "type");
         }
+        break;
+      case "TSImportType":
+        add(staticString(node.source), true);
         break;
       case "ImportExpression":
         add(staticString(node.source), false);

@@ -134,11 +134,23 @@ describe("checkLayers", () => {
     expect(checkLayers(root).map((x) => x.rule)).toEqual(["core-no-io-builtins"]);
   });
 
-  it("type-only specifiers and a syntax error", async () => {
-    const ok = await tree({ "src/core/q.ts": 'import { type A, type B } from "../cli/y.ts";\nexport type X = A | B;\n' });
-    expect(checkLayers(ok).map((x) => x.rule)).toEqual(["core-no-cli"]);
+  it("specifier-level type imports are value imports; syntax error names the file", async () => {
+    const ext = await tree({
+      "src/adapters/pi/extension/t.ts": 'import { type A } from "@earendil-works/pi-ai";\nexport { type B } from "@earendil-works/pi-ai";\nexport type X = A;\n',
+    });
+    expect(checkLayers(ext).map((x) => [x.rule, x.line])).toEqual([
+      ["pi-import-type-only", 1],
+      ["pi-import-type-only", 2],
+    ]);
     const bad = await tree({ "src/core/z.ts": "import {{{ nope\n" });
     expect(() => checkLayers(bad)).toThrow(/cannot parse src\/core\/z\.ts/);
+  });
+
+  it("import() types are type-only dependencies that still obey layers", async () => {
+    const root = await tree({ "src/core/it.ts": 'export type X = import("../adapters/x.ts").X;\n' });
+    expect(checkLayers(root).map((x) => x.rule)).toEqual(["core-no-adapters"]);
+    const ext = await tree({ "src/adapters/pi/extension/it.ts": 'export type Y = import("@earendil-works/pi-ai").Y;\n' });
+    expect(checkLayers(ext)).toEqual([]);
   });
 
   it("multi-line imports, import type and export-from are classified correctly", async () => {
