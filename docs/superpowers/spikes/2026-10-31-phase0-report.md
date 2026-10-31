@@ -963,14 +963,57 @@ Windows specifics observed in the logs: the executable was `D:\a\ai-factory\ai-f
 | 7 | Pi `bash` tool via `-p` prompt: `printf 'Bash is working\n'; echo "$BASH_VERSION $OSTYPE $0"` | tool result `Bash is working` / `5.2.37(1)-release msys /usr/bin/bash` | 0 | pass |
 | 8 | Bridge on Windows | not run: no Claude Code (nor Codex CLI) on the machine (`command -v claude codex` empty) | n/a | unverified |
 
-**Comparison with Linux.** The Windows inventory in item 4 is identical to the Linux list recorded in S5 (same ten names in the same order and the same exposures: eight `direct`, `codemode` and `tool_search` `model-only`; `powershell` is listed on Linux too). The `active` set was `read, bash, edit, write`. Item 5 matches Linux: default transport `auto` writes a session file and no header log. Items 4 and 6 show the gate blocking `write` and `bash` through `tool_call` on Windows with the same `spike gate` result as Linux.
+**Exact commands** (sanitised: the token was only in the session environment via `winrun.sh`; Node portable zips on PATH per command; `$HOME` = `C:\Users\jorge`). Exit codes are from the "Controller console capture" section of `spikes/phase0/out/windows/RUNLOG.md`.
+
+Items 1 and 2 (`w1.sh`, `w3.sh`): console `pi-install exit=0`; both ci-checks loops `exit=0`.
+
+```bash
+export PATH="$HOME/ai-factory-spike-node/node-v24.22.1-win-x64:$PATH"
+mkdir -p "$HOME/ai factory" && cd "$HOME/ai factory"
+git clone -q https://github.com/jrevenga/ai-factory.git
+cd ai-factory && git log --oneline -1 && pwd -W        # 8b8050b ... / C:/Users/jorge/ai factory/ai-factory
+npm install --prefix spikes/phase0/.prefix --ignore-scripts --no-fund --no-audit @earendil-works/pi-coding-agent@1.4.0
+
+for v in 24.22.1 22.19.0; do
+  export PATH="$HOME/ai-factory-spike-node/node-v$v-win-x64:$PATH"
+  node spikes/phase0/ci-checks.mjs > "spikes/phase0/out-win-ci-$v.json" 2>&1; echo "exit=$?"
+done
+```
+
+Item 4 (`w4.sh`, Node 24; `R` = `C:/Users/jorge/ai factory/ai-factory`, `O` = `$R/spikes/phase0/out`, `T` = fresh `mktemp -d`, `N` = 1793477598). Console: `run1 block=0 exit=0` (created.txt EXISTS (hello)), `run2 block=1 exit=0` (absent), `run3 block=1 exit=0` (absent).
+
+```bash
+P1="Create a file named created.txt containing hello, then answer in one sentence."
+P3="Run this exact shell command with your bash tool: echo hello > created.txt — then answer in one sentence."
+# run n with block b and prompt P:
+( cd "$T" && SPIKE_TOOLLOG="$O/win-s4-$N-$n.jsonl" SPIKE_INVENTORY="$O/win-s4-$N-$n-inv.json" SPIKE_BLOCK_WRITES=$b \
+  timeout 200 node "$R/spikes/phase0/pi.mjs" -p --no-session --model openai-codex/gpt-6.1-sol \
+  --extension "$R/spikes/phase0/gate-probe.ts" "$P" </dev/null > "$O/win-s4-$N-$n.out" 2>&1 )
+# run 1: b=0 P=$P1;  run 2: b=1 P=$P1;  run 3: b=1 P=$P3
+```
+
+Items 5-7 (`w5.sh`, Node 24, `N` = 1793477643). Console: `s6 exit=0`, `header log exists: no`, `wt: C:/Users/jorge/ai factory/ai-factory-spike-wt`, `s7 exit=0`, `stderr bytes: 0`, `wt removed`, `bash-tool exit=0`.
+
+```bash
+timeout 400 node spikes/phase0/s6-probe.mjs win-codex-$N openai-codex/gpt-6.1-sol </dev/null > "$O/win-s6-$N.txt" 2>&1
+
+git worktree add -q "../ai-factory-spike-wt" -b spike/wt master
+timeout 300 node spikes/phase0/rpc-subagent.mjs ../ai-factory-spike-wt openai-codex/gpt-6.1-sol </dev/null > "$O/win-s7-$N.txt" 2> "$O/win-s7-$N.err"
+git worktree remove ../ai-factory-spike-wt && git branch -D spike/wt
+
+( cd "$T" && SPIKE_TOOLLOG="$O/win-bash-$N.jsonl" timeout 200 node "$R/spikes/phase0/pi.mjs" -p --no-session --model openai-codex/gpt-6.1-sol \
+  --extension "$R/spikes/phase0/gate-probe.ts" "Run this exact shell command with your bash tool: printf 'Bash is working\n'; echo \"\$BASH_VERSION \$OSTYPE \$0\" — then answer in one sentence." </dev/null > "$O/win-bash-$N.out" 2>&1 )
+```
+
+**Comparison with Linux.** The Windows inventory in item 4 is identical to the Linux list recorded in S5 (same ten names in the same order and the same exposures: eight `direct`, `codemode` and `tool_search` `model-only`; `powershell` is listed on Linux too). The `active` set was `read, bash, edit, write`. Item 5 matches Linux: default transport `auto` writes a session file and no header log. Item 4 shows the gate blocking `write` and `bash` through `tool_call` on Windows with the same `spike gate` result as Linux. Item 6 shows the hook running in the RPC subagent (one `bash` call logged as `decision: allowed`); it does not exercise a denial.
 
 **Not tested on Windows:** Codex transport `sse` (limit headers), process-tree teardown and timeouts of the RPC runner (C7), Node 22.19.0 for model runs, the bridge.
 
 **Observations.**
 - Install `doctor` on Windows: an SSH or other non-interactive session has no usable credential store (GCM cannot use `wincredman`) and the user's SSH key may be unreadable ("error in libcrypto"). `doctor` should detect missing git credentials in non-interactive sessions and print the fix (credential helper or token env), beyond the two error strings already listed for S2.
 - `dism` is the working route to install OpenSSH Server when `Add-WindowsCapability` fails; only relevant to remote-support docs.
-- The isolated Pi install took 8.3 s (Node 22) on a cold prefix; the Node 24 run reused the prefix, so it is not a timing sample.
+- The isolated Pi install timings (8304 ms on the Node 22.19.0 run, 582 ms on Node 24.22.1) are repeated-install checks, not cold-install measurements: both runs printed `up to date` (`up to date in 7s` and `up to date in 488ms`) because item 1 had already populated the prefix. The only cold Windows install timings remain the CI runner figures above and the `cli-install-run`/`bootstrap-empty-prefix` rows.
+- Warnings in the captured output, none of which failed a check. npm: `deprecated node-domexception@1.0.0: Use your platform's native DOMException instead` (a transitive dependency of the Pi tree, informational), and `2 packages have install scripts not yet covered by allowScripts` (`@google/genai@2.21.0` preinstall no-op, `protobufjs@7.6.6` postinstall): the global installs of the spike package pull Pi's dependency tree (see C2), and newer npm warns that dependency install scripts will need an explicit allow-list. This supports the C2 requirement that dependency scripts are reviewed with the release manifest and that the installer may need `allowScripts` handling. Node 22.19.0: `ExperimentalWarning: SQLite is an experimental feature and might change at any time` from `node:sqlite` (the S1 JSON carries it as `"warning"`; Node 24.22.1 prints none). The feature works, but the warning is on stderr, so the Factory must not treat stderr output from its own CLI on Node 22 as a failure.
 
 **Verdict:** changed (two small spec additions, see Design impact); items 1-7 of the checklist are confirmed (all pass on the owner's machine, including a path with a space), with one gap: bridge on Windows (item 8) is unverified.
 
