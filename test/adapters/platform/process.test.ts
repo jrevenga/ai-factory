@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { UnsafeCmdArgument } from "../../../src/adapters/platform/cmd-quote.ts";
-import { runBounded } from "../../../src/adapters/platform/process.ts";
+import { ProcessTeardownFailed, runBounded, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
 const FIXTURES = fileURLToPath(new URL("../../fixtures/proc/", import.meta.url));
@@ -131,6 +131,17 @@ describe("runBounded", () => {
     expect(killProbe(pid)).toBe("ESRCH");
   });
 
+  it.runIf(!isWindows)("POSIX: detects orphans on leader exit even when they keep the output pipes open", async () => {
+    const pidFile = join(tmp.dir, "child.pid");
+    const t0 = Date.now();
+    const r = await runBounded(process.execPath, [fixture("exit-leave-child.mjs"), pidFile, "inherit"]);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(r.orphans).toBe(true);
+    expect(r.code).toBe(0);
+    const pid = await readPid(pidFile);
+    expect(killProbe(pid)).toBe("ESRCH");
+  });
+
   it("installs parent signal handlers only while a child is active", async () => {
     const before = { int: process.listenerCount("SIGINT"), term: process.listenerCount("SIGTERM") };
     const run = runBounded(process.execPath, ["-e", "setTimeout(() => {}, 200)"]);
@@ -187,5 +198,49 @@ describe("runBounded", () => {
     const cmdFile = join(tmp.dir, "noop.cmd");
     await writeFile(cmdFile, "@exit /b 0\r\n");
     await expect(runBounded(cmdFile, ["a&b"])).rejects.toBeInstanceOf(UnsafeCmdArgument);
+  });
+});
+
+// The Windows teardown branch (taskkill) with an injected tree-kill command, so it runs on every OS.
+describe("runBounded Windows teardown", () => {
+  const HANG = ["-e", "setInterval(() => {}, 1000)"];
+  const fakeTaskkill = (script: string) => () => spawn(process.execPath, ["-e", script], { stdio: "ignore" });
+
+  async function expectTeardownFailure(deps: Partial<ProcessDeps>): Promise<ProcessTeardownFailed> {
+    const before = { int: process.listenerCount("SIGINT"), term: process.listenerCount("SIGTERM") };
+    const error = await runBounded(process.execPath, HANG, { timeoutMs: 200 }, { platform: "win32", ...deps }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(ProcessTeardownFailed);
+    const failure = error as ProcessTeardownFailed;
+    spawnedPids.push(failure.pid);
+    expect(killProbe(failure.pid)).toBe("alive");
+    expect(process.listenerCount("SIGINT")).toBe(before.int);
+    expect(process.listenerCount("SIGTERM")).toBe(before.term);
+    return failure;
+  }
+
+  it("resolves as cancelled when the tree-kill command succeeds", async () => {
+    const r = await runBounded(process.execPath, HANG, { timeoutMs: 200 }, {
+      platform: "win32",
+      spawnTaskkill: (pid) => spawn(process.execPath, ["-e", `process.kill(${pid}, "SIGKILL")`], { stdio: "ignore" }),
+    });
+    expect(r).toMatchObject({ code: null, timedOut: true, orphans: false });
+  });
+
+  it("rejects with ProcessTeardownFailed when taskkill cannot start", async () => {
+    const failure = await expectTeardownFailure({ spawnTaskkill: () => spawn(join(tmp.dir, "no-such-taskkill"), [], { stdio: "ignore" }) });
+    expect(failure.reason).toMatch(/could not start/);
+  });
+
+  it("rejects with ProcessTeardownFailed when taskkill exits non-zero", async () => {
+    const failure = await expectTeardownFailure({ spawnTaskkill: fakeTaskkill("process.exit(1)") });
+    expect(failure.reason).toBe("taskkill exited with 1");
+  });
+
+  it("rejects with ProcessTeardownFailed when taskkill does not finish in time", async () => {
+    const failure = await expectTeardownFailure({ spawnTaskkill: fakeTaskkill("setInterval(() => {}, 1000)"), taskkillTimeoutMs: 300 });
+    expect(failure.reason).toMatch(/did not finish within 300 ms/);
   });
 });

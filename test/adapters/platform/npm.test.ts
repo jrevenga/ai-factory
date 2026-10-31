@@ -2,6 +2,7 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { npm, NpmNotFound, resolveNpm } from "../../../src/adapters/platform/npm.ts";
+import { isolatedEnv } from "../../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
 const isWindows = process.platform === "win32";
@@ -34,6 +35,12 @@ describe("resolveNpm", () => {
     expect(() => resolveNpm({ npm_execpath: "/x/pnpm.cjs", PATH: "" })).toThrow(NpmNotFound);
   });
 
+  it("falls back to PATH npm when npm_execpath is pnpm's entry", async () => {
+    // Under `pnpm run`, pnpm sets npm_execpath to pnpm.cjs (ruling R3); npm args must not go to pnpm.
+    const { bin, npmPath } = await fakeNpmOnPath();
+    expect(resolveNpm({ npm_execpath: "/x/pnpm.cjs", PATH: bin })).toEqual({ cmd: npmPath, args: [] });
+  });
+
   it("throws NpmNotFound with a fix when npm is not on PATH", () => {
     expect(() => resolveNpm({ PATH: "" })).toThrow(NpmNotFound);
     expect(() => resolveNpm({})).toThrow(/install Node\.js/i);
@@ -60,15 +67,18 @@ describe("npm", () => {
       fake,
       "process.stdout.write(JSON.stringify({ args: process.argv.slice(2), prompt: process.env.GIT_TERMINAL_PROMPT, gcm: process.env.GCM_INTERACTIVE, cwd: process.cwd() }));\n",
     );
-    const r = await npm(["install", "C:\\a b"], { env: { ...process.env, npm_execpath: fake }, cwd: tmp.dir, timeoutMs: 30_000 });
+    const r = await npm(["install", "C:\\a b"], { env: { ...isolatedEnv(tmp.dir), npm_execpath: fake }, cwd: tmp.dir, timeoutMs: 30_000 });
     expect(r.code, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout) as { args: string[]; prompt: string; gcm: string };
     expect(out).toMatchObject({ args: ["install", "C:\\a b"], prompt: "0", gcm: "never" });
   });
 
-  it("runs the real npm", async () => {
-    const r = await npm(["--version"], { timeoutMs: 60_000 });
+  it("runs the real npm in an isolated environment", async () => {
+    const env = isolatedEnv(tmp.dir);
+    const r = await npm(["--version"], { env, cwd: tmp.dir, timeoutMs: 60_000 });
     expect(r.code, r.stderr).toBe(0);
     expect(r.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+    const prefix = await npm(["config", "get", "prefix"], { env, cwd: tmp.dir, timeoutMs: 60_000 });
+    expect(prefix.stdout.trim()).toBe(env.npm_config_prefix);
   });
 });
