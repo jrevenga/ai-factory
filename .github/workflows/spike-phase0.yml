@@ -1,0 +1,43 @@
+name: spike-phase0
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  checks:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["22.19.0", "24"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Configure private repo access
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://x-access-token:${GH_TOKEN}@github.com/".insteadOf "git@github.com:"
+      - name: Versions
+        run: |
+          node --version
+          npm --version
+          git --version
+      - name: Run ci-checks
+        run: node spikes/phase0/ci-checks.mjs
+      - name: Upload spike output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-out-${{ matrix.os }}-node${{ matrix.node }}
+          path: spikes/phase0/out/marker-*.json
+          if-no-files-found: ignore
