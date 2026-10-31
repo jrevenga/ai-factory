@@ -514,15 +514,84 @@ The one-command bootstrap works in these runs. Timings are single runs; the boot
 
 ## S9 Codex CLI hooks (desk check)
 
-**Question:** TBD
+**Question:** The design (§7.5) has a `[verify]` marker: what hook mechanism does Codex CLI offer for enforcing the factory's hard gates (deny destructive commands, block publish/remote mutation, protect secrets, restrict writes to the worktree) from a future Codex adapter? Concretely: (a) is there a PreToolUse-style hook that can deny a call before execution, (b) which approval policies and sandbox modes exist and can an external program answer approvals, (c) is there a command allow/deny rules mechanism.
 
-**Method:** TBD
+**Method:** Desk check, no model call (owner quota exhausted). Inspected the local CLI help and feature flags, generated the app-server JSON Schema into `spikes/phase0/out/s9-schema/` (git-ignored), read the Rust sources at tag `rust-v0.163.0` (`openai/codex`) via `gh api`, read the current official docs (the `developers.openai.com/codex/*` URLs 308-redirect to `learn.chatgpt.com/docs/*`), and ran `codex execpolicy check` (pure local rules evaluation, no model) against a scratch rules file. Version caveat: the binary at `~/.local/bin/codex` now reports `codex-cli 0.166.0` (the standalone install self-updated; the brief said 0.163.0). Source-level claims are pinned to `rust-v0.163.0`; CLI/schema output and docs pages are 0.166.0/current. Anything that differs is flagged below.
 
-**Evidence:** TBD
+**Evidence:**
 
-**Verdict:** TBD
+1. Version and hooks feature flag
+```
+$ codex --version        -> codex-cli 0.166.0
+$ codex features list | grep -E '^(hooks|guardian_approval|plugin_hooks|request_rule)'
+hooks              stable   true
+guardian_approval  stable   true
+plugin_hooks       removed  false
+request_rule       removed  false
+$ codex exec --help | grep -n hook
+--dangerously-bypass-hook-trust   Run enabled hooks without requiring persisted hook trust ...
+```
 
-**Design impact:** TBD
+2. Hook system exists and is a PreToolUse-style gate. Docs (https://learn.chatgpt.com/docs/hooks, fetched 2026-10-31):
+- Config: `hooks.json` or `[hooks]` tables in `config.toml`, at `~/.codex/` and `<repo>/.codex/` (project layer only when trusted); plugins; managed `requirements.toml`.
+- Events: `SessionStart, SessionEnd, PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, UserPromptSubmit, SubagentStart, SubagentStop, Stop, Interrupt`.
+- Handler types that run: `command`, `mcp_tool` (`prompt`/`agent` parsed but skipped).
+- Config shape: `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"...","timeout":30}]}]}}`; TOML: `[[hooks.PreToolUse]]` + `[[hooks.PreToolUse.hooks]]`. `matcher` is a regex on tool name (`Bash`, `^apply_patch$`, `Edit|Write`, `mcp__fs__.*`).
+- Input on stdin: `session_id, transcript_path, cwd, hook_event_name, model, permission_mode, turn_id, tool_name, tool_use_id, tool_input` (`tool_input.command` for Bash/apply_patch).
+- Covered tools: shell (`Bash`), `exec_command`, `apply_patch` (matchable as `apply_patch`/`Edit`/`Write`), MCP tools, other local function tools. Not covered: hosted tools (`WebSearch`). `write_stdin` does not re-trigger PreToolUse.
+- Docs' own caveat: "Treat tool hooks as a useful guardrail, not a complete enforcement boundary."
+
+3. Deny semantics confirmed in source at `rust-v0.163.0`:
+- `codex-rs/hooks/src/events/pre_tool_use.rs`: exit code 2 with non-empty stderr -> `should_block` (L264-L273 region: `Some(2) if handler.can_apply_control_effects()`); exit 2 with empty stderr -> hook marked Failed, NOT blocked (L274); any other non-zero exit, or a crash/timeout -> `HookRunStatus::Failed` (L278-L282), i.e. the call proceeds (fail-open).
+- Same file, tests: `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"do not run that"}}` -> blocked (L357-L372); legacy `{"decision":"block","reason":...}` -> blocked (L485-L500); `permissionDecision:"ask"` -> "unsupported", `should_block:false` (fails open) (L556-L581).
+- `codex-rs/hooks/src/engine/output_parser.rs`: unsupported `continue:false`, `stopReason`, `suppressOutput` (L369-L375), `permissionDecision:allow` without `updatedInput` and `ask` (L454-L459), `deny` without a non-empty reason (L510). All invalid output = hook failed = call continues.
+- Multiple matching hooks run concurrently; any block wins (`results.iter().any(...)`, L115).
+Source: https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/hooks/src/events/pre_tool_use.rs and `.../engine/output_parser.rs`.
+
+4. Trust: non-managed hooks must be reviewed/trusted (hash-bound; `/hooks` in TUI); `--dangerously-bypass-hook-trust` skips it for a run; hooks can be turned off with `[features] hooks = false`; managed hooks (`requirements.toml`, `managed_dir`) are trusted by policy and cannot be disabled by users. A project-local `.codex/hooks.json` is ignored unless the project layer is trusted. Consequence: a factory-provisioned hook is not active until trusted, so the adapter must pre-trust/manage it or fail closed when it is not loaded.
+
+5. Approval policy and sandbox values (app-server schema generated by the local binary, `codex app-server generate-json-schema --out spikes/phase0/out/s9-schema`, 0.166.0; `AskForApproval` also defined at `codex-rs/protocol/src/protocol.rs` L1092 in the 0.163.0 tag):
+```
+AskForApproval: "untrusted" | "on-request" | "never" | {"granular":{sandbox_approval, rules, mcp_elicitations, request_permissions, skill_approval}}
+   (legacy alias "on-failure" -> on-request, protocol.rs L1100)
+SandboxMode:    "read-only" | "workspace-write" | "danger-full-access"
+ApprovalsReviewer: "user" | "auto_review" | "guardian_subagent"(legacy)
+SandboxPolicy.type: dangerFullAccess | readOnly | externalSandbox | workspaceWrite(+networkAccess, writable roots, excludeSlashTmp...)
+```
+Config keys: `approval_policy`, `sandbox_mode`, CLI `-s/--sandbox`, `-c key=val`, `--ask-for-approval` (interactive), `--approve-for-me`, `--dangerously-bypass-approvals-and-sandbox`. Note the owner's `~/.codex/config.toml` currently sets `approval_policy = "never"` and `sandbox_mode = "danger-full-access"` (structure only inspected): the factory must never rely on user config and must pass explicit overrides.
+
+6. External program answering approvals: the app-server (JSON-RPC over stdio, `codex app-server`) sends server-to-client requests that the client must answer. Generated `ServerRequest.json` methods:
+```
+item/commandExecution/requestApproval, item/fileChange/requestApproval, item/permissions/requestApproval,
+item/tool/requestUserInput, mcpServer/elicitation/request, item/tool/call,
+applyPatchApproval, execCommandApproval (legacy), account/chatgptAuthTokens/refresh, attestation/generate
+```
+`CommandExecutionRequestApprovalParams` carries `command, cwd, commandActions, reason, networkApprovalContext, proposedExecpolicyAmendment, threadId, turnId, itemId`. Response decisions include `accept`, `acceptForSession`, `acceptWithExecpolicyAmendment`, and decline/cancel variants. So a factory process acting as app-server client can allow/deny each approval, but ONLY for actions that actually trigger an approval (policy `untrusted`/`on-request`/`granular`). With `approval_policy=never` nothing is asked and the sandbox is the only limit. `codex exec` has no approval callback (non-interactive: it either runs within the sandbox or fails), so approval-brokering requires app-server, not `exec`.
+
+7. Rules (exec policy): docs https://learn.chatgpt.com/docs/agent-configuration/rules (marked experimental). `*.rules` files in `rules/` next to any active config layer (`~/.codex/rules/default.rules`; `<repo>/.codex/rules/` only if project trusted). Starlark `prefix_rule(pattern=[...], decision="allow|prompt|forbidden", justification=, match=[...], not_match=[...])`; pattern elements may be alternatives lists; most restrictive wins (forbidden > prompt > allow). `allow` means "run outside the sandbox without prompting"; `forbidden` blocks without prompting. Wrapper handling per docs: `bash -lc "a && b | c"` is split only if linear plain words; redirections, substitutions, env vars, wildcards or control flow make it one opaque command. Local run (no model):
+```
+$ codex execpolicy check --rules out/s9-gate.rules -- git push origin main
+{"matchedRules":[{"prefixRuleMatch":{"matchedPrefix":["git","push"],"decision":"forbidden","justification":"factory gate: no remote mutation"}}],"decision":"forbidden"}   exit 0
+$ codex execpolicy check --rules out/s9-gate.rules -- bash -lc 'git status && git push'
+{"matchedRules":[]}
+$ codex execpolicy check --rules out/s9-gate.rules -- bash -lc 'echo $(git push)'
+{"matchedRules":[]}
+$ codex execpolicy check --rules out/s9-gate.rules -- ls
+{"matchedRules":[]}
+```
+Observation: the `check` subcommand evaluates the argv literally (it does not apply the core's shell-wrapper splitting, which happens in the runtime), so it can be used to unit-test rules for plain argv forms only; wrapper behaviour must be taken from the docs, not from `check`. A command with no matching rule yields no decision (falls through to approval policy/sandbox), so rules are a deny-list/escalation list, not a default-deny allow-list.
+
+8. Other: `notify` (config program invoked on events such as turn completion) is notification-only and cannot gate; `sandbox` (`codex sandbox -- <cmd>`) runs a command under the Codex sandbox, useful for tests. `PermissionRequest` hook event exists (hooks can answer approval prompts; `updatedInput`/`updatedPermissions`/`interrupt` unsupported).
+
+**Verdict:** Yes, Codex (hooks stable since before 0.163.0; `hooks` flag default true) has a Claude-Code-like PreToolUse hook: command hook, JSON on stdin, deny via exit 2 + stderr or `permissionDecision:"deny"` with reason, covering shell, apply_patch, MCP and function tools. It is explicitly a guardrail, not a boundary, and fails open on hook errors, bad output, timeouts, unsupported `ask`, untrusted or unloaded hooks, and uncovered tools (hosted `WebSearch`, `write_stdin` continuation). Recommended layering for the Codex adapter, from strongest to weakest:
+1. Sandbox (OS-level, the real boundary): force `sandbox_mode="workspace-write"` with the worktree as the writable root and network off; this is what enforces "restrict writes to the worktree" and blocks remote mutation by network when networking is disabled. Pass via explicit `-c`/`-s` flags, never inherit user config (the owner's is `never` + `danger-full-access`).
+2. `.rules` forbidden/prompt rules for destructive and publish commands (`rm -rf`, `git push`, `gh pr create`, `npm publish`, ...): cheap, declarative, Codex-native, evaluated before escalation. Limited to prefix matching and only on commands that would leave the sandbox or be approved.
+3. Managed PreToolUse hook (command) that calls the factory's GatePolicy evaluator: needed for what prefix rules cannot express (secret-path reads, apply_patch target paths outside the worktree, MCP tool deny-lists, shell-wrapper content). Install via managed config/`requirements.toml` or pre-trusted project hooks; the adapter must verify the hook is loaded and trusted (e.g. via app-server `hooks/list`, schema type `HooksListEntry` with `HookTrustStatus`) and refuse to start the run otherwise (fail closed at the launcher, since the hook itself fails open).
+4. App-server approval broker (optional): run Codex through `codex app-server` with `approval_policy="on-request"` or `granular`, and answer `requestApproval` requests from GatePolicy. This is the only route to a programmatic approve/deny per action; `codex exec` cannot do it.
+
+What it cannot enforce: hosted tools (web search), commands hidden in opaque shell constructs (`bash -lc` with substitutions/redirections are one command to the rules), anything when the user passes `--dangerously-bypass-*` or `approval_policy=never` + `danger-full-access` (owner's current config), reading secrets that the sandbox allows reading (workspace-write permits reads broadly; needs read-only roots or hook path checks), hook crashes/timeouts (fail-open), and edits made by subprocesses of an allowed command that stay inside the sandbox. Hook/rules specifics are documented as experimental/changing, and the local binary already moved 0.163 -> 0.166, so the adapter needs a version-pinned contract test.
+
+**Design impact:** Resolve §7.5 `[verify]` as: Codex adapter = explicit sandbox flags + generated `.rules` + managed PreToolUse hook backed by the shared GatePolicy evaluator, with a launcher preflight that asserts hook loaded/trusted and config not weakened (fail closed). State in §7.5 that Codex gates are defence in depth (guardrail plus sandbox), weaker than Claude Code's, and that hard gates for publishing/remote mutation must additionally rely on the factory refusing to hold credentials/network in the Codex sandbox and on the outward-action confirmation flow. Add an adapter-contract test pinned to the Codex version (rule/hook output shapes changed risk) and make `codex exec` runs rely on sandbox + rules + hook only (no approval broker); use app-server if per-action approval brokering is wanted. Not verified (needs a model call, deferred until quota returns): that a configured hook actually denies a live model-issued command end to end, and that `workspace-write` blocks a given path on this host; add as a follow-up smoke test.
 
 ## S10 Windows
 
