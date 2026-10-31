@@ -77,6 +77,30 @@ describe("applyManagedPiSettings", () => {
   });
 });
 
+describe("concurrency and release failures", () => {
+  it("two concurrent first-time applies never lose ownership", async () => {
+    const [a, b] = await Promise.all([applyManagedPiSettings(paths, "0.1.0"), applyManagedPiSettings(paths, "0.1.0")]);
+    const all = [...a, ...b].map((c) => c.action).sort();
+    expect(all).toEqual(["set", "set", "unchanged", "unchanged"]);
+    const record = (await readJson(paths.managedSettings)) as { keys: Record<string, unknown> };
+    expect(Object.keys(record.keys).sort()).toEqual(["enableInstallTelemetry", "transport"]);
+  });
+
+  it("propagates a release failure", async () => {
+    const path = join(tmp.dir, "r.json");
+    const lock = async () => async () => { throw new Error("release failed"); };
+    await expect(withPiSettingsLock(path, async () => ({ result: 1 }), { lock })).rejects.toThrow("release failed");
+  });
+
+  it("surfaces both errors when the operation and the release fail", async () => {
+    const path = join(tmp.dir, "r2.json");
+    const lock = async () => async () => { throw new Error("release failed"); };
+    const err = await withPiSettingsLock(path, async () => { throw new Error("op failed"); }, { lock }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AggregateError);
+    expect((err as AggregateError).errors.map((e: Error) => e.message)).toEqual(["op failed", "release failed"]);
+  });
+});
+
 describe("withPiSettingsLock", () => {
   it("does not write when fn returns no next, and releases the lock when fn throws", async () => {
     const path = join(tmp.dir, "s.json");

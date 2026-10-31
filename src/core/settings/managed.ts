@@ -48,7 +48,12 @@ export function planManagedSettings(
   const next: Record<string, unknown> = { ...current };
   const keys: ManagedRecord["keys"] = { ...record.keys };
   const changes: SettingChange[] = [];
-  const stamp = (value: unknown) => ({ value, writtenAt: ctx.now, factoryVersion: ctx.factoryVersion });
+  const stamp = (key: string, value: unknown) => ({
+    ...(Object.hasOwn(record.keys, key) ? record.keys[key] : {}),
+    value,
+    writtenAt: ctx.now,
+    factoryVersion: ctx.factoryVersion,
+  });
 
   const all = new Set([...Object.keys(desired), ...Object.keys(record.keys)]);
   for (const key of all) {
@@ -62,7 +67,7 @@ export function planManagedSettings(
         changes.push({ key, action: "kept-foreign-value" });
       } else {
         next[key] = desired[key];
-        keys[key] = stamp(desired[key]);
+        keys[key] = stamp(key, desired[key]);
         changes.push({ key, action: "set" });
       }
       continue;
@@ -79,7 +84,7 @@ export function planManagedSettings(
       changes.push({ key, action: "unchanged" });
     } else {
       next[key] = desired[key];
-      keys[key] = stamp(desired[key]);
+      keys[key] = stamp(key, desired[key]);
       changes.push({ key, action: "updated" });
     }
   }

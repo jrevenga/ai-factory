@@ -83,4 +83,10 @@ describe("planManagedSettings", () => {
     expect(r.next.theme).toBe("dark");
     expect(r.changes.map((c) => c.key).sort()).toEqual(["enableInstallTelemetry", "transport"]);
   });
+
+  it("preserves unknown metadata on a record entry when updating it", () => {
+    const record = { schema: 1 as const, keys: { x: { value: 1, writtenAt: "old", factoryVersion: "0.0.9", note: "keep" } } };
+    const r = planManagedSettings({ x: 1 }, record, { x: 2 }, ctx);
+    expect(r.record.keys.x).toEqual({ value: 2, writtenAt: ctx.now, factoryVersion: "0.1.0", note: "keep" });
+  });
 });

@@ -48,14 +48,19 @@ async function ensureFile(path: string): Promise<void> {
   }
 }
 
+export interface LockDeps {
+  lock: (path: string, options: lockfile.LockOptions) => Promise<() => Promise<void>>;
+}
+
 export async function withPiSettingsLock<T>(
   settingsPath: string,
   fn: (current: Record<string, unknown>) => Promise<{ next?: Record<string, unknown>; result: T }>,
+  deps: LockDeps = { lock: lockfile.lock },
 ): Promise<T> {
   await ensureFile(settingsPath);
   let release: () => Promise<void>;
   try {
-    release = await lockfile.lock(settingsPath, {
+    release = await deps.lock(settingsPath, {
       realpath: false,
       retries: { retries: 10, minTimeout: 20, maxTimeout: 200 },
     });
@@ -63,14 +68,22 @@ export async function withPiSettingsLock<T>(
     if ((e as NodeJS.ErrnoException).code === "ELOCKED") throw new SettingsLocked(settingsPath, e);
     throw e;
   }
+  let result: T;
   try {
     const current = await readPiSettings(settingsPath);
-    const { next, result } = await fn(current);
-    if (next !== undefined) await writeJsonAtomic(settingsPath, next);
-    return result;
-  } finally {
-    await release().catch(() => undefined);
+    const out = await fn(current);
+    if (out.next !== undefined) await writeJsonAtomic(settingsPath, out.next);
+    result = out.result;
+  } catch (opError) {
+    try {
+      await release();
+    } catch (releaseError) {
+      throw new AggregateError([opError, releaseError], "Pi settings operation failed and the lock could not be released");
+    }
+    throw opError;
   }
+  await release();
+  return result;
 }
 
 async function readRecord(path: string): Promise<ManagedRecord> {
@@ -81,19 +94,22 @@ async function readRecord(path: string): Promise<ManagedRecord> {
   return parsed.data;
 }
 
-/** Applies DESIRED_PI_SETTINGS per key under Pi's lock, then persists the ownership record. */
+/**
+ * Applies DESIRED_PI_SETTINGS per key. Reading the ownership record, writing Pi's settings and then the
+ * record all happen inside one Pi lock critical section, so concurrent callers cannot lose ownership.
+ */
 export async function applyManagedPiSettings(paths: FactoryPaths, factoryVersion: string): Promise<SettingChange[]> {
-  const record = await readRecord(paths.managedSettings);
-  const plan = await withPiSettingsLock(paths.piSettings, async (current) => {
-    const p = planManagedSettings(current, record, DESIRED_PI_SETTINGS, {
+  return withPiSettingsLock(paths.piSettings, async (current) => {
+    const record = await readRecord(paths.managedSettings);
+    const plan = planManagedSettings(current, record, DESIRED_PI_SETTINGS, {
       now: new Date().toISOString(),
       factoryVersion,
     });
-    const changed = p.changes.some((c) => c.action === "set" || c.action === "updated" || c.action === "released");
-    return { next: changed ? p.next : undefined, result: p };
+    const changed = plan.changes.some((c) => c.action === "set" || c.action === "updated" || c.action === "released");
+    // Settings first, then the record: a failure in between leaves keys unrecorded (foreign), never clobbered.
+    if (changed) await writeJsonAtomic(paths.piSettings, plan.next);
+    await mkdir(dirname(paths.managedSettings), { recursive: true });
+    await writeJsonAtomic(paths.managedSettings, plan.record);
+    return { result: plan.changes };
   });
-  // Record after the settings write: a failure in between leaves keys unrecorded (treated as foreign, never clobbered).
-  await mkdir(dirname(paths.managedSettings), { recursive: true });
-  await writeJsonAtomic(paths.managedSettings, plan.record);
-  return plan.changes;
 }
