@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "factory": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "git": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "git"
+      ],
+      "additionalProperties": {}
+    },
+    "stateSchemas": {
+      "type": "object",
+      "properties": {
+        "config.json": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "state.json": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "managed-settings.json": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "config.json",
+        "state.json",
+        "managed-settings.json"
+      ],
+      "additionalProperties": {}
+    },
+    "node": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "min"
+      ],
+      "additionalProperties": {}
+    },
+    "pi": {
+      "type": "object",
+      "properties": {
+        "package": {
+          "type": "string",
+          "const": "@earendil-works/pi-coding-agent"
+        },
+        "version": {
+          "type": "string"
+        },
+        "supportedRange": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "package",
+        "version",
+        "supportedRange"
+      ],
+      "additionalProperties": {}
+    },
+    "companions": {
+      "type": "object",
+      "properties": {
+        "pi-claude-bridge": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "when": {
+              "type": "string",
+              "const": "claude"
+            }
+          },
+          "required": [
+            "source",
+            "when"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "pi-claude-bridge"
+      ],
+      "additionalProperties": {}
+    },
+    "lockfileSha256": {
+      "type": "string"
+    },
+    "reviewedInstallScripts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "factory",
+    "source",
+    "stateSchemas",
+    "node",
+    "pi",
+    "companions",
+    "lockfileSha256",
+    "reviewedInstallScripts"
+  ],
+  "additionalProperties": {}
+}
