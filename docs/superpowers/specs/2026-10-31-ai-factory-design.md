@@ -185,17 +185,17 @@ Model names are data in the profiles; nothing in code hardcodes them. The radar 
 ### 7.3 Orchestration
 - The **orchestrator** is the user's interactive Pi session with the factory extension loaded.
 - **Subagents** are separate Pi processes (`--mode rpc`) started by the factory's `SubagentRunner` (one runtime for every role and provider; the port allows others later). Each subagent is started with: role, model, role instructions (as prompt sections + skill refs), allowed tools, working directory (a worktree), and input artifacts **by reference** (spec/task file paths), never paraphrased (Gentle-AI measured paraphrased handoffs failing 13/26 checks).
-- Delegation is **for a reason, not for size** **[call]**: large exploration that would flood the orchestrator's context, parallel writers on disjoint files, an independent reviewer, or a context backstop in long sessions. Otherwise the orchestrator works inline.
+- Delegation is **for a reason, not for size** **[call]**: large exploration that would flood the orchestrator's context, parallel writers on disjoint files, an independent reviewer, or a context backstop in long sessions. Otherwise the orchestrator works inline. In the project tier the orchestrator acts as coordinator and every plan task goes to a writer subagent **[owner]** (methodology §9).
 - **Parallelism**: global concurrency limit per machine in personal config (default 3 on the owner's server; lower default for laptops; `doctor` suggests a value from RAM) **[call]**.
 - **Isolation**: each writing subagent works in its own git worktree under the project (e.g. `.factory/worktrees/<task>`; ignored by git) **[builder]** exact path. Git checkpoints at phase boundaries. Worktrees are reaped after integration.
 - Every subagent returns a structured result (schema in core): status, summary, artifacts changed, evidence, open questions, usage.
 
 ### 7.4 Integration protocol **[call]**
-- **Base**: worktrees are created from a committed base SHA recorded in the task file; the user's working tree is never used or modified. If it is dirty, the factory bases on `HEAD`, warns, and does not touch uncommitted changes.
+- **Base**: worktrees are created from a committed base SHA recorded in the task file; feature and project work never uses or modifies the user's working tree. If it is dirty, the factory bases on `HEAD`, warns, and does not touch uncommitted changes. Exceptions **[owner]**: the small tier edits in place with an undo snapshot, and the answer route may run commands in place with automatic restore of tracked files (methodology §3.1, §6.1).
 - **Branches**: each task gets an integration branch `factory/<task>` from the base; each parallel writer gets a sub-branch `factory/<task>/<n>` in its own worktree, with an explicit, disjoint file scope assigned by the orchestrator.
 - **Merge order**: sub-branches are merged into the integration branch sequentially in plan order. A conflict goes back to the owning writer (rebase on the current integration head) once; if it persists, the orchestrator resolves it inline and records a decision.
 - **Combined candidate**: after all merges, the full verification (tests, checks, acceptance criteria) runs on the integration branch head, and *that* SHA is frozen for review (§9.4). Per-writer reviews are optional; the combined candidate review is mandatory.
-- **Delivery**: integrating `factory/<task>` into the user's branch is a hard gate. Worktrees and branches are reaped only after successful integration (or explicit abandon).
+- **Delivery**: integrating `factory/<task>` into the user's branch is a hard gate. Integration is a **fast-forward** only: at integration time the factory atomically checks that the target branch tip is still the base the candidate was built on. If the target has advanced, the factory merges the latest target into the integration branch, reruns the full verification, and re-requests review when the incoming changes touch the same files or conflicts were resolved; only then does it fast-forward. Human approval authorizes integration; it does not replace verification of the exact combination. Worktrees and branches are reaped only after successful integration (or explicit abandon).
 
 ### 7.5 Harness portability **[owner]** (goal, Pi first, no per-harness evals) / **[call]** (mechanics)
 The core is harness-agnostic (§5.1); each harness gets a **harness adapter**. Pi's is built first and is the reference.
@@ -241,7 +241,7 @@ Mandatory defaults per tier (owner-approved baseline): feature = stop at design 
 
 ### 8.3 Conditions on autonomy
 1. Every soft gate the orchestrator skips or resolves on its own is written to the **decision log** with justification and shown in the delivery report. It may skip, never hide.
-2. Autonomous work happens in worktrees with checkpoints, so being wrong is cheap to undo.
+2. Autonomous work happens in worktrees with checkpoints (small changes: in place with an undo snapshot), so being wrong is cheap to undo.
 3. Autonomy level (`low | medium | high`) is personal config; core default `medium`, owner sets `high`.
 4. Skipped gates later corrected by the human at delivery are recorded and become an eval signal for the orchestrator's judgment.
 
@@ -254,6 +254,8 @@ Rule: any future runtime that cannot apply `GatePolicy` to its tool calls may ru
 Some methodology invariants are enforced, not just prompted **[call]**: e.g., in feature tier and above, writes to source files are blocked until a task file exists for the current task; a task cannot be reported done without an evidence section. Hooks that only remind must fire at most once per session and fail open.
 
 ## 9. Methodology **[call]** (owner approved the direction)
+
+> The detailed methodology lives in `2026-10-31-factory-methodology-design.md`. This section is a summary; where they differ, the methodology document governs.
 
 Draws on: Superpowers (TDD, evidence before claims, review discipline), Gentle-AI ODD/RDD (proportionality, delegate for a reason, frozen candidate review), RSC-Harness (announced lane, evidence-gated checklists, "Next" field, hooks over prose), Anthropic long-running harness guidance (progress file, one feature at a time, git checkpoints), OpenSpec (living specs with deltas).
 
@@ -273,6 +275,7 @@ A task that outgrows its tier is promoted without restarting (its task file beco
 - `specs/<slug>.md`: living spec (intent, requirements with acceptance criteria, design notes). Changes after approval are recorded as dated deltas.
 - `tasks/<slug>.md`: task file, written before the first source change. Frontmatter `type, status (in-progress|blocked|done), author, branch, tier, spec`. Sections: Intent, Scope, Checklist (each item names what proves it), Evidence (observed output), Decisions (soft gates resolved), Next (single next step for resumption). "The checkbox is not the proof."
 - `decisions/<date>-<slug>.md`: one file per decision (options considered → choice → why). Append-only; superseding decisions link back. One file each to avoid merge conflicts.
+- `plans/<slug>.md` (projects) and `ideas/<slug>.md` (saved exploration outcomes, only on user acceptance); templates in the methodology document §7.
 - `conventions.md`, `index.md`: project conventions and a short index for progressive disclosure.
 - Format: Markdown + YAML frontmatter with a required `type` field and relative links, compatible with Obsidian and Open Knowledge Format readers.
 - Task files are closed (`status: done`, merge info) by the delivery step, not left to the agent's memory.
@@ -408,9 +411,9 @@ Full scope stays **[owner]**: every capability in this document is built; phases
 |---|---|---|
 | 0. Feasibility spikes (throwaway) | Prove on Linux **and Windows**: private-git `pi install` with deps and the chosen extension format; persistent `factory` CLI via the install path; bridge tool forwarding through Pi's `tool_call` hook and absence of Claude Code built-in tools; role instructions via `systemPromptOptions.sections` on bridge and native Codex; Pi subagent over `--mode rpc` with native Codex; limit signals available per provider; `node:sqlite` FTS5 on Node 22.19 | Written spike report; every **[verify]** in this document resolved or the design updated |
 | 1. Foundations | Repo, TS toolchain, layer lint, CI (Linux+Windows, Node 22.19/24), release manifest, Pi package skeleton, config layering + schemas + `config explain`, profiles, per-key managed settings, `factory install/doctor/update/rollback/init`, launcher + handshake + guard extension, migration/backup policy | CI install < 10 min on clean runners; update → rollback round-trip restores state; a broken package install leaves write tools blocked |
-| 2. Safety and recovery basics | GatePolicy + command policy + `tool_call` enforcement, decision log, autonomy levels, run ledger, incremental task state, startup reconciliation | Gate suite incl. bypass attempts passes on both OSes; killing a session mid-task resumes from the last checkpoint |
+| 2. Safety and recovery basics | GatePolicy + command policy + `tool_call` enforcement, decision log, autonomy levels, run ledger, incremental task state, startup reconciliation, route state + `set_route`, `run_check` check records, review dispositions (methodology §3.4, §11, §14) | Gate suite incl. bypass attempts passes on both OSes; killing a session mid-task resumes from the last checkpoint |
 | 3. Evaluation harness | Task format, isolated withheld checks, controlled state, dev/held-out split, runners for all same-provider baselines, per-provider usage, paired statistics, reports | Reproducible baseline report for all baselines on the smoke suite, both profiles |
-| 4. Methodology, inline | Tier classifier, skills, artifacts, small and feature tiers inline (no delegation yet), independent review loop, delivery report, methodology invariants in code | Dev suite: small tier usage ≤ plain CLI per provider; factory ≥ best same-provider baseline on pass rate (held-out confirmed) |
+| 4. Methodology, inline | Tier classifier, skills, artifacts, small and feature tiers inline, independent review loop with a minimal reviewer runner and the integration worktree pulled forward from phase 5, delivery report, methodology invariants in code | Dev suite: small tier usage ≤ plain CLI per provider; factory ≥ best same-provider baseline on pass rate (held-out confirmed) |
 | 5. Delegation and parallelism | SubagentRunner, worktrees, integration protocol (§7.4), concurrency limit, project tier | Feature/project tasks with parallel writers integrate, verify and review the combined candidate; no regression vs phase 4 |
 | 6. Memory and knowledge | MemoryPort + SQLite store, knowledge store, read path, review/consolidation | Memory suite: cross-session recall tasks pass; measured gain vs no-memory |
 | 7. Observability and limits | `/status`, three-state limits, budgets, failover, Windows live-smoke checklist in the release process | Simulated quota exhaustion recovers without lost work; first release passes the Windows live-smoke |
