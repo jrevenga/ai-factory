@@ -12,7 +12,7 @@ This is the only npm command run outside `npm.mjs`.
 
 ## Launchers
 
-- `node spikes/phase0/pi.mjs <pi args...>` runs Pi through its JavaScript bin entry (no `pi.cmd`, `shell: false`). Exit code is passed through. Also usable as `RpcClient`'s `cliPath`.
+- `node spikes/phase0/pi.mjs <pi args...>` runs Pi inside the launcher process itself (env hygiene and guards applied, then Pi's JavaScript bin entry is imported; no child process), so killing the launcher kills Pi on every OS. Exit code is passed through. Also usable as `RpcClient`'s `cliPath`.
 - `node spikes/phase0/npm.mjs <scenario> <npm|npx> <args...>` runs npm/npx with `npm_config_prefix=.npm-global-<scenario>` and `npm_config_cache=out/npm-cache-<scenario>`.
 - Programmatic: `runPi(args, { cwd, env, input, scenario })`, `runNpm(tool, args, { scenario, env })`, and `SPIKE = { root, launcher, agentDir, out }`.
 

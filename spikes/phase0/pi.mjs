@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 export const SPIKE = {
@@ -107,26 +107,12 @@ export function runPi(args, opts = {}) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === SPIKE.launcher) {
-  // CLI mode: inherit stdio so it works as an RPC cliPath; forward termination to Pi.
+  // CLI mode (also RpcClient's cliPath): run Pi inside THIS process, so killing
+  // the launcher kills Pi on every OS. No child process, no signal forwarding.
   const env = isolatedEnv(undefined);
-  const child = spawn(process.execPath, [piBin(), ...process.argv.slice(2)], {
-    env,
-    shell: false,
-    stdio: "inherit",
-  });
-  let exiting = false;
-  const forward = (sig) => () => {
-    exiting = true;
-    try {
-      child.kill(sig);
-    } catch {}
-  };
-  // On Windows Node maps SIGTERM/SIGINT kills to TerminateProcess; "SIGBREAK"/"SIGHUP" are best effort.
-  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP", "SIGBREAK"]) {
-    try {
-      process.on(sig, forward(sig));
-    } catch {}
-  }
-  child.on("error", (e) => die(String(e)));
-  child.on("close", (code, signal) => process.exit(code ?? (signal ? 128 + ({ SIGINT: 2, SIGTERM: 15, SIGHUP: 1 }[signal] ?? 1) : exiting ? 1 : 0)));
+  for (const k of Object.keys(process.env)) if (!(k in env)) delete process.env[k];
+  Object.assign(process.env, env);
+  const bin = piBin();
+  process.argv = [process.execPath, bin, ...process.argv.slice(2)];
+  await import(pathToFileURL(bin).href);
 }
