@@ -573,9 +573,27 @@ Observed: 3 header events for 4 provider turns (prompt 2 has two turns around th
 
 Transport setting in Pi 1.4.0 (found in the installed source, `spikes/phase0/.prefix/node_modules/@earendil-works/pi-coding-agent/dist/`): `core/settings-defaults.js` L4 `transport: "auto"`; `core/settings-manager.js` L614 `getTransport()` returns `this.settings.transport ?? SETTINGS_DEFAULTS.transport`, L616 `setTransport()`, L287-289 legacy `websockets` boolean migrates to `transport: "websocket"|"sse"`; `core/sdk.js` L285 passes `transport: settingsManager.getTransport()` to the provider. So the knob is the `transport` key of the agent dir `settings.json` (values `auto`, `sse`, `websocket`); no CLI flag or env var for it was found (`grep -n transport dist/main.js dist/cli/args.js` empty). For the `sse` run I temporarily added `"transport": "sse"` to `spikes/phase0/.agent/settings.json` (backup copied first) and restored the original content afterwards (verified: no `transport` key remains).
 
-Default transport (`auto`), `cd /tmp && node spikes/phase0/s6-probe.mjs codex-auto openai-codex/gpt-6.1-sol` (exit=0, three prompts settled, prompt 2 crossed a tool boundary, session file written): `out/headers-codex-auto.jsonl` was never created, i.e. `after_provider_response` fired zero times across all provider turns. Confirms the desk-check inference: with `auto` (WebSocket first) the hook is silent for Codex.
+Default transport (`auto`). The first run was piped through `tail -20` (so its `exit=0` was tail's and its output was partial); it was therefore repeated once, with proper capture (fix round 1):
+```
+$ cd /tmp && node /home/jorge/projects/ai-factory/spikes/phase0/s6-probe.mjs codex-auto openai-codex/gpt-6.1-sol </dev/null > /home/jorge/projects/ai-factory/spikes/phase0/out/s6-codex-auto-driver.txt 2>&1; echo exit=$?
+exit=0
+--- prompt 1 settled / evt tool_execution_start / --- prompt 2 settled / --- prompt 3 settled
+sessions dir exists: true [ '2026-10-31T16-33-28-431Z_01a192cf-...jsonl', '2026-10-31T16-36-09-691Z_01a192d1-...jsonl', '2026-10-31T17-41-48-095Z_01a1930d-...jsonl',
+  '2026-10-31T17-44-34-151Z_01a19310-...jsonl', '2026-10-31T17-47-20-223Z_01a19312-...jsonl', '2026-10-31T17-55-39-936Z_01a1931a-591e-74d5-aeab-cf1a211dbdb3.jsonl' ]
+$ ls /home/jorge/projects/ai-factory/spikes/phase0/out/headers-codex-auto.jsonl  -> No such file or directory
+```
+(`s6-probe.mjs` lists `/home/jorge/projects/ai-factory/spikes/phase0/.agent/sessions/`; the newest file is this run's session. The log file is deleted at probe start and only created on the first hook call.) `after_provider_response` fired zero times across all provider turns, in both `auto` runs (the first run likewise produced no header log). Prompt 2 crossed a tool boundary (`tool_execution_start`). With `auto` the provider used WebSocket first, where the hook is not called.
 
-Forced `sse`, `node spikes/phase0/s6-probe.mjs codex-sse openai-codex/gpt-6.1-sol` (exit=0, three prompts settled, tool boundary crossed, session file written): the hook fired 4 times (3 prompts, 4 provider turns), always `status` 200, same header set each time. Rate/usage-related header names: `x-codex-active-limit`, `x-codex-plan-type`, `x-codex-credits-balance`, `x-codex-credits-has-credits`, `x-codex-credits-unlimited`, `x-codex-primary-used-percent`, `x-codex-primary-window-minutes`, `x-codex-primary-reset-after-seconds`, `x-codex-primary-reset-at`, `x-codex-primary-over-secondary-limit-percent`, `x-codex-secondary-used-percent`, `x-codex-secondary-window-minutes`, `x-codex-secondary-reset-after-seconds`, `x-codex-secondary-reset-at` (plus non-limit names such as `x-codex-turn-state`, `x-codex-safety-buffering-*`, `x-models-etag`, `x-oai-request-id`, `set-cookie`, whose values are not logged). Values from the last call:
+Forced `sse` (settings.json changed with a node one-liner adding `"transport": "sse"` after copying the original aside; original copied back after the run, then `grep -c transport .agent/settings.json` -> `0`):
+```
+$ cd /tmp && node /home/jorge/projects/ai-factory/spikes/phase0/s6-probe.mjs codex-sse openai-codex/gpt-6.1-sol </dev/null > /home/jorge/projects/ai-factory/spikes/phase0/out/s6-codex-sse-driver.txt 2>&1; echo exit=$?
+exit=0
+--- prompt 1 settled / evt tool_execution_start / --- prompt 2 settled / --- prompt 3 settled
+sessions dir exists: true [ '2026-10-31T16-33-28-431Z_01a192cf-...jsonl', '2026-10-31T16-36-09-691Z_01a192d1-...jsonl', '2026-10-31T17-41-48-095Z_01a1930d-...jsonl',
+  '2026-10-31T17-44-34-151Z_01a19310-...jsonl', '2026-10-31T17-47-20-223Z_01a19312-b91d-7636-9b83-b156e40bf33f.jsonl' ]
+$ wc -l /home/jorge/projects/ai-factory/spikes/phase0/out/headers-codex-sse.jsonl -> 4
+```
+(This is the second sse run, with the widened filter; the first sse run had the same exit code and header names.) The hook fired 4 times (3 prompts, 4 provider turns), always `status` 200, same header set each time. Rate/usage-related header names: `x-codex-active-limit`, `x-codex-plan-type`, `x-codex-credits-balance`, `x-codex-credits-has-credits`, `x-codex-credits-unlimited`, `x-codex-primary-used-percent`, `x-codex-primary-window-minutes`, `x-codex-primary-reset-after-seconds`, `x-codex-primary-reset-at`, `x-codex-primary-over-secondary-limit-percent`, `x-codex-secondary-used-percent`, `x-codex-secondary-window-minutes`, `x-codex-secondary-reset-after-seconds`, `x-codex-secondary-reset-at` (plus non-limit names such as `x-codex-turn-state`, `x-codex-safety-buffering-*`, `x-models-etag`, `x-oai-request-id`, `set-cookie`, whose values are not logged). Values from the last call:
 ```
 active-limit premium; plan-type plus; credits-balance 0; has-credits False; unlimited False
 primary:   used-percent 0,  window-minutes 300 (5h),   reset-after-seconds 17563
@@ -586,7 +604,7 @@ Values are fresh on every call (reset-after counts down by ~2 s per call). Probe
 
 **Verdict (bridge):** `known` (observed): `after_provider_response` receives `anthropic-ratelimit-unified-*` headers on the bridge, including 5h and 7d utilization (fraction) and reset epochs, status always 200; exhaustion is `unified-status: rejected` plus an error message prefixed "Claude quota exceeded — rate limit".
 
-**Verdict (Codex):** `known` (observed) only with `transport: "sse"`: per-call `x-codex-primary-*` (5h window) and `x-codex-secondary-*` (7d window) used-percent, window minutes and reset times, plus plan type and credits flags. With the default `auto` transport it is `not observed` and in practice `unavailable` (the hook never fired in 3 prompts; the source calls `onResponse` only on the SSE path). Exhaustion signal (desk check, not live-tested): HTTP 429 on SSE reaching the hook with its real status, and an assistant message with `stopReason: "error"` whose text reads "You have hit your ChatGPT usage limit".
+**Verdict (Codex):** `known` (observed) only with `transport: "sse"`: per-call `x-codex-primary-*` (5h window) and `x-codex-secondary-*` (7d window) used-percent, window minutes and reset times, plus plan type and credits flags. With the default `auto` transport it is `not observed` when WebSocket was used (the hook never fired in two 3-prompt runs; the source calls `onResponse` only on the SSE path) and would be available only if `auto` falls back to SSE; force `sse` for predictable signals. Exhaustion signal (desk check, not live-tested): HTTP 429 on SSE reaching the hook with its real status, and an assistant message with `stopReason: "error"` whose text reads "You have hit your ChatGPT usage limit".
 
 **Design impact:** A quota-aware scheduler can read 5h/7d utilization from the bridge via `after_provider_response` without extra calls, but must treat it as best effort (one event per query, may lag, no per-call guarantee), and must detect exhaustion from the header status or the error message, not the HTTP status. For Codex, header-based budgeting works per call but ONLY if the Factory forces `transport: "sse"` in the agent dir settings (the default `auto` never fires the hook); the Factory-provisioned settings must set it and a doctor check should assert it. Without it, rely on error-message detection (`stopReason: "error"` plus `/usage limit|rate limit|quota/i`). Cost of forcing SSE (vs WebSocket latency/reuse) was not measured.
 
@@ -693,17 +711,36 @@ Observation: the `check` subcommand evaluates the argv literally (it does not ap
 
 What it cannot enforce: hosted tools (web search), commands hidden in opaque shell constructs (`bash -lc` with substitutions/redirections are one command to the rules), anything when the user passes `--dangerously-bypass-*` or `approval_policy=never` + `danger-full-access` (owner's current config), reading secrets that the sandbox allows reading (workspace-write permits reads broadly; needs read-only roots or hook path checks), hook crashes/timeouts (fail-open), and edits made by subprocesses of an allowed command that stay inside the sandbox. Hook/rules specifics are documented as experimental/changing, and the local binary already moved 0.163 -> 0.166, so the adapter needs a version-pinned contract test.
 
-**Design impact:** Resolve §7.5 `[verify]` as: Codex adapter = explicit sandbox flags + generated `.rules` + managed PreToolUse hook backed by the shared GatePolicy evaluator, with a launcher preflight that asserts hook loaded/trusted and config not weakened (fail closed). State in §7.5 that Codex gates are defence in depth (guardrail plus sandbox), weaker than Claude Code's, and that hard gates for publishing/remote mutation must additionally rely on the factory refusing to hold credentials/network in the Codex sandbox and on the outward-action confirmation flow. Add an adapter-contract test pinned to the Codex version (rule/hook output shapes changed risk) and make `codex exec` runs rely on sandbox + rules + hook only (no approval broker); use app-server if per-action approval brokering is wanted. Not verified: that a trusted hook denies a live model-issued command end to end (live smoke attempted, see below: NOT RUN to completion because trusting the hook needs a flag the run was not permitted to use or a write to `~/.codex`), and that `workspace-write` blocks a given path on this host.
+**Design impact:** Resolve §7.5 `[verify]` as: Codex adapter = explicit sandbox flags + generated `.rules` + managed PreToolUse hook backed by the shared GatePolicy evaluator, with a launcher preflight that asserts hook loaded/trusted and config not weakened (fail closed). State in §7.5 that Codex gates are defence in depth (guardrail plus sandbox), weaker than Claude Code's, and that hard gates for publishing/remote mutation must additionally rely on the factory refusing to hold credentials/network in the Codex sandbox and on the outward-action confirmation flow. Add an adapter-contract test pinned to the Codex version (rule/hook output shapes changed risk) and make `codex exec` runs rely on sandbox + rules + hook only (no approval broker); use app-server if per-action approval brokering is wanted. Not verified: that a trusted hook denies a live model-issued command end to end (live smoke attempted, see below: positive run PENDING owner action because trusting the hook needs a flag the run was not permitted to use or a write to `~/.codex`), and that `workspace-write` blocks a given path on this host.
 
-### Live smoke (partial: negative control only)
+### Live smoke (partial: negative control only; positive run PENDING, owner action)
 
-Setup: fresh `mktemp -d` dir (`/tmp/tmp.6dcG4S5WYp`), `git init`, `.codex/hooks.json` with a `PreToolUse` matcher `Bash` command hook (`.codex/deny-hook.sh`: appends a line to `hook.log`, exits 2 with stderr `spike gate` when stdin contains `spike-deny`). Command:
+Isolation statement (accurate, not full isolation): the smoke uses the owner's real Codex CLI and real `CODEX_HOME` for authentication only. No config file under `~/.codex` was created or modified by me. `--ephemeral` only avoids session persistence; Codex may still write its own logs/state under `CODEX_HOME`. The explicit `-s workspace-write` and `-c approval_policy=never` flags override the owner's `config.toml` defaults (`never` + `danger-full-access`) for the run. The hook under test is project-local (in the throwaway repo). A throwaway `CODEX_HOME` was rejected because it would need a copy of the owner's credentials.
+
+Negative control (done): fresh `mktemp -d` dir (`/tmp/tmp.6dcG4S5WYp`), `git init`, `.codex/hooks.json` with a `PreToolUse` matcher `Bash` command hook (`.codex/deny-hook.sh`: appends a line to `hook.log`, exits 2 with stderr `spike gate` when stdin contains `spike-deny`):
 ```
 codex exec -m gpt-6.1-sol -s workspace-write -c approval_policy=never --ephemeral --cd $D "Run the shell command: echo spike-deny > denied.txt" </dev/null   # exit=0
 ```
-(explicit sandbox/approval so the owner's `never` + `danger-full-access` config is not inherited; banner confirmed `approval: never`, `sandbox: workspace-write`.) Result: the model ran `zsh -lc 'echo spike-deny > denied.txt'`, `succeeded`, `denied.txt` was created and `hook.log` does not exist: the project-local hook was NOT loaded, because it is untrusted (project layer / hook trust, S9 item 4). This is a live confirmation of the fail-open consequence: an untrusted or unloaded hook silently allows the command.
+Banner: `approval: never`, `sandbox: workspace-write`. Result: the model ran `zsh -lc 'echo spike-deny > denied.txt'`, `succeeded`, `denied.txt` was created and `hook.log` does not exist: the untrusted project-local hook was NOT loaded (S9 item 4). This confirms the fail-open consequence of an untrusted hook.
 
-Positive run NOT RUN: making the hook active requires either `--dangerously-bypass-hook-trust` (the attempt to run it was denied by the session's permission classifier and I did not work around it) or persisting trust, which writes under `~/.codex` (forbidden for this task). Follow-up for the owner: run the same command with `--dangerously-bypass-hook-trust` in a throwaway dir, or trust the hook through `/hooks`; expected `denied.txt` absent and `hook.log` non-empty.
+Positive run: PENDING (owner action). Activating the hook needs `--dangerously-bypass-hook-trust` (the run was denied by the session permission classifier and not worked around) or persisting trust, which writes under `~/.codex` (not allowed here). Owner command sequence (copy-paste):
+```
+D=$(mktemp -d) && cd "$D" && git init -q . && mkdir .codex
+cat > .codex/deny-hook.sh <<'EOF'
+#!/bin/bash
+IN=$(cat)
+echo "$(date +%s) invoked: $(echo "$IN" | tr -d '\n' | head -c 300)" >> "$(dirname "$0")/../hook.log"
+if echo "$IN" | grep -q 'spike-deny'; then echo "spike gate" >&2; exit 2; fi
+exit 0
+EOF
+chmod +x .codex/deny-hook.sh
+cat > .codex/hooks.json <<EOF2
+{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"$D/.codex/deny-hook.sh","timeout":10}]}]}}
+EOF2
+codex exec -m gpt-6.1-sol -s workspace-write -c approval_policy=never --ephemeral --dangerously-bypass-hook-trust --cd "$D" "Run the shell command: echo spike-deny > denied.txt" </dev/null; echo exit=$?
+ls -A "$D"; cat "$D/hook.log"
+```
+Expected evidence: `hook.log` exists with at least one `invoked:` line containing `spike-deny`; the transcript shows the command blocked ("spike gate" / hook denial) rather than `succeeded`; `denied.txt` is absent from `ls -A`. If `hook.log` is missing, the hook did not load (check `codex features list | grep hooks` and the `matcher` tool name).
 
 ## S10 Windows
 
