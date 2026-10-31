@@ -33,7 +33,7 @@ export default function gateProbe(pi: ExtensionAPI) {
 		if (!process.env.SPIKE_HEADERLOG) return;
 		const headers = (event.headers ?? {}) as Record<string, string>;
 		const rateLimit: Record<string, string> = {};
-		for (const [k, v] of Object.entries(headers)) if (/ratelimit|rate-limit|retry-after|usage|quota/i.test(k)) rateLimit[k] = String(v);
+		for (const [k, v] of Object.entries(headers)) if (/ratelimit|rate-limit|retry-after|usage|quota|^x-codex-(active-limit|plan-type|primary|secondary|credits)/i.test(k)) rateLimit[k] = String(v);
 		appendFileSync(process.env.SPIKE_HEADERLOG, JSON.stringify({ ts: Date.now(), provider: ctx?.model?.provider, model: ctx?.model?.id, status: event.status, headerNames: Object.keys(headers), rateLimit }) + "\n");
 	});
 }
