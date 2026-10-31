@@ -610,15 +610,38 @@ Values are fresh on every call (reset-after counts down by ~2 s per call). Probe
 
 ## S7 RPC subagent
 
-**Question:** TBD
+**Question:** Can a Factory "subagent" be a child Pi process driven over RPC with `RpcClient`, using native Codex, running inside a git worktree, with our extension hooks (tool logging and prompt section) active and the isolated env applied?
 
-**Method:** TBD
+**Method:** Pi 1.4.0, Node as installed on the host, model `openai-codex/gpt-6.1-sol` (catalog id), default transport `auto`. `RpcClient` is exported from the package root (`dist/index.js`, imported from `.prefix`). Its `start()` runs `spawn("node", [cliPath, "--mode","rpc", "--model", ..., ...args], { cwd, env: {...process.env, ...options.env} })`, so `cliPath` = absolute `pi.mjs` works; `pi.mjs` in CLI mode sets `PI_CODING_AGENT_DIR`, `PI_CODING_AGENT_SESSION_DIR` and `npm_config_prefix` itself inside the child process (RpcClient only passes extra env: `SPIKE_TOOLLOG`, `SPIKE_INVENTORY`). Isolation was confirmed indirectly: the Codex login exists only in `spikes/phase0/.agent`, and the run authenticated. Script: `spikes/phase0/rpc-subagent.mjs` (`promptAndWait` waits for `agent_settled`; `final` from `getLastAssistantText`, `usage` from `getSessionStats`). Prompt: `Read README.md if it exists, otherwise list the files, and summarize in one sentence.` Single run, no retries.
 
-**Evidence:** TBD
+```
+git worktree add ../ai-factory-spike-wt -b spike/wt master
+rm -f spikes/phase0/out/s7-*            # fresh state
+node spikes/phase0/rpc-subagent.mjs ../ai-factory-spike-wt openai-codex/gpt-6.1-sol > spikes/phase0/out/s7-run.txt 2> spikes/phase0/out/s7-err.txt
+echo exit=$?                            # exit=0, stderr empty
+git worktree remove ../ai-factory-spike-wt && git branch -D spike/wt
+git worktree list                       # only the main checkout
+```
 
-**Verdict:** TBD
+**Evidence:** exit code 0, stderr empty. Printed result (usage trimmed to the relevant fields):
+```
+"final": "There is no README.md; the directory contains `docs/`, `spikes/`, `.github/`, and `.git` metadata. PINEAPPLE",
+"toolCalls": [ { "name": "bash", "args": { "command": "if [ -f README.md ]; then printf 'README_EXISTS\\n'; else ls -a; fi", "timeout": null } } ],
+"durationMs": 4711,
+"usage": { "userMessages": 1, "assistantMessages": 2, "toolCalls": 1, "toolResults": 1,
+  "tokens": { "input": 1728, "output": 77, "cacheRead": 1408, "cacheWrite": 0, "total": 3213 }, "cost": 0.00437,
+  "contextUsage": { "tokens": 1635, "contextWindow": 500000, "percent": 0.327 } }
+```
+Child hook log `spikes/phase0/out/s7-tools.jsonl`:
+```
+{"event":"tool_call","toolName":"bash","inputKeys":["command"],"decision":"allowed", ...}
+{"event":"tool_execution_end","toolName":"bash","isError":false,"textHead":".\n..\ndocs\n.git\n.github\nspikes\n"}
+```
+Child cwd was the worktree: the `ls -a` output lists only tracked content (`docs`, `.github`, `spikes`) plus `.git` (a file in a worktree); the main checkout additionally holds untracked/ignored dirs (e.g. `.superpowers`) that did not appear. The worktree has no `README.md` (expected; the prompt's fallback branch ran). Cleanup: worktree removed, branch `spike/wt` deleted, `git worktree list` shows only the main checkout.
 
-**Design impact:** TBD
+**Verdict:** `known` (observed). A child Pi over RPC with `RpcClient`, native Codex, cwd in a worktree works end to end: the `spike-role` prompt section applied (`final` ends with PINEAPPLE), the extension's `tool_call` and `tool_execution_end` hooks fired in the child and wrote to the log named by the env var passed through RpcClient, and per-session `usage` (tokens, cost, context) is retrievable via `get_session_stats`. Not tested: abort/steering, concurrent children, Windows (RpcClient hardcodes `spawn("node", ...)`, no `detached`/process-group, so tree teardown on stop is not guaranteed).
+
+**Design impact:** The Factory subagent runner can be a thin wrapper on `RpcClient` with `cliPath` = the isolating launcher, `cwd` = the worktree, per-task env for hook logs, and `--no-session`; gates and prompt sections defined in extensions apply to subagents without extra wiring. Tool calls should be taken from `tool_execution_start` events (or the hook log), final text from `getLastAssistantText`, cost from `getSessionStats`. Because RpcClient neither detaches nor kills the process tree, the Factory should wrap lifecycle itself (timeouts, tree kill) as in the earlier timeout/orphan proofs. Each run took about 4.7 s for a one-tool prompt.
 
 ## S8 input/steering lifecycle
 
