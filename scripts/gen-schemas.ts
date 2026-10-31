@@ -6,12 +6,14 @@ import { z } from "zod";
 import { PersonalConfig, ProjectConfig } from "../src/core/config/schema.ts";
 import { Profile } from "../src/core/profiles/schema.ts";
 import { ReleaseManifest } from "../src/core/release/manifest.ts";
+import { ManagedRecord } from "../src/core/settings/managed.ts";
 
 const SOURCES: Record<string, z.ZodType> = {
   "personal-config.schema.json": PersonalConfig,
   "project-config.schema.json": ProjectConfig,
   "profile.schema.json": Profile,
   "release.schema.json": ReleaseManifest,
+  "managed-settings.schema.json": ManagedRecord,
 };
 
 export function generateSchemas(): Record<string, string> {
