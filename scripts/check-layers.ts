@@ -1,5 +1,6 @@
 // Layer lint: enforces the import rules between core / adapters / cli / extension.
 // Run via `npm run lint` (through jiti, no build step) or import `checkLayers` in tests.
+import { parse } from "@babel/parser";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,186 +44,75 @@ function listFiles(dir: string, out: string[], optional: boolean): void {
   }
 }
 
-interface Tok {
-  kind: "word" | "str" | "punct";
-  text: string; // word text, string value (null-ish "" when not static), or punctuation char
-  line: number;
-  static: boolean; // for str: false for template literals with substitutions
-}
-
-// Minimal lexer: skips comments, keeps string/template literal values, skips regex literals.
-function tokenize(src: string): Tok[] {
-  const toks: Tok[] = [];
-  let i = 0;
-  let line = 1;
-  const n = src.length;
-  const isWordStart = (c: string) => /[A-Za-z_$]/.test(c);
-  const isWord = (c: string) => /[A-Za-z0-9_$]/.test(c);
-
-  // Skips a template body starting after the opening backtick; returns value and whether static.
-  const readTemplate = (): { value: string; isStatic: boolean } => {
-    let value = "";
-    let isStatic = true;
-    while (i < n && src[i] !== "`") {
-      const c = src[i] as string;
-      if (c === "\\") {
-        value += src[i + 1] ?? "";
-        if (src[i + 1] === "\n") line++;
-        i += 2;
-      } else if (c === "$" && src[i + 1] === "{") {
-        isStatic = false;
-        i += 2;
-        let depth = 1;
-        while (i < n && depth > 0) {
-          const d = src[i] as string;
-          if (d === "\n") line++;
-          if (d === "`") {
-            i++;
-            readTemplate();
-            i++;
-            continue;
-          }
-          if (d === '"' || d === "'") {
-            i = skipString(d);
-            continue;
-          }
-          if (d === "{") depth++;
-          else if (d === "}") depth--;
-          i++;
-        }
-      } else {
-        if (c === "\n") line++;
-        value += c;
-        i++;
-      }
-    }
-    return { value, isStatic };
-  };
-  const skipString = (q: string): number => {
-    let j = i + 1;
-    while (j < n && src[j] !== q && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
-    return j + 1;
-  };
-
-  while (i < n) {
-    const c = src[i] as string;
-    if (c === "\n") {
-      line++;
-      i++;
-    } else if (/\s/.test(c)) {
-      i++;
-    } else if (c === "/" && src[i + 1] === "/") {
-      while (i < n && src[i] !== "\n") i++;
-    } else if (c === "/" && src[i + 1] === "*") {
-      const end = src.indexOf("*/", i + 2);
-      const stop = end === -1 ? n : end + 2;
-      for (let k = i; k < stop; k++) if (src[k] === "\n") line++;
-      i = stop;
-    } else if (c === '"' || c === "'") {
-      let j = i + 1;
-      let value = "";
-      while (j < n && src[j] !== c && src[j] !== "\n") {
-        if (src[j] === "\\") {
-          value += src[j + 1] ?? "";
-          j += 2;
-        } else value += src[j++];
-      }
-      toks.push({ kind: "str", text: value, line, static: true });
-      i = j + 1;
-    } else if (c === "`") {
-      const startLine = line;
-      i++;
-      const t = readTemplate();
-      i++;
-      toks.push({ kind: "str", text: t.value, line: startLine, static: t.isStatic });
-    } else if (isWordStart(c)) {
-      let j = i + 1;
-      while (j < n && isWord(src[j] as string)) j++;
-      toks.push({ kind: "word", text: src.slice(i, j), line, static: true });
-      i = j;
-    } else if (/[0-9]/.test(c)) {
-      let j = i + 1;
-      while (j < n && /[0-9A-Za-z_.]/.test(src[j] as string)) j++;
-      toks.push({ kind: "word", text: src.slice(i, j), line, static: true });
-      i = j;
-    } else if (c === "/" && regexAllowed(toks)) {
-      let j = i + 1;
-      let inClass = false;
-      while (j < n && src[j] !== "\n") {
-        const d = src[j] as string;
-        if (d === "\\") j++;
-        else if (d === "[") inClass = true;
-        else if (d === "]") inClass = false;
-        else if (d === "/" && !inClass) break;
-        j++;
-      }
-      i = j + 1;
-      toks.push({ kind: "word", text: "/regex/", line, static: true });
-    } else {
-      toks.push({ kind: "punct", text: c, line, static: true });
-      i++;
-    }
-  }
-  return toks;
-}
-
-function regexAllowed(toks: Tok[]): boolean {
-  const prev = toks[toks.length - 1];
-  if (!prev) return true;
-  if (prev.kind === "str") return false;
-  if (prev.kind === "word") return ["return", "typeof", "case", "in", "of", "delete", "void", "throw", "new"].includes(prev.text);
-  return ![")", "]", "}"].includes(prev.text);
-}
-
 interface Ref {
   specifier: string;
   line: number;
   typeOnly: boolean;
 }
 
-function findRefs(src: string): Ref[] {
-  const t = tokenize(src);
+type Node = { type: string; loc?: { start: { line: number } }; [key: string]: unknown };
+
+function isNode(v: unknown): v is Node {
+  return typeof v === "object" && v !== null && typeof (v as { type?: unknown }).type === "string";
+}
+
+function staticString(n: unknown): string | undefined {
+  if (!isNode(n)) return undefined;
+  if (n.type === "StringLiteral") return n.value as string;
+  if (n.type === "TemplateLiteral") {
+    const quasis = n.quasis as Array<{ value: { cooked?: string | null } }>;
+    if ((n.expressions as unknown[]).length === 0 && quasis.length === 1) return quasis[0]?.value.cooked ?? undefined;
+  }
+  return undefined;
+}
+
+function allTypeSpecifiers(specs: unknown, kindKey: "importKind" | "exportKind"): boolean {
+  return Array.isArray(specs) && specs.length > 0 && specs.every((sp) => isNode(sp) && sp[kindKey] === "type");
+}
+
+function findRefs(src: string, file: string): Ref[] {
+  let ast: Node;
+  try {
+    ast = parse(src, { sourceType: "module", plugins: ["typescript"] }) as unknown as Node;
+  } catch (e) {
+    throw new Error(`cannot parse ${file}: ${(e as Error).message}`, { cause: e });
+  }
   const refs: Ref[] = [];
-  const word = (k: number, w: string) => t[k]?.kind === "word" && t[k]?.text === w;
-  const punct = (k: number, p: string) => t[k]?.kind === "punct" && t[k]?.text === p;
-  const str = (k: number) => (t[k]?.kind === "str" ? t[k] : undefined);
-  for (let k = 0; k < t.length; k++) {
-    const tok = t[k] as Tok;
-    if (tok.kind !== "word" || punct(k - 1, ".")) continue;
-    if (tok.text === "import") {
-      if (punct(k + 1, "(")) {
-        const a = str(k + 2);
-        if (a?.static && (punct(k + 3, ")") || punct(k + 3, ","))) {
-          refs.push({ specifier: a.text, line: tok.line, typeOnly: false });
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const c of node) visit(c);
+      return;
+    }
+    if (!isNode(node)) return;
+    const line = node.loc?.start.line ?? 0;
+    const add = (specifier: string | undefined, typeOnly: boolean) => {
+      if (specifier !== undefined) refs.push({ specifier, line, typeOnly });
+    };
+    switch (node.type) {
+      case "ImportDeclaration":
+        add(staticString(node.source), node.importKind === "type" || allTypeSpecifiers(node.specifiers, "importKind"));
+        break;
+      case "ExportNamedDeclaration":
+      case "ExportAllDeclaration":
+        if (node.source) {
+          add(staticString(node.source), node.exportKind === "type" || allTypeSpecifiers(node.specifiers, "exportKind"));
         }
-        continue;
-      }
-      if (punct(k + 1, ".")) continue;
-      const side = str(k + 1);
-      if (side) {
-        refs.push({ specifier: side.text, line: tok.line, typeOnly: false });
-        continue;
-      }
-      const typeOnly = word(k + 1, "type") && !word(k + 2, "from") && !punct(k + 2, ",");
-      for (let j = k + 1; j < t.length && !punct(j, ";"); j++) {
-        const s = str(j + 1);
-        if (word(j, "from") && s) {
-          refs.push({ specifier: s.text, line: tok.line, typeOnly });
-          break;
-        }
-      }
-    } else if (tok.text === "export") {
-      const typed = word(k + 1, "type") && (punct(k + 2, "{") || punct(k + 2, "*"));
-      if (!(typed || punct(k + 1, "{") || punct(k + 1, "*"))) continue;
-      for (let j = k + 1; j < t.length && !punct(j, ";"); j++) {
-        const s = str(j + 1);
-        if (word(j, "from") && s) {
-          refs.push({ specifier: s.text, line: tok.line, typeOnly: typed });
-          break;
-        }
+        break;
+      case "ImportExpression":
+        add(staticString(node.source), false);
+        break;
+      case "CallExpression": {
+        const callee = node.callee;
+        if (isNode(callee) && callee.type === "Import") add(staticString((node.arguments as unknown[])[0]), false);
+        break;
       }
     }
-  }
+    for (const key of Object.keys(node)) {
+      if (key === "loc" || key === "leadingComments" || key === "trailingComments") continue;
+      visit(node[key]);
+    }
+  };
+  visit(ast);
   return refs;
 }
 
@@ -236,7 +126,7 @@ export function checkLayers(root: string): LayerViolation[] {
   for (const abs of files) {
     const rel = relative(absRoot, abs).split(sep).join("/");
     const zone = zoneOf(rel);
-    for (const ref of findRefs(readFileSync(abs, "utf8"))) {
+    for (const ref of findRefs(readFileSync(abs, "utf8"), rel)) {
       const add = (rule: string) => violations.push({ file: rel, line: ref.line, specifier: ref.specifier, rule });
       const spec = ref.specifier;
       const isRelative = spec.startsWith("./") || spec.startsWith("../");

@@ -119,6 +119,28 @@ describe("checkLayers", () => {
     expect(checkLayers(root)).toEqual([]);
   });
 
+  it("regex literal containing import(...) after a statement head -> no violation", async () => {
+    const root = await tree({ "src/core/r.ts": 'if (true) /import("node:fs")/.test("");\n' });
+    expect(checkLayers(root)).toEqual([]);
+  });
+
+  it("import() inside a template substitution -> violation", async () => {
+    const root = await tree({ "src/core/u.ts": 'export const text = `${import("node:fs")}`;\n' });
+    expect(checkLayers(root).map((x) => x.rule)).toEqual(["core-no-io-builtins"]);
+  });
+
+  it("import() after postfix increment and division is still found", async () => {
+    const root = await tree({ "src/core/p.ts": 'let n = 1; n++ / 2; export const m = import("node:fs");\n' });
+    expect(checkLayers(root).map((x) => x.rule)).toEqual(["core-no-io-builtins"]);
+  });
+
+  it("type-only specifiers and a syntax error", async () => {
+    const ok = await tree({ "src/core/q.ts": 'import { type A, type B } from "../cli/y.ts";\nexport type X = A | B;\n' });
+    expect(checkLayers(ok).map((x) => x.rule)).toEqual(["core-no-cli"]);
+    const bad = await tree({ "src/core/z.ts": "import {{{ nope\n" });
+    expect(() => checkLayers(bad)).toThrow(/cannot parse src\/core\/z\.ts/);
+  });
+
   it("multi-line imports, import type and export-from are classified correctly", async () => {
     const root = await tree({
       "src/core/m.ts": 'import {\n  a,\n  b,\n} from\n  "../adapters/x.ts";\nimport type { T } from "../cli/y.ts";\nexport type { U } from "../cli/z.ts";\nexport { a, b };\n',
