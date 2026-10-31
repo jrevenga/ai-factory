@@ -1,8 +1,8 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
-import { acquireLock, isPidAlive, Locked } from "../../../src/adapters/store/lock.ts";
+import { acquireLock, isPidAlive, type Lock, Locked, readLockHolder } from "../../../src/adapters/store/lock.ts";
 import { deadPid } from "../../helpers/dead-pid.ts";
 import { isolatedEnv } from "../../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
@@ -18,9 +18,18 @@ afterEach(async () => {
   await tmp.cleanup();
 });
 
-async function writeHolder(pid: number, at = new Date().toISOString()): Promise<void> {
-  await mkdir(paths.home, { recursive: true });
-  await writeFile(paths.lock, `${JSON.stringify({ pid, at })}\n`);
+const gen = (n: number): string => join(paths.lock, `${n}.json`);
+
+/** Plants generation record `n` as if another process had written it. */
+async function plant(n: number, content: string): Promise<string> {
+  await mkdir(paths.lock, { recursive: true });
+  await writeFile(gen(n), content);
+  return content;
+}
+const holder = (pid: number, at = new Date().toISOString()): string => `${JSON.stringify({ pid, at })}\n`;
+
+async function records(): Promise<string[]> {
+  return (await readdir(paths.lock)).sort();
 }
 
 describe("isPidAlive", () => {
@@ -35,103 +44,141 @@ describe("isPidAlive", () => {
 });
 
 describe("acquireLock", () => {
-  it("creates the lock file with this pid and removes it on release", async () => {
+  it("creates generation 1 with this pid and marks it released on release", async () => {
     const lock = await acquireLock(paths);
-    const content = JSON.parse(await readFile(paths.lock, "utf8")) as { pid: number; at: string };
+    expect(lock.path).toBe(gen(1));
+    const content = JSON.parse(await readFile(gen(1), "utf8")) as { pid: number; at: string };
     expect(content.pid).toBe(process.pid);
     expect(Number.isNaN(Date.parse(content.at))).toBe(false);
     expect(lock.borrowed).toBe(false);
+    expect((await readLockHolder(paths))?.pid).toBe(process.pid);
     await lock.release();
-    expect(existsSync(paths.lock)).toBe(false);
+    expect(JSON.parse(await readFile(gen(1), "utf8")).released).toBe(true);
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("moves to the next generation after a release and removes older records", async () => {
+    await (await acquireLock(paths)).release();
+    const second = await acquireLock(paths);
+    expect(second.path).toBe(gen(2));
+    expect(await records()).toEqual(["2.json"]);
+    await second.release();
   });
 
   it("throws Locked with the holder pid when a live process holds it", async () => {
-    await writeHolder(process.pid);
+    const live = await plant(1, holder(process.pid));
     const err = await acquireLock(paths).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Locked);
-    expect(err).toMatchObject({ pid: process.pid });
-    expect(JSON.parse(await readFile(paths.lock, "utf8")).pid).toBe(process.pid);
+    expect(err).toMatchObject({ pid: process.pid, path: gen(1) });
+    expect(await readFile(gen(1), "utf8")).toBe(live);
+    expect(await records()).toEqual(["1.json"]);
   });
 
-  it("replaces a lock held by a dead pid", async () => {
-    const dead = await deadPid();
-    await writeHolder(dead);
+  it("takes over a lock held by a dead pid by moving to the next generation", async () => {
+    await plant(1, holder(await deadPid()));
     const lock = await acquireLock(paths);
-    expect(JSON.parse(await readFile(paths.lock, "utf8")).pid).toBe(process.pid);
+    expect(lock.path).toBe(gen(2));
+    expect(await records()).toEqual(["2.json"]);
     await lock.release();
   });
 
   it("is acquired (borrowed) when the holder is ownerPid, and release leaves the owner's lock", async () => {
-    await writeHolder(process.pid);
-    const before = await readFile(paths.lock, "utf8");
+    const live = await plant(1, holder(process.pid));
     const lock = await acquireLock(paths, { ownerPid: process.pid });
     expect(lock.borrowed).toBe(true);
     await lock.release();
-    expect(await readFile(paths.lock, "utf8")).toBe(before);
+    expect(await readFile(gen(1), "utf8")).toBe(live);
   });
 
   it("lets exactly one of many concurrent acquirers win", async () => {
-    const results = await Promise.allSettled(Array.from({ length: 12 }, () => acquireLock(paths)));
-    const won = results.filter((r) => r.status === "fulfilled");
-    expect(won).toHaveLength(1);
-    for (const r of results) if (r.status === "rejected") expect(r.reason).toBeInstanceOf(Locked);
-  });
-
-  it("lets exactly one of many concurrent acquirers take over a stale lock", async () => {
-    await writeHolder(await deadPid());
     const results = await Promise.allSettled(Array.from({ length: 12 }, () => acquireLock(paths)));
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     for (const r of results) if (r.status === "rejected") expect(r.reason).toBeInstanceOf(Locked);
   });
 
-  it("never deletes a lock that was replaced after it was judged stale", async () => {
-    await writeHolder(await deadPid());
-    const live = `${JSON.stringify({ pid: process.pid, at: "2026-10-31T00:00:00.000Z" })}\n`;
-    const err = await acquireLock(paths, {}, { beforeTakeover: () => writeFile(paths.lock, live) }).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(Locked);
-    expect((err as Locked).pid).toBe(process.pid);
-    expect(await readFile(paths.lock, "utf8")).toBe(live);
+  it("lets exactly one of many concurrent acquirers take over a stale lock", async () => {
+    await plant(1, holder(await deadPid()));
+    const results = await Promise.allSettled(Array.from({ length: 12 }, () => acquireLock(paths)));
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    for (const r of results) if (r.status === "rejected") expect(r.reason).toBeInstanceOf(Locked);
   });
 
-  it("leaves a stale lock alone while another process holds a fresh takeover marker", async () => {
-    const dead = await deadPid();
-    await writeHolder(dead);
-    const before = await readFile(paths.lock, "utf8");
-    await writeFile(`${paths.lock}.takeover`, "");
-    const err = await acquireLock(paths).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(Locked);
-    expect((err as Locked).pid).toBe(dead);
-    expect(await readFile(paths.lock, "utf8")).toBe(before);
-  });
-
-  it("does not remove a lock it no longer owns on release", async () => {
+  it("does not mark a record it no longer owns as released", async () => {
     const lock = await acquireLock(paths);
-    await writeHolder(process.pid, "2000-01-01T00:00:00.000Z");
+    const other = await plant(1, holder(process.pid, "2000-01-01T00:00:00.000Z"));
     await lock.release();
-    expect(JSON.parse(await readFile(paths.lock, "utf8")).at).toBe("2000-01-01T00:00:00.000Z");
+    expect(await readFile(gen(1), "utf8")).toBe(other);
   });
 
-  it("treats a freshly written malformed lock as held and an old malformed lock as stale", async () => {
-    await mkdir(paths.home, { recursive: true });
-    await writeFile(paths.lock, "");
+  it("treats a freshly written malformed record as held and an old malformed record as free", async () => {
+    await plant(1, "");
     const err = await acquireLock(paths).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Locked);
     expect((err as Locked).pid).toBeUndefined();
 
     const old = new Date(Date.now() - 60_000);
-    await utimes(paths.lock, old, old);
+    await utimes(gen(1), old, old);
     const lock = await acquireLock(paths);
-    expect(JSON.parse(await readFile(paths.lock, "utf8")).pid).toBe(process.pid);
+    expect(lock.path).toBe(gen(2));
     await lock.release();
   });
 
-  it("removes an abandoned takeover marker and proceeds", async () => {
-    await writeHolder(await deadPid());
-    await writeFile(`${paths.lock}.takeover`, "");
-    const old = new Date(Date.now() - 60_000);
-    await utimes(`${paths.lock}.takeover`, old, old);
+  it("ignores files that are not generation records", async () => {
+    await plant(1, holder(await deadPid()));
+    await writeFile(join(paths.lock, "7.json.tmp-1-abc"), holder(process.pid));
+    await writeFile(join(paths.lock, "notes.txt"), "x");
     const lock = await acquireLock(paths);
-    expect(existsSync(`${paths.lock}.takeover`)).toBe(false);
+    expect(lock.path).toBe(gen(2));
     await lock.release();
+  });
+
+  it("a paused acquirer that judged the lock free and resumes after another won never holds it", async () => {
+    let b: Lock | undefined;
+    const a = await acquireLock(paths, {}, {
+      afterJudgedFree: async () => {
+        b ??= await acquireLock(paths);
+      },
+    }).catch((e: unknown) => e);
+    expect(b).toBeDefined();
+    expect(a).toBeInstanceOf(Locked);
+    expect((await readLockHolder(paths))?.pid).toBe(process.pid);
+    await b?.release();
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("an acquirer overtaken by a higher generation before it verifies backs off", async () => {
+    const higher = holder(process.pid, "2026-10-31T00:00:00.000Z");
+    const a = await acquireLock(paths, {}, {
+      afterCreate: async () => {
+        await writeFile(gen(99), higher);
+      },
+    }).catch((e: unknown) => e);
+    expect(a).toBeInstanceOf(Locked);
+    expect(await readFile(gen(99), "utf8")).toBe(higher);
+    expect(await records()).toEqual(["99.json"]);
+    expect(await readLockHolder(paths)).toMatchObject({ pid: process.pid, at: "2026-10-31T00:00:00.000Z" });
+  });
+
+  it("review r1 interleaving: a stale takeover paused while others take over, release and clean up never ends with two holders", async () => {
+    await plant(1, holder(await deadPid()));
+    let c: Lock | undefined;
+    const a = await acquireLock(paths, {}, {
+      afterJudgedFree: async () => {
+        if (c) return;
+        // While A is paused with candidate generation 2: B takes over and releases, then C takes over and
+        // deletes every record below its own, so A's candidate path 2 is free again when A resumes.
+        const b = await acquireLock(paths);
+        expect(b.path).toBe(gen(2));
+        await b.release();
+        c = await acquireLock(paths);
+        expect(c.path).toBe(gen(3));
+        expect(await records()).toEqual(["3.json"]);
+      },
+    }).catch((e: unknown) => e);
+    expect(a).toBeInstanceOf(Locked);
+    expect((a as Locked).path).toBe(gen(3));
+    expect(await records()).toEqual(["3.json"]);
+    expect(await readLockHolder(paths)).toMatchObject({ path: gen(3), pid: process.pid });
+    await c?.release();
   });
 });

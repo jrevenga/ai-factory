@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readPiSettings } from "../../../src/adapters/pi/settings-file.ts";
+import { MalformedJson } from "../../../src/adapters/platform/json-file.ts";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
 import {
   createSnapshot,
@@ -123,13 +124,45 @@ describe("restoreSnapshot", () => {
     expect(await readFile(paths.config)).toEqual(original);
   });
 
-  it("restores Pi packages into Pi settings and keeps other keys", async () => {
+  it("does not restore Pi packages (the target's _apply-release reinstalls its own package)", async () => {
     await mkdir(paths.piAgentDir, { recursive: true });
     await writeFile(paths.piSettings, JSON.stringify({ packages: ["git:x@v0.1.0"] }));
     const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });
-    await writeFile(paths.piSettings, JSON.stringify({ packages: ["git:x@v0.2.0"], theme: "dark" }));
-    await restoreSnapshot(paths, info.id, ["pi-packages.json"]);
-    expect(await readPiSettings(paths.piSettings)).toEqual({ packages: ["git:x@v0.1.0"], theme: "dark" });
+    expect(info.files).toContain("pi-packages.json");
+    await writeFile(paths.piSettings, JSON.stringify({ packages: ["git:x@v0.2.0"] }));
+    await expect(restoreSnapshot(paths, info.id, ["pi-packages.json"])).rejects.toThrow(/not a restorable/);
+    expect(await readPiSettings(paths.piSettings)).toEqual({ packages: ["git:x@v0.2.0"] });
+  });
+
+  it("changes nothing when a listed source file is missing from the snapshot", async () => {
+    const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });
+    await rm(join(paths.backups, info.id, "state.json"));
+    await writeFile(paths.config, '{"schema":1,"profile":"changed"}');
+    await writeFile(paths.state, '{"schema":1,"version":"0.2.0"}');
+    await expect(restoreSnapshot(paths, info.id, ["config.json", "state.json"])).rejects.toThrow(/state\.json/);
+    expect(await readFile(paths.config, "utf8")).toBe('{"schema":1,"profile":"changed"}');
+    expect(await readFile(paths.state, "utf8")).toBe('{"schema":1,"version":"0.2.0"}');
+    expect((await readdir(paths.home)).filter((f) => f.includes(".restore-"))).toEqual([]);
+  });
+
+  it("changes nothing when a JSON source file in the snapshot is malformed", async () => {
+    const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });
+    await writeFile(join(paths.backups, info.id, "state.json"), "{broken");
+    await writeFile(paths.config, '{"schema":1,"profile":"changed"}');
+    await expect(restoreSnapshot(paths, info.id, ["config.json", "state.json"])).rejects.toBeInstanceOf(MalformedJson);
+    expect(await readFile(paths.config, "utf8")).toBe('{"schema":1,"profile":"changed"}');
+    expect((await readdir(paths.home)).filter((f) => f.includes(".restore-"))).toEqual([]);
+  });
+
+  it("restores several files including memory.db", async () => {
+    await writeFile(paths.memoryDb, Buffer.from([9, 8, 7]));
+    const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });
+    const config = await readFile(paths.config);
+    await writeFile(paths.memoryDb, Buffer.from([1]));
+    await writeFile(paths.config, "{}");
+    await restoreSnapshot(paths, info.id, ["config.json", "memory.db"]);
+    expect(await readFile(paths.memoryDb)).toEqual(Buffer.from([9, 8, 7]));
+    expect(await readFile(paths.config)).toEqual(config);
   });
 
   it("refuses a file the snapshot does not hold before restoring anything", async () => {

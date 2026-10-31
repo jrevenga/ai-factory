@@ -2,7 +2,7 @@
 // (non-recursive mkdir of the final path), so an existing snapshot is never reused or overwritten.
 // `snapshot.json` is written last: a directory without it is an incomplete snapshot and is not listed.
 import { randomBytes } from "node:crypto";
-import { copyFile, constants, mkdir, open, readdir, rm, stat } from "node:fs/promises";
+import { copyFile, constants, mkdir, open, readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { STATE_DOCS } from "../../core/release/manifest.ts";
 import { SnapshotInfo, type StateDoc, type TxnKind } from "../../core/state/schema.ts";
@@ -155,56 +155,83 @@ export async function listSnapshots(paths: FactoryPaths): Promise<SnapshotInfo[]
   return out.sort((a, b) => (a.at === b.at ? b.id.localeCompare(a.id) : b.at < a.at ? -1 : 1));
 }
 
-const RESTORABLE = new Set<string>([...STATE_DOCS, MEMORY_DB_FILE, PI_PACKAGES_FILE]);
+/** Files restoreSnapshot accepts. `pi-packages.json` is snapshotted but never restored: the target
+ * release's `_apply-release` reinstalls its own package (ruling 10). */
+export const RESTORABLE: readonly string[] = [...STATE_DOCS, MEMORY_DB_FILE];
 
 function targetOf(paths: FactoryPaths, file: string): string {
   return file === MEMORY_DB_FILE ? paths.memoryDb : stateDocPath(paths, file as StateDoc);
 }
 
-async function restoreFile(src: string, target: string): Promise<void> {
-  const tmp = `${target}.restore-${process.pid}-${randomBytes(6).toString("hex")}`;
+export class SnapshotFileMissing extends Error {
+  readonly id: string;
+  readonly file: string;
+  constructor(id: string, file: string, detail: string) {
+    super(`Snapshot ${id} cannot restore ${file}: ${detail}`);
+    this.name = "SnapshotFileMissing";
+    this.id = id;
+    this.file = file;
+  }
+}
+
+/** Copies `src` next to `target` as a flushed temporary file and returns its path; validates JSON documents. */
+async function stage(id: string, file: string, src: string, target: string): Promise<string> {
+  let bytes: Buffer;
   try {
-    await copyFile(src, tmp, constants.COPYFILE_EXCL);
-    await syncFile(tmp);
-    await renameWithRetry(tmp, target);
+    bytes = await readFile(src);
   } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new SnapshotFileMissing(id, file, `${src} is missing`);
+    throw e;
+  }
+  if (file !== MEMORY_DB_FILE) {
+    const text = bytes.toString("utf8");
+    try {
+      JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
+    } catch (e) {
+      throw new MalformedJson(src, e);
+    }
+  }
+  const tmp = `${target}.restore-${process.pid}-${randomBytes(6).toString("hex")}`;
+  const handle = await open(tmp, "wx");
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } catch (e) {
+    await handle.close();
     await rm(tmp, { force: true });
     throw e;
   }
-}
-
-async function restorePiPackages(paths: FactoryPaths, src: string): Promise<void> {
-  const saved = await readJson(src);
-  if (typeof saved !== "object" || saved === null || Array.isArray(saved)) {
-    throw new MalformedJson(src, new Error("expected a JSON object"));
-  }
-  const has = "packages" in saved;
-  if (!has && !(await exists(paths.piSettings))) return;
-  await withPiSettingsLock(paths.piSettings, async (current) => {
-    const next = { ...current };
-    if (has) next.packages = (saved as { packages: unknown }).packages;
-    else delete next.packages;
-    return { next, result: undefined };
-  });
+  await handle.close();
+  return tmp;
 }
 
 /**
- * Restores `files` of snapshot `id` byte-for-byte (atomically per file); `pi-packages.json` is written
- * back into Pi settings `packages` under Pi's lock. Every requested file is checked against the
- * snapshot before anything is written.
+ * Restores `files` of snapshot `id` byte-for-byte. All-or-nothing up front: every requested file is
+ * checked against the snapshot, read, validated (JSON documents must parse) and staged as a flushed
+ * temporary file next to its destination before any destination is replaced; only then is each staged
+ * file renamed over its destination. Accepts only RESTORABLE files.
  */
 export async function restoreSnapshot(paths: FactoryPaths, id: string, files: string[]): Promise<void> {
   const dir = snapshotDir(paths, id);
   const info = await readInfo(dir);
   if (info === undefined || info.id !== id) throw new SnapshotNotFound(id, dir);
   for (const file of files) {
-    if (!RESTORABLE.has(file)) throw new Error(`${file} is not a restorable snapshot file.`);
-    if (!info.files.includes(file)) throw new Error(`Snapshot ${id} has no copy of ${file}.`);
+    if (!RESTORABLE.includes(file)) throw new Error(`${file} is not a restorable snapshot file.`);
+    if (!info.files.includes(file)) throw new SnapshotFileMissing(id, file, "the snapshot has no copy of it");
   }
   await mkdir(paths.home, { recursive: true });
-  for (const file of files) {
-    const src = join(dir, file);
-    if (file === PI_PACKAGES_FILE) await restorePiPackages(paths, src);
-    else await restoreFile(src, targetOf(paths, file));
+  const staged: { tmp: string; target: string }[] = [];
+  try {
+    for (const file of files) {
+      const target = targetOf(paths, file);
+      staged.push({ tmp: await stage(id, file, join(dir, file), target), target });
+    }
+    while (staged.length > 0) {
+      const next = staged[0] as { tmp: string; target: string };
+      await renameWithRetry(next.tmp, next.target);
+      staged.shift();
+    }
+  } finally {
+    for (const s of staged) await rm(s.tmp, { force: true });
   }
 }

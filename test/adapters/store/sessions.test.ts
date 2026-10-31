@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readJson } from "../../../src/adapters/platform/json-file.ts";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
-import { acquireLock, Locked } from "../../../src/adapters/store/lock.ts";
+import { acquireLock, Locked, readLockHolder } from "../../../src/adapters/store/lock.ts";
 import { liveSessions, registerSession } from "../../../src/adapters/store/sessions.ts";
 import { deadPid } from "../../helpers/dead-pid.ts";
 import { isolatedEnv } from "../../helpers/isolated-env.ts";
@@ -35,7 +35,7 @@ describe("registerSession", () => {
     const rec = (await readJson(join(paths.sessions, `${process.pid}.json`))) as Record<string, unknown>;
     expect(rec).toMatchObject({ launcherPid: process.pid });
     expect(rec.piPid).toBeUndefined();
-    expect(existsSync(paths.lock)).toBe(false);
+    expect(await readLockHolder(paths)).toBeUndefined();
   });
 
   it("propagates Locked while another holder has the lock and writes nothing", async () => {
