@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "profile": {
+      "type": "string"
+    },
+    "autonomy": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "parallelism": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16
+    },
+    "language": {
+      "type": "string"
+    },
+    "radar": {
+      "type": "boolean"
+    },
+    "maintainer": {
+      "type": "boolean"
+    },
+    "gates": {
+      "type": "object",
+      "properties": {
+        "soften": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "design-approval",
+              "new-dependency",
+              "design-deviation",
+              "review-disagreement",
+              "quota-low"
+            ]
+          }
+        }
+      },
+      "additionalProperties": {}
+    },
+    "budgets": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "weeklyTokens": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": {}
+      }
+    },
+    "machine": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "profile"
+  ],
+  "additionalProperties": {}
+}

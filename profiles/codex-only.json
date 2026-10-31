@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "name": "codex-only",
+  "requires": ["codex"],
+  "roles": {
+    "orchestrator": { "model": "openai-codex/gpt-6-astra" },
+    "implementer": { "model": "openai-codex/gpt-6.1-sol" },
+    "reviewer": { "model": "openai-codex/gpt-6.1-sol", "options": { "freshContext": true } },
+    "researcher": { "model": "openai-codex/gpt-6-luna" }
+  }
+}

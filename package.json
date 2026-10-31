@@ -25,9 +25,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "npm run typecheck && node --import jiti/register scripts/check-layers.ts",
+    "lint": "npm run typecheck && node --import jiti/register scripts/check-layers.ts && node --import jiti/register scripts/gen-schemas.ts --check",
     "test": "vitest run --exclude \"test/e2e/**\"",
-    "test:e2e": "vitest run test/e2e"
+    "test:e2e": "vitest run test/e2e",
+    "schemas": "node --import jiti/register scripts/gen-schemas.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "1.4.0"

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "minFactoryVersion": {
+      "type": "string"
+    },
+    "context": {
+      "type": "string"
+    },
+    "conventions": {
+      "type": "string"
+    },
+    "overrides": {
+      "type": "object",
+      "properties": {
+        "language": {
+          "type": "string"
+        },
+        "gates": {
+          "type": "object",
+          "properties": {
+            "soften": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "design-approval",
+                  "new-dependency",
+                  "design-deviation",
+                  "review-disagreement",
+                  "quota-low"
+                ]
+              }
+            }
+          },
+          "additionalProperties": {}
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema"
+  ],
+  "additionalProperties": {}
+}
