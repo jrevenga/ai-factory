@@ -337,40 +337,55 @@ npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMExcep
 ```
 
 ### 7. Timeout kills and awaits the whole tree, including a SIGTERM-ignoring descendant
-Tree: `npm -> git -> git remote-https -> /bin/sh -c "sh -c 'trap \"\" TERM; sleep 300'"` (credential helper ignores SIGTERM). `runNpm(..., {timeoutMs: 3000})`; elapsed 5074 ms = 3 s + 2 s grace, i.e. SIGKILL escalation was awaited; `ps` immediately after the runner resolved (no extra wait) shows nothing. Cleanup: `resetScenario('tmo')`.
+Tree: `npm -> git -> git remote-https -> /bin/sh -c "sh -c 'trap \"\" TERM; sleep 300'"` (credential helper ignores SIGTERM). `runNpm(..., {timeoutMs: 3000})`; elapsed 5076 ms = 3 s + 2 s grace, so the SIGKILL escalation was awaited; `ps` right after the runner resolved shows nothing. Cleanup: `resetScenario('tmo')`. Signals, timeouts, aborts and orphan cleanup share one per-child `cancel()` that starts the awaited teardown once and returns the same promise; the child's completion promise never resolves before it.
 ```
-node spikes/phase0/timeout-proof.mjs   # exit 0
+cd /home/jorge/projects/ai-factory && node spikes/phase0/timeout-proof.mjs   # exit 0
 descendants while running (t=2s):
-2120014 2120007 2120014 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
-2120025 2120014 2120014 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
-2120029 2120027 2120014 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get
-2120030 2120029 2120014 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
-process group of the whole tree: 2120014 
+2166143 2166136 2166143 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+2166165 2166143 2166143 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
+2166191 2166167 2166143 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get
+2166197 2166191 2166143 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
+process group of the whole tree: 2166143 
 all members:
-2120014 2120007 2120014 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
-2120025 2120014 2120014 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
-2120026 2120025 2120014 /home/linuxbrew/.linuxbrew/opt/git/libexec/git-core/git remote-https https://github.com/jrevenga/ai-factory.git https://github.com/jrevenga/ai-factory.git
-2120027 2120026 2120014 /home/linuxbrew/.linuxbrew/opt/git/libexec/git-core/git-remote-https https://github.com/jrevenga/ai-factory.git https://github.com/jrevenga/ai-factory.git
-2120029 2120027 2120014 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get
-2120030 2120029 2120014 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
-2120031 2120030 2120014 sleep 300
-result: code=null timedOut=true elapsed=5074ms
+2166143 2166136 2166143 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+2166165 2166143 2166143 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
+2166166 2166165 2166143 /home/linuxbrew/.linuxbrew/opt/git/libexec/git-core/git remote-https https://github.com/jrevenga/ai-factory.git https://github.com/jrevenga/ai-factory.git
+2166167 2166166 2166143 /home/linuxbrew/.linuxbrew/opt/git/libexec/git-core/git-remote-https https://github.com/jrevenga/ai-factory.git https://github.com/jrevenga/ai-factory.git
+2166191 2166167 2166143 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get
+2166197 2166191 2166143 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
+2166199 2166197 2166143 sleep 300
+result: code=null timedOut=true elapsed=5076ms
 leftover processes (name match + every member of the process group) immediately after runner resolved: none
 ```
 
 ### 8. Ctrl+C on the parent kills the detached groups
-`spikes/phase0/sigint-proof.sh` starts `node spikes/phase0/timeout-proof.mjs sigint` (120 s timeout, same tree; cleanup `resetScenario('sigint')`), waits 4 s, sends SIGINT to the parent:
+`sigint-proof.sh` (`set -eu`, `mkdir -p` of its log dir, non-zero exit unless the parent exits 130) starts `node spikes/phase0/timeout-proof.mjs sigint` (120 s timeout, same tree; cleanup `resetScenario('sigint')`), waits 4 s, sends SIGINT:
 ```
-sh spikes/phase0/sigint-proof.sh   # script exit 0
-parent pid=2125790; processes before SIGINT:
-2125853 2125853 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
-2125965 2125853 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
-2125969 2125853 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 30
-2125970 2125853 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
-2125971 2125853 sleep 300
+cd /home/jorge/projects/ai-factory && sh spikes/phase0/sigint-proof.sh   # script exit 0
+parent pid=2165673; processes before SIGINT:
+2165681 2165681 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+2165694 2165681 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
+2165698 2165681 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 30
+2165699 2165681 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
+2165700 2165681 sleep 300
 parent exit code=130 (130 expected)
 processes after parent exit:
 (end of list)
+```
+
+### 9. Ctrl+C race: direct child closed, SIGTERM-ignoring descendant alive
+`sigint-orphan-proof.sh` runs `orphan-proof.mjs`: `spawnBounded('/bin/sh', ['-c', '(trap "" TERM; exec sleep 300) >/dev/null 2>&1 </dev/null & exit 0'])`. The shell exits at once and the sleeper holds no pipe, so the child's `close` fires immediately, yet the sleeper is still in the group. The runner treats it as an orphan and cancels it (same `cancel()`), and a SIGINT sent 0.6 s after start joins that teardown. Parent exit comes only after SIGKILL of the sleeper (timestamps are `HH:MM:SS.mmm`; script exits non-zero unless parent code is 130 and nothing is left):
+```
+cd /home/jorge/projects/ai-factory && sh spikes/phase0/sigint-orphan-proof.sh   # script exit 0
+16:06:05.200 parent pid=2167475; direct child already gone, sleeper still alive:
+2167484       1 2167483 sleep 300
+16:06:05.222 sending SIGINT to parent
+16:06:06.687 parent exited with code 130 (130 expected)
+processes after parent exit:
+none
+parent log:
+16:06:04.607 start
+16:06:06.681 runner resolved: code=0 orphans=true
 ```
 
 **Verdict:** PASS on Node 24.13.1 and 22.19.0 (Pi legs and npm legs) for install-by-tag from a private repo with credentials, and for TS-source extension plus dependency (no build step). Failure modes (bad tag, missing credentials) are loud, bounded and distinguishable, but an unresolvable ref in settings is fatal for every Pi command rather than a warning.

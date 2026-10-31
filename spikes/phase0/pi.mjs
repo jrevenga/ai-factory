@@ -93,8 +93,9 @@ export async function terminateTree(child, graceMs = 2000, maxMs = 15000) {
   }
 }
 
-// Children currently running; Ctrl+C / SIGTERM on the parent tears all of them down (they are detached,
-// so the terminal's SIGINT does not reach them).
+// Children currently running, each with ONE cancellation path (timeout, abort, Ctrl+C and orphan cleanup
+// all go through cancel(), which starts the awaited teardown once and returns the same promise).
+// Children are detached, so the terminal's SIGINT does not reach them; the parent forwards it.
 const active = new Set();
 let handlersInstalled = false;
 function installSignalHandlers() {
@@ -102,41 +103,55 @@ function installSignalHandlers() {
   handlersInstalled = true;
   for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
     process.on(sig, async () => {
-      await Promise.all([...active].map((c) => terminateTree(c)));
+      await Promise.all([...active].map((entry) => entry.cancel(sig)));
       process.exit(code);
     });
   }
 }
 
 // Spawn with stdout/stderr capture, optional stdin, timeoutMs and AbortSignal.
-// Resolves { code, stdout, stderr, timedOut }; on timeout/abort only after the whole process tree is gone.
+// Resolves { code, stdout, stderr, timedOut, orphans }. The promise never resolves before the whole process
+// group is gone when a cancel happened. After a normal exit, descendants still alive in the group are
+// treated as orphans and cancelled too (orphans: true); the child stays "active" until then.
 export function spawnBounded(cmd, args, spawnOpts, { input, timeoutMs, signal } = {}) {
   installSignalHandlers();
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { ...spawnOpts, shell: false, detached: process.platform !== "win32" });
-    active.add(child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let terminating;
+    const entry = {
+      cancel(reason) {
+        terminating ??= terminateTree(child);
+        entry.reason ??= reason;
+        return terminating;
+      },
+    };
+    active.add(entry);
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
     const stop = () => {
       timedOut = true;
-      terminating ??= terminateTree(child);
+      entry.cancel("timeout");
     };
     const timer = timeoutMs ? setTimeout(stop, timeoutMs) : undefined;
     if (signal) signal.aborted ? stop() : signal.addEventListener("abort", stop, { once: true });
     child.on("error", (e) => {
       clearTimeout(timer);
-      active.delete(child);
+      active.delete(entry);
       reject(e);
     });
     child.on("close", async (code) => {
       clearTimeout(timer);
+      let orphans = false;
+      if (!terminating && process.platform !== "win32" && groupAlive(child.pid)) {
+        orphans = true;
+        entry.cancel("orphans");
+      }
       if (terminating) await terminating;
-      active.delete(child);
-      resolve({ code: timedOut ? null : code ?? 1, stdout, stderr, timedOut });
+      active.delete(entry);
+      resolve({ code: timedOut ? null : code ?? 1, stdout, stderr, timedOut, orphans });
     });
     if (child.stdin) {
       child.stdin.on("error", () => {});
