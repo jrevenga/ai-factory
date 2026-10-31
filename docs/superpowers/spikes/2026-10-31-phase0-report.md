@@ -396,7 +396,7 @@ parent log:
 
 **Question:** Can a persistent `factory` executable be installed from the private repo into an empty npm prefix with `npm install -g`, and can a single `npx -y github:... install` command bootstrap it (the executable surviving after npx exits)?
 
-**Method:** Tag `spike-pkg-v0.1.0` (`bin/factory-spike.mjs`; `package.json` has no `scripts`, so no build/prepare step exists to run). Every scenario was reset (`resetScenario`) before its run; npm ran through `spikes/phase0/npm.mjs` (forced prefix `.npm-global-<scenario>`, cache `out/npm-cache-<scenario>`). The executable was then run in a new process (`env -u npm_config_prefix`, cwd `/tmp`) from the POSIX location `<prefix>/bin/factory-spike` (on Windows it would be `<prefix>/factory-spike.cmd`; not tested here, see S10). Node 24.13.1 and the Node 22.19.0 binary (`/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node`) were both used; under 22.19 the same npm/npx JS entries run with that binary via `spikes/phase0/s3-probe.mjs <scenario> <npm|npx> <node> <args>` (scenarios `cli-n22`, `bootstrap-n22`). Owner's `npm prefix -g` recorded before and after.
+**Method:** Tag `spike-pkg-v0.1.0` (`bin/factory-spike.mjs`; `package.json` has no `scripts`, so no build/prepare step exists to run). Every scenario was reset (`resetScenario`) before its run; npm ran through `spikes/phase0/npm.mjs` (forced prefix `.npm-global-<scenario>`, cache `out/npm-cache-<scenario>`). The executable was then run in a new process (`env -u npm_config_prefix`, cwd `/tmp`) from the POSIX location `<prefix>/bin/factory-spike` (on Windows `<prefix>/factory-spike.cmd`; not tested here, see S10). Node 24.13.1 (default) and an official Node 22.19.0 distribution (see "Node 22.19.0 rerun" below) were used. (An earlier Node 22 attempt used an npm-less standalone binary; it did not run the `install` branch under 22.19 and its claim was withdrawn.) Owner's `npm prefix -g` recorded before and after.
 
 **Evidence:**
 
@@ -409,8 +409,6 @@ ls -la /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli/bin
 /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli/bin/factory-spike   (new process, cwd /tmp)
   factory-spike ok v24.13.1   # exit 0
 ```
-Step 1, Node 22.19.0 (`cli-n22`):
-```
 node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs cli-n22 npm /home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
 -> exit=0 durationMs=11015, "added 122 packages in 11s", same warnings
 PATH=<node22 dir>:$PATH /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli-n22/bin/factory-spike
@@ -420,13 +418,11 @@ Step 2, Node 24.13.1 (`bootstrap`):
 ```
 npm prefix -g (owner env) before: /home/linuxbrew/.linuxbrew
 node /home/jorge/projects/ai-factory/spikes/phase0/npm.mjs bootstrap npx -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install
--> exit 0, "added 122 packages in 9s" (wall 21.9 s, includes npx's own fetch/install of the package into its cache before running `install`)
+-> exit 0, "added 122 packages in 9s" (single run, wall 21.9 s; the "9s" is the inner npm install, the remainder is npx fetching the package and startup)
 ls -la /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-bootstrap/bin
   factory-spike -> ../lib/node_modules/ai-factory-spike/bin/factory-spike.mjs
 /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-bootstrap/bin/factory-spike   (new process after npx exited, cwd /tmp)
   factory-spike ok v24.13.1   # exit 0
-```
-Step 2, Node 22.19.0 (`bootstrap-n22`, npx-cli.js run with the 22.19 binary):
 ```
 node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs bootstrap-n22 npx /home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install
 -> exit=0 durationMs=21395, "added 122 packages in 9s"
@@ -434,9 +430,36 @@ node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs bootstrap-n22 np
 ```
 Owner environment after all runs: `npm prefix -g` = `/home/linuxbrew/.linuxbrew` (unchanged); `ls /home/linuxbrew/.linuxbrew/bin | grep -c factory-spike` = 0.
 
-**Verdict:** Both paths work on Linux with Node 24.13.1 and 22.19.0 using the owner's git credential helper. The one-command bootstrap works reliably in this run: the persistent executable exists after npx exits (it is a symlink into the global prefix's `lib/node_modules`, not into the npx cache) and runs. Cost: ~22 s versus ~11 s for the direct install, because npx first installs the package into its cache and then the `install` subcommand does a second `npm install -g` (including the ~122 packages for Pi as a peer dependency). No build/prepare step ran (none declared). Caveat: a single run per Node version, Linux only, and the self-install depends on `install` inheriting `npm_config_prefix`; on a real machine it uses the user's configured global prefix, which must be writable without sudo.
+Node 22.19.0 rerun (official distribution, fixes review finding on the earlier leg):
+```
+curl -fsSLO https://nodejs.org/dist/v22.19.0/node-v22.19.0-linux-x64.tar.xz ; curl -fsSLO .../SHASUMS256.txt   (into /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/)
+grep node-v22.19.0-linux-x64.tar.xz SHASUMS256.txt | sha256sum -c -   -> node-v22.19.0-linux-x64.tar.xz: OK
+tar xf ...  ->  bin/{corepack,node,npm,npx}; node -v = v22.19.0; npm -v = 10.9.3 (bundled, next to node)
+PATH=/home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin:<original PATH minus every dir containing a node executable>; npm_config_loglevel=verbose
+which node -> /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin/node (v22.19.0); which npx -> /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin/npx; `which -a node` lists only that one
+```
+The driver was itself started by the official node (`node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs <scenario> <tool> - <args>`), so `process.execPath` is Node 22.19.0 and runNpm's `npmEntry` resolves the official bundled npm; `runNpm` still forces prefix `.npm-global-<scenario>` and cache `out/npm-cache-<scenario>` with the containment guard. Scenarios reset first.
+```
+(a) node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs cli-n22 npm - install -g {G}
+  exit=0 durationMs=9719, "added 122 packages in 10s"
+  npm verbose cli /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin/node /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js
+(b) node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs bootstrap-n22 npx - -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install
+  exit=0 durationMs=17683, "added 122 packages in 7s"
+  outer: npm verbose cli /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin/node /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js ; title "npm exec github:jrevenga/ai-factory#spike-pkg-v0.1.0 install"; npm info using node@v22.19.0
+  inner (spawned by the package's `install` branch): npm verbose cli /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin/node /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js ; title "npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0"; argv "install" "--global" ...
+new process, same PATH, env -u npm_config_prefix, cwd /tmp:
+  /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli-n22/bin/factory-spike        -> factory-spike ok v22.19.0   # exit 0
+  /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-bootstrap-n22/bin/factory-spike  -> factory-spike ok v22.19.0   # exit 0
+```
+Lifecycle scripts (verbose log excerpt, both runs): only dependencies ran scripts, not the spike package: `npm info run @google/genai@2.21.0 preinstall ... echo 'preinstall: no-op'` and `npm info run protobufjs@7.6.6 postinstall ... node scripts/postinstall` (each `{ code: 0, signal: null }`); no `run ai-factory-spike@...` line appears. The spike package itself declares no scripts, so no build/prepare step ran for it; the Pi peer-dependency tree does run two dependency scripts.
 
-**Design impact:** Task 11 can offer the one-command bootstrap (`npx -y github:jrevenga/ai-factory#<tag> install`) as the documented entry point, with `npm install -g git+https://github.com/jrevenga/ai-factory.git#<tag>` as the equivalent two-step fallback (and `factory install` when the CLI already exists). Keep the fallback because npx bootstrap doubles the install time and hides npm errors behind npx; `doctor` should print the `npm prefix -g` writability check and the Windows location (`<prefix>/factory.cmd` style, to be confirmed in S10).
+**Verdict:** Linux, single runs, owner's git credential helper. Proven per Node version:
+- Node 24.13.1: `npm install -g` (exit 0, ~11 s) and `npx -y github:... install` (exit 0, ~22 s) both leave a working persistent `factory-spike` (`ok v24.13.1`); the executable survives after npx exits (symlink into the prefix's `lib/node_modules`, not the npx cache).
+- Official Node 22.19.0 with bundled npm 10.9.3 first on PATH: both legs also exit 0, outer and inner npm logs show the 22.19.0 node and its bundled npm, and the installed executable prints `ok v22.19.0`.
+- Not proven: a Node without bundled npm next to it (the earlier standalone 22.19 binary), Windows, macOS, or a clean machine without git credentials (auth failure is covered by S2 and feeds the Task 11 `doctor` message).
+The one-command bootstrap works in these runs. Timings are single runs; the bootstrap (~22 s vs ~11 s) includes npx fetching the package plus the inner install, and the cost split was not measured further. Keep `npm install -g` as the documented fallback.
+
+**Design impact:** Task 11 can document `npx -y github:jrevenga/ai-factory#<tag> install` as the entry point with `npm install -g git+https://github.com/jrevenga/ai-factory.git#<tag>` as fallback. The spike's `install` branch resolves npm relative to `process.execPath` (`<node-dir>/../lib/node_modules/npm/bin/npm-cli.js`), which is fragile: standalone node binaries, nvm/volta shims and Node installs without bundled npm break it (observed: the standalone Node 22.19 binary has no npm beside it). The real installer should locate npm via `npm_execpath` (set when run through npm/npx) or invoke `npm` from PATH. `doctor` should check that `npm prefix -g` is writable without sudo and report the private-repo auth failure from S2; on Windows the executable is `<prefix>/factory-spike.cmd` (confirm in S10).
 
 ## S4 bridge tools and gates
 
