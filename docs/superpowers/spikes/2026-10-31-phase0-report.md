@@ -409,11 +409,6 @@ ls -la /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli/bin
 /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli/bin/factory-spike   (new process, cwd /tmp)
   factory-spike ok v24.13.1   # exit 0
 ```
-node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs cli-n22 npm /home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
--> exit=0 durationMs=11015, "added 122 packages in 11s", same warnings
-PATH=<node22 dir>:$PATH /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-cli-n22/bin/factory-spike
-  factory-spike ok v22.19.0   # exit 0
-```
 Step 2, Node 24.13.1 (`bootstrap`):
 ```
 npm prefix -g (owner env) before: /home/linuxbrew/.linuxbrew
@@ -423,10 +418,6 @@ ls -la /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-bootstrap/bin
   factory-spike -> ../lib/node_modules/ai-factory-spike/bin/factory-spike.mjs
 /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-bootstrap/bin/factory-spike   (new process after npx exited, cwd /tmp)
   factory-spike ok v24.13.1   # exit 0
-```
-node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs bootstrap-n22 npx /home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install
--> exit=0 durationMs=21395, "added 122 packages in 9s"
-/home/jorge/projects/ai-factory/spikes/phase0/.npm-global-bootstrap-n22/bin/factory-spike -> factory-spike ok v22.19.0   # exit 0
 ```
 Owner environment after all runs: `npm prefix -g` = `/home/linuxbrew/.linuxbrew` (unchanged); `ls /home/linuxbrew/.linuxbrew/bin | grep -c factory-spike` = 0.
 
@@ -440,7 +431,7 @@ which node -> /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/
 ```
 The driver was itself started by the official node (`node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs <scenario> <tool> - <args>`), so `process.execPath` is Node 22.19.0 and runNpm's `npmEntry` resolves the official bundled npm; `runNpm` still forces prefix `.npm-global-<scenario>` and cache `out/npm-cache-<scenario>` with the containment guard. Scenarios reset first.
 ```
-(a) node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs cli-n22 npm - install -g {G}
+(a) node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs cli-n22 npm - install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
   exit=0 durationMs=9719, "added 122 packages in 10s"
   npm verbose cli /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/bin/node /home/jorge/projects/ai-factory/spikes/phase0/out/node22-official/node-v22.19.0-linux-x64/lib/node_modules/npm/bin/npm-cli.js
 (b) node /home/jorge/projects/ai-factory/spikes/phase0/s3-probe.mjs bootstrap-n22 npx - -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install
