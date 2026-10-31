@@ -872,7 +872,7 @@ What it cannot enforce: hosted tools (web search), commands hidden in opaque she
 
 ### Live smoke (negative control and positive run)
 
-Isolation statement (accurate, not full isolation): both runs use the owner's real Codex CLI and real `CODEX_HOME` for authentication only. No config file under `~/.codex` was created or modified by the runs' flags. `--ephemeral` only avoids session persistence; Codex may still write its own logs/state under `CODEX_HOME`. The explicit `-s workspace-write` and `-c approval_policy=never` flags override the owner's `config.toml` defaults (`never` + `danger-full-access`) for the run. The hook under test is project-local (in the throwaway repo). A throwaway `CODEX_HOME` was rejected because it would need a copy of the owner's credentials.
+Isolation statement (accurate, not full isolation): both runs use the owner's real Codex CLI and real `CODEX_HOME`: it supplied authentication, and user-level Codex configuration was also loaded (see C12: the positive run answered in the owner's persona). No config file under `~/.codex` was created or modified by the runs' flags. `--ephemeral` only avoids session persistence; Codex may still write its own logs/state under `CODEX_HOME`. The explicit `-s workspace-write` and `-c approval_policy=never` flags override the owner's `config.toml` defaults (`never` + `danger-full-access`) for the run. The hook under test is project-local (in the throwaway repo). A throwaway `CODEX_HOME` was rejected because it would need a copy of the owner's credentials.
 
 Negative control (done): fresh `mktemp -d` dir (`/tmp/tmp.6dcG4S5WYp`), `git init`, `.codex/hooks.json` with a `PreToolUse` matcher `Bash` command hook (`.codex/deny-hook.sh`: appends a line to `hook.log`, exits 2 with stderr `spike gate` when stdin contains `spike-deny`):
 ```
@@ -880,7 +880,7 @@ codex exec -m gpt-6.1-sol -s workspace-write -c approval_policy=never --ephemera
 ```
 Banner: `approval: never`, `sandbox: workspace-write`. Result: the model ran `zsh -lc 'echo spike-deny > denied.txt'`, `succeeded`, `denied.txt` was created and `hook.log` does not exist: the untrusted project-local hook was NOT loaded (S9 item 4). This confirms the fail-open consequence of an untrusted hook.
 
-Positive run (executed 2026-10-31 about 19:37 UTC): run by the controller (Claude) after the owner explicitly asked for it and added a narrow project-local Claude Code allow rule for exactly this script (`spikes/phase0/out/s9-hook-smoke.sh`, git-ignored, a verbatim copy of the owner sequence below). The earlier denial by the session permission classifier was not worked around; the run happened only once the owner authorized it. Two controls were needed, and both were supplied per invocation (nothing persisted for trust):
+Positive run (executed 2026-10-31 about 19:37 UTC): run by the controller (Claude) after the owner explicitly asked for it and added a narrow project-local Claude Code allow rule for exactly this script (`spikes/phase0/out/s9-hook-smoke.sh`, git-ignored, the same sequence the report previously listed for the owner). The earlier denial by the session permission classifier was not worked around; the run happened only once the owner authorized it. Two controls were needed, and both were supplied per invocation (nothing persisted for trust):
 1. **Project trust**: an untrusted project skips every project-scoped `.codex/` layer, including project-local hooks (docs: https://learn.chatgpt.com/docs/config-file/config-basic, "Configuration precedence"). In Codex 0.166.0 the trust decision is computed from the merged config including the `-c` session overrides (`codex-rs/config/src/loader/mod.rs` at tag `rust-v0.166.0`, `merged_so_far` merges `cli_overrides_layer` before `project_trust_context(...)` reads `projects`), so the per-invocation override `-c "projects={\"$D\"={trust_level=\"trusted\"}}"` trusts the project without writing `~/.codex/config.toml`. This was source-derived and is now run-tested: the override WAS honoured. It must be an inline table on the `projects` key (the dotted form does not work: the override key is split on every `.`, and `mktemp` paths contain dots), and `D` is canonicalized with `pwd -P` because the lookup compares canonical paths.
 2. **Hook trust**: non-managed hooks also need persisted, hash-bound hook trust (`/hooks` in the TUI); `--dangerously-bypass-hook-trust` skips it for one invocation (`codex exec --help`, 0.166.0).
 
@@ -895,7 +895,7 @@ workdir: /tmp/tmp.s8Qw6pXIBh
 model: gpt-6.1-sol
 approval: never
 sandbox: workspace-write [workdir, /tmp, $TMPDIR]
-warning: `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.
+warning: `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.   # expected: printed once per hook load when the bypass flag is set (appears twice in the transcript)
 hook: PreToolUse
 2026-10-31T19:37:58.608709Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: spike gate. Command: echo spike-deny > denied.txt
 hook: PreToolUse Blocked
