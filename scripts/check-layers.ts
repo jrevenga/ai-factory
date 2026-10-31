@@ -27,25 +27,151 @@ function zoneOf(rel: string): Zone {
   return "other";
 }
 
-function listFiles(dir: string, out: string[]): void {
+function listFiles(dir: string, out: string[], optional: boolean): void {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return;
+  } catch (e) {
+    if (optional && (e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new Error(`cannot read directory ${dir}: ${(e as Error).message}`, { cause: e });
   }
   for (const e of entries) {
     if (e.name === "node_modules") continue;
     const p = join(dir, e.name);
-    if (e.isDirectory()) listFiles(p, out);
+    if (e.isDirectory()) listFiles(p, out, false);
     else if (SCAN_EXT.test(e.name)) out.push(p);
   }
 }
 
-// Replace comments with spaces (keeping newlines) while leaving string literals intact.
-function maskComments(src: string): string {
-  const re = /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\[\s\S]|[^`\\])*`/g;
-  return src.replace(re, (m) => (m.startsWith("//") || m.startsWith("/*") ? m.replace(/[^\n]/g, " ") : m));
+interface Tok {
+  kind: "word" | "str" | "punct";
+  text: string; // word text, string value (null-ish "" when not static), or punctuation char
+  line: number;
+  static: boolean; // for str: false for template literals with substitutions
+}
+
+// Minimal lexer: skips comments, keeps string/template literal values, skips regex literals.
+function tokenize(src: string): Tok[] {
+  const toks: Tok[] = [];
+  let i = 0;
+  let line = 1;
+  const n = src.length;
+  const isWordStart = (c: string) => /[A-Za-z_$]/.test(c);
+  const isWord = (c: string) => /[A-Za-z0-9_$]/.test(c);
+
+  // Skips a template body starting after the opening backtick; returns value and whether static.
+  const readTemplate = (): { value: string; isStatic: boolean } => {
+    let value = "";
+    let isStatic = true;
+    while (i < n && src[i] !== "`") {
+      const c = src[i] as string;
+      if (c === "\\") {
+        value += src[i + 1] ?? "";
+        if (src[i + 1] === "\n") line++;
+        i += 2;
+      } else if (c === "$" && src[i + 1] === "{") {
+        isStatic = false;
+        i += 2;
+        let depth = 1;
+        while (i < n && depth > 0) {
+          const d = src[i] as string;
+          if (d === "\n") line++;
+          if (d === "`") {
+            i++;
+            readTemplate();
+            i++;
+            continue;
+          }
+          if (d === '"' || d === "'") {
+            i = skipString(d);
+            continue;
+          }
+          if (d === "{") depth++;
+          else if (d === "}") depth--;
+          i++;
+        }
+      } else {
+        if (c === "\n") line++;
+        value += c;
+        i++;
+      }
+    }
+    return { value, isStatic };
+  };
+  const skipString = (q: string): number => {
+    let j = i + 1;
+    while (j < n && src[j] !== q && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
+    return j + 1;
+  };
+
+  while (i < n) {
+    const c = src[i] as string;
+    if (c === "\n") {
+      line++;
+      i++;
+    } else if (/\s/.test(c)) {
+      i++;
+    } else if (c === "/" && src[i + 1] === "/") {
+      while (i < n && src[i] !== "\n") i++;
+    } else if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? n : end + 2;
+      for (let k = i; k < stop; k++) if (src[k] === "\n") line++;
+      i = stop;
+    } else if (c === '"' || c === "'") {
+      let j = i + 1;
+      let value = "";
+      while (j < n && src[j] !== c && src[j] !== "\n") {
+        if (src[j] === "\\") {
+          value += src[j + 1] ?? "";
+          j += 2;
+        } else value += src[j++];
+      }
+      toks.push({ kind: "str", text: value, line, static: true });
+      i = j + 1;
+    } else if (c === "`") {
+      const startLine = line;
+      i++;
+      const t = readTemplate();
+      i++;
+      toks.push({ kind: "str", text: t.value, line: startLine, static: t.isStatic });
+    } else if (isWordStart(c)) {
+      let j = i + 1;
+      while (j < n && isWord(src[j] as string)) j++;
+      toks.push({ kind: "word", text: src.slice(i, j), line, static: true });
+      i = j;
+    } else if (/[0-9]/.test(c)) {
+      let j = i + 1;
+      while (j < n && /[0-9A-Za-z_.]/.test(src[j] as string)) j++;
+      toks.push({ kind: "word", text: src.slice(i, j), line, static: true });
+      i = j;
+    } else if (c === "/" && regexAllowed(toks)) {
+      let j = i + 1;
+      let inClass = false;
+      while (j < n && src[j] !== "\n") {
+        const d = src[j] as string;
+        if (d === "\\") j++;
+        else if (d === "[") inClass = true;
+        else if (d === "]") inClass = false;
+        else if (d === "/" && !inClass) break;
+        j++;
+      }
+      i = j + 1;
+      toks.push({ kind: "word", text: "/regex/", line, static: true });
+    } else {
+      toks.push({ kind: "punct", text: c, line, static: true });
+      i++;
+    }
+  }
+  return toks;
+}
+
+function regexAllowed(toks: Tok[]): boolean {
+  const prev = toks[toks.length - 1];
+  if (!prev) return true;
+  if (prev.kind === "str") return false;
+  if (prev.kind === "word") return ["return", "typeof", "case", "in", "of", "delete", "void", "throw", "new"].includes(prev.text);
+  return ![")", "]", "}"].includes(prev.text);
 }
 
 interface Ref {
@@ -55,21 +181,47 @@ interface Ref {
 }
 
 function findRefs(src: string): Ref[] {
-  const text = maskComments(src);
+  const t = tokenize(src);
   const refs: Ref[] = [];
-  const lineAt = (idx: number) => text.slice(0, idx).split("\n").length;
-  // import "x" | import ... from "x" | export ... from "x"
-  const stat = /\b(import|export)\b(\s+type\b)?([^;"'`]*?\bfrom\s*|\s*)(["'])((?:\\.|(?!\4)[^\\\n])+)\4/g;
-  for (let m; (m = stat.exec(text)); ) {
-    const kw = m[1];
-    const between = m[3] ?? "";
-    if (kw === "export" && !/\bfrom\s*$/.test(between)) continue;
-    if (kw === "import" && between.trim() === "" && m[2]) continue;
-    refs.push({ specifier: m[5] ?? "", line: lineAt(m.index), typeOnly: Boolean(m[2]) });
-  }
-  const dyn = /\bimport\s*\(\s*(["'])((?:\\.|(?!\1)[^\\\n])+)\1\s*\)/g;
-  for (let m; (m = dyn.exec(text)); ) {
-    refs.push({ specifier: m[2] ?? "", line: lineAt(m.index), typeOnly: false });
+  const word = (k: number, w: string) => t[k]?.kind === "word" && t[k]?.text === w;
+  const punct = (k: number, p: string) => t[k]?.kind === "punct" && t[k]?.text === p;
+  const str = (k: number) => (t[k]?.kind === "str" ? t[k] : undefined);
+  for (let k = 0; k < t.length; k++) {
+    const tok = t[k] as Tok;
+    if (tok.kind !== "word" || punct(k - 1, ".")) continue;
+    if (tok.text === "import") {
+      if (punct(k + 1, "(")) {
+        const a = str(k + 2);
+        if (a?.static && (punct(k + 3, ")") || punct(k + 3, ","))) {
+          refs.push({ specifier: a.text, line: tok.line, typeOnly: false });
+        }
+        continue;
+      }
+      if (punct(k + 1, ".")) continue;
+      const side = str(k + 1);
+      if (side) {
+        refs.push({ specifier: side.text, line: tok.line, typeOnly: false });
+        continue;
+      }
+      const typeOnly = word(k + 1, "type") && !word(k + 2, "from") && !punct(k + 2, ",");
+      for (let j = k + 1; j < t.length && !punct(j, ";"); j++) {
+        const s = str(j + 1);
+        if (word(j, "from") && s) {
+          refs.push({ specifier: s.text, line: tok.line, typeOnly });
+          break;
+        }
+      }
+    } else if (tok.text === "export") {
+      const typed = word(k + 1, "type") && (punct(k + 2, "{") || punct(k + 2, "*"));
+      if (!(typed || punct(k + 1, "{") || punct(k + 1, "*"))) continue;
+      for (let j = k + 1; j < t.length && !punct(j, ";"); j++) {
+        const s = str(j + 1);
+        if (word(j, "from") && s) {
+          refs.push({ specifier: s.text, line: tok.line, typeOnly: typed });
+          break;
+        }
+      }
+    }
   }
   return refs;
 }
@@ -77,7 +229,7 @@ function findRefs(src: string): Ref[] {
 export function checkLayers(root: string): LayerViolation[] {
   const absRoot = resolve(root);
   const files: string[] = [];
-  for (const d of SCAN_DIRS) listFiles(join(absRoot, d), files);
+  for (const d of SCAN_DIRS) listFiles(join(absRoot, d), files, true);
   files.sort();
 
   const violations: LayerViolation[] = [];
@@ -97,6 +249,10 @@ export function checkLayers(root: string): LayerViolation[] {
         if ((zone === "adapters" || zone === "extension") && tz === "cli") add("adapters-no-cli");
         if (tz === "extension" && zone !== "extension") add("no-import-extension");
         if (zone === "extension" && tz !== "core" && tz !== "extension") add("extension-core-only");
+        continue;
+      }
+      if (zone === "extension" && !spec.startsWith(PI_SCOPE)) {
+        add("extension-core-only");
         continue;
       }
       const bare = spec.startsWith("node:") ? spec.slice(5) : spec;

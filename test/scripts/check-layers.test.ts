@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
@@ -85,6 +85,60 @@ describe("checkLayers", () => {
   it("scripts importing pi is a violation", async () => {
     const root = await tree({ "scripts/s.ts": 'import type { a } from "@earendil-works/pi-ai";\n' });
     expect(checkLayers(root).map((x) => x.rule)).toEqual(["pi-import-type-only"]);
+  });
+
+  it("extension non-relative imports other than pi types -> extension-core-only", async () => {
+    const root = await tree({
+      "src/adapters/pi/extension/n.ts": 'import fs from "node:fs";\nimport { z } from "zod";\nimport type { T } from "@earendil-works/pi-ai";\nexport { fs, z };\nexport type U = T;\n',
+    });
+    const v = checkLayers(root);
+    expect(v.map((x) => [x.rule, x.specifier])).toEqual([
+      ["extension-core-only", "node:fs"],
+      ["extension-core-only", "zod"],
+    ]);
+  });
+
+  it("dynamic template-literal import of node:fs in core -> violation", async () => {
+    const root = await tree({ "src/core/t.ts": "export const m = import(`node:fs`);\n" });
+    expect(checkLayers(root).map((x) => x.rule)).toEqual(["core-no-io-builtins"]);
+  });
+
+  it("import text inside strings, templates and comments -> no violation", async () => {
+    const root = await tree({
+      "src/core/s.ts": [
+        "const a = \"import('node:fs')\";",
+        "const b = `import fs from 'node:fs' ${1 + 1}`;",
+        "// import fs from 'node:fs';",
+        "/* import('node:os') */",
+        "const c = /import\\('x'\\)/;",
+        "const d = { import: 1 }.import;",
+        "export { a, b, c, d };",
+        "",
+      ].join("\n"),
+    });
+    expect(checkLayers(root)).toEqual([]);
+  });
+
+  it("multi-line imports, import type and export-from are classified correctly", async () => {
+    const root = await tree({
+      "src/core/m.ts": 'import {\n  a,\n  b,\n} from\n  "../adapters/x.ts";\nimport type { T } from "../cli/y.ts";\nexport type { U } from "../cli/z.ts";\nexport { a, b };\n',
+    });
+    const v = checkLayers(root);
+    expect(v.map((x) => [x.rule, x.line])).toEqual([
+      ["core-no-adapters", 1],
+      ["core-no-cli", 6],
+      ["core-no-cli", 7],
+    ]);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("an unreadable source directory fails the scan with its path", async () => {
+    const root = await tree({ "src/core/ok.ts": "export {};\n" });
+    chmodSync(join(root, "src"), 0o000);
+    try {
+      expect(() => checkLayers(root)).toThrow(/src/);
+    } finally {
+      chmodSync(join(root, "src"), 0o755);
+    }
   });
 
   it("the real repository has no violations", () => {
