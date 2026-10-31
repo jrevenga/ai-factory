@@ -49,7 +49,7 @@ Each is `ruling — why — cost if wrong`. Facts marked (verified) were checked
 - Git and npm children get `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never` and a timeout.
 - One effective package source everywhere: `effectiveSource(manifest, env)` = `env.FACTORY_SOURCE ?? manifest.source.git` (install, doctor, update, rollback, apply).
 - Factory state under `FACTORY_HOME` (default `~/.factory`); Pi agent dir = `PI_CODING_AGENT_DIR` or `~/.pi/agent`.
-- Layers: `core` imports nothing from `adapters`/`cli`, no `@earendil-works/*`, no `node:fs`, `node:child_process`, `node:os`, `node:net`, `node:http`; `adapters` never imports `cli`; nothing outside `src/adapters/pi/extension/**` imports from it; `src/adapters/pi/extension/**` imports only `core` and itself; only `src/adapters/pi/extension/**`, `guard/**` and `test/**` may import `@earendil-works/*`, and outside `test/**` only with `import type`. `cli` is the composition root and may import `core` and any adapter except the extension.
+- Layers: `core` imports nothing from `adapters`/`cli`, no `@earendil-works/*`, no `node:fs`, `node:child_process`, `node:os`, `node:net`, `node:http`; `adapters` never imports `cli`; nothing outside `src/adapters/pi/extension/**` imports from it; `src/adapters/pi/extension/**` imports only `core`, itself and Node builtins (ruling R6, SDD ledger); only `src/adapters/pi/extension/**`, `guard/**` and `test/**` may import `@earendil-works/*`, and outside `test/**` only with `import type`. `cli` is the composition root and may import `core` and any adapter except the extension.
 - `.gitattributes`: `* text=auto eol=lf`.
 - Artifacts in English; conventional commits, no AI attribution.
 
