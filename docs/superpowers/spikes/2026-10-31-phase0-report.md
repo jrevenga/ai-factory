@@ -913,6 +913,8 @@ Expected evidence: `hook.log` exists with at least one `invoked:` line containin
 
 **Evidence:** Run https://github.com/jrevenga/ai-factory/actions/runs/41219133823 (commit `b908165`), first attempt, no re-runs. All four jobs concluded `success`; every check in every job had `ok: true`. Runner Node: 22.19.0 and 24.22.1.
 
+**Re-run after the Windows quoting fix:** Run https://github.com/jrevenga/ai-factory/actions/runs/41232497334 (commit `6494d68`, owner-approved push and dispatch, 2026-10-31), first attempt. All four jobs concluded `success` (ubuntu 22.19.0 52 s, ubuntu 24 53 s, windows 22.19.0 124 s, windows 24 138 s). The Windows legs checked out into a path containing a space (log: `Working directory is 'D:\a\ai-factory\ai-factory\ai factory'`; the workflow fails if `$PWD` has no space), and `cli-install-run` reported `ok: true` on both Windows legs, so the `.cmd` shim runs from a spaced checkout path with the `cmd.exe /d /s /c ""<exe>""` + `windowsVerbatimArguments` invocation.
+
 | Job | Node | S1 | Pi install | install-by-tag + marker | CLI install + run | Bootstrap | totalMs |
 |---|---|---|---|---|---|---|---|
 | ubuntu-latest | 22.19.0 | ok 32 ms | ok 11.3 s | ok 2.7 s | ok 12.5 s | ok 19.6 s | 46179 |
