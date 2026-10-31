@@ -36,3 +36,6 @@ jobs:
       - name: Test
         working-directory: ${{ env.CHECKOUT_DIR }}
         run: npm test
+      - name: Test (e2e)
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        run: npm run test:e2e
