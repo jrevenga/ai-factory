@@ -12,10 +12,14 @@ export function changelogVersions(markdown: string): string[] {
 /** Sections with `from < version <= to`, newest first. */
 export function changelogBetween(markdown: string, from: string, to: string): string {
   const sections: Array<{ version: string; lines: string[] }> = [];
+  let current: { version: string; lines: string[] } | undefined;
   for (const line of markdown.split(/\r?\n/)) {
     const v = HEADING.exec(line)?.[1];
-    if (v !== undefined) sections.push({ version: v, lines: [line] });
-    else sections.at(-1)?.lines.push(line);
+    if (v !== undefined) {
+      current = { version: v, lines: [line] };
+      sections.push(current);
+    } else if (/^## /.test(line)) current = undefined;
+    else current?.lines.push(line);
   }
   return sections
     .filter((s) => compareSemver(s.version, from) > 0 && compareSemver(s.version, to) <= 0)
