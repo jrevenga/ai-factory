@@ -14,8 +14,10 @@
 
 - Pi version under test: exactly `1.4.0`. Bridge: exactly `pi-claude-bridge@0.9.3`. Record both in the report.
 - Node minimum declared by the design: `22.19`; also test Node `24`.
-- **Isolation**: every Pi invocation goes through `spikes/phase0/pi.mjs`, which sets `PI_CODING_AGENT_DIR=<repo>/spikes/phase0/.agent` and uses the Pi binary from `<repo>/spikes/phase0/.prefix`. Never read, write or print `~/.pi/agent/*` or any `auth.json`. `.agent/` and `.prefix/` are git-ignored.
-- No `sudo`, no admin rights, no global installs outside a scratch npm prefix (`npm_config_prefix=<repo>/spikes/phase0/.npm-global`).
+- **Isolation**: every Pi invocation (including RPC children) goes through `spikes/phase0/pi.mjs`, which forces `PI_CODING_AGENT_DIR=<repo>/spikes/phase0/.agent`, `PI_CODING_AGENT_SESSION_DIR=<repo>/spikes/phase0/.agent/sessions` (Pi honours it independently of the agent dir — `src/main.ts` v1.4.0), and `npm_config_prefix=<repo>/spikes/phase0/.npm-global`, and refuses to start unless all three resolve inside `spikes/phase0/`. Paths are resolved from the launcher's own location (`import.meta.url`), never from the cwd. Never read, write or print `~/.pi/agent/*` or any `auth.json`. `.agent*/`, `.prefix/`, `.npm-global*/` and `out/` are git-ignored.
+- No `sudo`, no admin rights, no global installs outside a scratch npm prefix.
+- **Non-inference RPC probes pass an explicit catalog model** (`--model openai-codex/gpt-6.1-sol`; if Pi's catalog spells it differently, use the catalog id and record it): without authentication or an explicit model Pi selects no model and exits before RPC initialization (`model-resolver.ts`, `main.ts` v1.4.0). Such probes send only `get_state` and never prompt, so no inference or login is needed.
+- **Fresh state per evidence**: every marker carries a per-run nonce and is deleted before the run; failure scenarios use their own empty agent dir and prefix (`.agent-<scenario>`, `.npm-global-<scenario>`), because Pi's git checkout path does not include the ref and a previous valid checkout could otherwise be loaded (`src/core/package-manager.ts` v1.4.0).
 - No secrets in logs or the report: log response header **names** and only the values of rate-limit headers; never log request headers or tokens.
 - Bridge runs with no `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` or `ANTHROPIC_AUTH_TOKEN` in the environment (bridge issue #107); `pi.mjs` deletes them from the child env.
 - Spikes are throwaway (methodology §8 declared exception): no unit tests. Evidence = the exact command, its relevant output and exit code, pasted into the report.
@@ -38,11 +40,14 @@
 **Files:**
 - Create: `spikes/phase0/README.md` — how to run each probe, isolation rules, owner actions.
 - Create: `spikes/phase0/pi.mjs` — isolated Pi launcher.
-- Create: `spikes/phase0/.gitignore` — `.agent/`, `.prefix/`, `.npm-global/`, `out/`.
+- Create: `spikes/phase0/npm.mjs` — isolated npm/npx runner.
+- Create: `spikes/phase0/.gitignore` — `.agent*/`, `.prefix/`, `.npm-global*/`, `out/`.
 - Create: `docs/superpowers/spikes/2026-10-31-phase0-report.md` — report skeleton.
 
 **Interfaces:**
-- Produces: `node spikes/phase0/pi.mjs <pi args...>` runs Pi 1.4.0 with `PI_CODING_AGENT_DIR=spikes/phase0/.agent`, cwd unchanged, `ANTHROPIC_*` removed, exit code passed through. Exported `runPi(args: string[], opts?: { cwd?: string; env?: Record<string,string>; input?: string }): Promise<{ code: number; stdout: string; stderr: string }>`.
+- Produces: `node spikes/phase0/pi.mjs <pi args...>` runs Pi 1.4.0 with the isolated env (Global Constraints), `ANTHROPIC_*` removed, exit code passed through. It spawns `process.execPath` with Pi's **JavaScript bin entry** (resolved from `.prefix/node_modules/@earendil-works/pi-coding-agent/package.json` → `bin`), never `pi.cmd`, so it works on Windows with `shell: false`.
+- Produces: exported `runPi(args: string[], opts?: { cwd?: string; env?: Record<string,string>; input?: string; scenario?: string }): Promise<{ code: number; stdout: string; stderr: string }>` (`scenario` switches to `.agent-<scenario>` / `.npm-global-<scenario>`), and exported `SPIKE = { root, launcher, agentDir, out }` absolute paths for other probes. `pi.mjs` is also usable as `RpcClient`'s `cliPath`.
+- Produces: `node spikes/phase0/npm.mjs <scenario> <npm|npx> <args...>` and exported `runNpm(tool: "npm" | "npx", args: string[], opts: { scenario: string; env?: Record<string,string> }): Promise<{ code: number; stdout: string; stderr: string }>`. It forces `npm_config_prefix=<root>/.npm-global-<scenario>` and `npm_config_cache=<root>/out/npm-cache-<scenario>`, refuses to start unless both resolve inside `spikes/phase0/`, and invokes npm's JS entry (`npm-cli.js` / `npx-cli.js` next to `process.execPath`'s npm install) with `process.execPath`, `shell: false`. **Every npm/npx command in this plan, other than Task 1 Step 1's local `--prefix` install, goes through `npm.mjs`.**
 - Produces: report sections `S1`–`S10` (below), each with *Question / Method / Evidence / Verdict / Design impact*.
 
 - [ ] **Step 1: Install Pi 1.4.0 into the scratch prefix**
@@ -52,12 +57,12 @@ Expected: exit 0; `spikes/phase0/.prefix/node_modules/.bin/pi` exists.
 
 - [ ] **Step 2: Write `pi.mjs`**
 
-Resolves the binary from `.prefix/node_modules/.bin/pi` (`pi.cmd` on Windows), sets the env as in Global Constraints, aborts with exit 2 if the resolved agent dir equals `os.homedir()/.pi/agent`, and spawns with `shell: false`.
+As specified in Interfaces; exits 2 with a clear message if any isolated path resolves outside `spikes/phase0/` or equals `os.homedir()/.pi/agent`.
 
-- [ ] **Step 3: Verify isolation**
+- [ ] **Step 3: Verify isolation with a real runtime start (no model call)**
 
-Run: `node spikes/phase0/pi.mjs --version` then `ls spikes/phase0/.agent`
-Expected: `1.4.0`; the `.agent` directory was created by Pi; `~/.pi/agent/settings.json` modification time unchanged (record before/after `stat`).
+Version: `node spikes/phase0/pi.mjs --version` → `1.4.0` (this exits before runtime initialization, so it checks the binary only). Runtime: record `stat` of `~/.pi/agent` (dir and files) before; start `node spikes/phase0/pi.mjs --mode rpc --model openai-codex/gpt-6.1-sol` (sessions enabled), send `{"id":"1","type":"get_state"}`, read the response, close stdin; record `stat` after.
+Expected: `get_state` succeeds and its `sessionFile` path lies under `spikes/phase0/.agent/sessions/` (an empty session writes no file until a message exists — `session-manager.ts` v1.4.0 — so actual persistence is asserted in Task 6); any new files appear only under `spikes/phase0/.agent/`; nothing under `~/.pi/agent` changed.
 
 - [ ] **Step 4: Write the report skeleton**
 
@@ -66,7 +71,7 @@ Sections: `S1 sqlite`, `S2 package from private git`, `S3 CLI install path`, `S4
 - [ ] **Step 5: Commit**
 
 ```bash
-git add spikes/phase0/README.md spikes/phase0/pi.mjs spikes/phase0/.gitignore docs/superpowers/spikes/2026-10-31-phase0-report.md
+git add spikes/phase0/README.md spikes/phase0/pi.mjs spikes/phase0/npm.mjs spikes/phase0/.gitignore docs/superpowers/spikes/2026-10-31-phase0-report.md
 git commit -m "chore(spike): add isolated Pi workspace and phase 0 report skeleton"
 ```
 
@@ -112,7 +117,8 @@ git commit -m "chore(spike): verify node:sqlite FTS5 accent folding (S1)"
 **Interfaces:**
 - Consumes: `runPi` (Task 1).
 - Produces: tag `spike-pkg-v0.1.0` on `github.com/jrevenga/ai-factory` (private); package `ai-factory-spike` with `keywords: ["pi-package"]`, `pi.extensions: ["./extensions/probe.ts"]`, `dependencies: { "ms": "2.1.3" }`, `peerDependencies: { "@earendil-works/pi-coding-agent": "*" }`, `bin: { "factory-spike": "bin/factory-spike.mjs" }`.
-- Produces: `extensions/probe.ts` — on `session_start` writes `process.env.SPIKE_MARKER` (a file path) with JSON `{"loaded": true, "ms": ms("2h")}` (expected `7200000`); emits `pi.events.emit("factory:handshake", { version: "0.1.0" })`.
+- Produces: `extensions/probe.ts` — on `session_start` writes `process.env.SPIKE_MARKER` (a file path) with JSON `{"loaded": true, "nonce": process.env.SPIKE_NONCE, "ms": ms("2h")}` (expected `7200000`); emits `pi.events.emit("factory:handshake", { version: "0.1.0" })`.
+- Produces: `bin/factory-spike.mjs` — no argument: prints `factory-spike ok <node version>`; `install`: runs `npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0` (inheriting `npm_config_prefix`) and exits with npm's code, simulating the one-command bootstrap's self-install.
 
 - [ ] **Step 1: Owner approval for the private repo (hard gate)**
 
@@ -130,15 +136,20 @@ Expected: exit 0; the package listed with ref `spike-pkg-v0.1.0`; `ms` present u
 
 - [ ] **Step 4: Prove the extension loads (TS via jiti, dependency resolved) without a model call**
 
-Start `node spikes/phase0/pi.mjs --mode rpc --no-session` with `SPIKE_MARKER=spikes/phase0/out/marker.json`, send `{"id":"1","type":"get_state"}`, read the response, close stdin.
-Expected: `marker.json` contains `{"loaded":true,"ms":7200000}`. A zero exit without the marker is a **failure** (Review Focus 1).
+Delete `spikes/phase0/out/marker.json`; generate a nonce; start `node spikes/phase0/pi.mjs --mode rpc --no-session --model openai-codex/gpt-6.1-sol` with `SPIKE_MARKER=<abs>/out/marker.json` and `SPIKE_NONCE=<nonce>`, send `{"id":"1","type":"get_state"}`, read the response, close stdin.
+Expected: `marker.json` exists and contains `{"loaded":true,"nonce":"<this nonce>","ms":7200000}`. A zero exit without a marker carrying this run's nonce is a **failure** (Review Focus 1).
 
-- [ ] **Step 5: Prove failure behavior (Review Focus 1, 2)**
+- [ ] **Step 5: Prove failure behavior with fresh state (Review Focus 1)**
 
-Run: `node spikes/phase0/pi.mjs install git:github.com/jrevenga/ai-factory@does-not-exist` and record the exit code; then start an RPC session with a settings entry pointing at the bad ref and record whether Pi starts without the package and what warning it prints.
-Expected per docs: `pi install` exits non-zero; startup warns and continues. Record exact messages for `factory doctor` and the guard-extension design (architecture §6.2).
+Scenario `badref` (empty `.agent-badref`): run `pi install git:github.com/jrevenga/ai-factory@does-not-exist`, record exit code and message. Then write `.agent-badref/settings.json` with `packages: ["git:github.com/jrevenga/ai-factory@does-not-exist"]`, start an RPC session (`--model openai-codex/gpt-6.1-sol`, `get_state` only) with a fresh nonce, and record: does Pi start, what warning it prints, and confirm **no** marker with this nonce was written (the package must not load from any cache).
+Expected per docs: `pi install` exits non-zero; startup warns and continues without the package. Record exact messages for `factory doctor` and the guard-extension design (architecture §6.2).
 
-- [ ] **Step 6: Record S2 (incl. extension format decision: TS source via jiti is sufficient, or built JS needed) and commit on master**
+- [ ] **Step 6: Missing-credential behavior (Review Focus 2)**
+
+Scenario `nocreds` (empty `.agent-nocreds`; npm via `npm.mjs nocreds`, which gives a fresh prefix and cache), with an environment that has **no** HTTPS or SSH credentials and no prompting: `GIT_CONFIG_GLOBAL=<abs>/out/empty.gitconfig` (empty file), `GIT_CONFIG_NOSYSTEM=1`, any inherited `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`/`GIT_CONFIG_PARAMETERS` removed, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `GIT_ASKPASS=` and `SSH_ASKPASS=` (empty), `SSH_AUTH_SOCK` and `NETRC` removed, `HOME` (and on Windows `USERPROFILE`, `HOMEDRIVE`/`HOMEPATH`) pointed at an empty scratch home `<abs>/out/home-nocreds` so neither git/curl `.netrc` nor a user `.npmrc` can supply credentials, and `GIT_SSH_COMMAND="ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null"` (npm falls back from HTTPS to SSH for hosted repos — pacote in Node 22.19's npm — so SSH must fail too; on Windows use `NUL` for `/dev/null`). Each command bounded to 120 s. Run the **valid** tag install via Pi (`pi install git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0`) and via `node spikes/phase0/npm.mjs nocreds npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0`.
+Expected: both fail without hanging; record exit codes and diagnostics verbatim (input for `factory doctor`). The owner's real git config is never modified.
+
+- [ ] **Step 7: Record S2 (incl. extension format decision: TS source via jiti is sufficient, or built JS needed) and commit on master**
 
 ```bash
 git add docs/superpowers/spikes/2026-10-31-phase0-report.md
@@ -153,17 +164,18 @@ git commit -m "chore(spike): verify Pi package install from private git (S2)"
 - Modify: report S3.
 
 **Interfaces:**
-- Consumes: tag `spike-pkg-v0.1.0` with `bin/factory-spike.mjs` (prints `factory-spike ok <node version>`).
+- Consumes: tag `spike-pkg-v0.1.0` with `bin/factory-spike.mjs` (Task 3 Interfaces).
+- Note: npm puts global executables in `<prefix>/bin/` on POSIX and **directly in `<prefix>/`** on Windows (`factory-spike.cmd`); checks must use the right location per OS.
 
-- [ ] **Step 1: Global install from private git into the scratch prefix**
+- [ ] **Step 1: Global install from private git into an empty scratch prefix**
 
-Run: `npm_config_prefix=spikes/phase0/.npm-global npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0`
-Expected: exit 0; `spikes/phase0/.npm-global/bin/factory-spike` exists and prints `factory-spike ok v24…`. Record whether npm ran a build/prepare step and how long the install took.
+Scenario `cli`: `node spikes/phase0/npm.mjs cli npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0`
+Expected: exit 0; the executable exists at the OS-specific location and prints `factory-spike ok v…`. Record whether npm ran a build/prepare step and the install duration.
 
-- [ ] **Step 2: One-command form**
+- [ ] **Step 2: One-command bootstrap from an empty prefix**
 
-Run: `npm_config_prefix=spikes/phase0/.npm-global npx -y github:jrevenga/ai-factory#spike-pkg-v0.1.0`
-Expected: runs `factory-spike` and prints the same line. Record whether `npx` can also leave a persistent install (design §6.2 one-command wrapper).
+Scenario `bootstrap`: `node spikes/phase0/npm.mjs bootstrap npx -y github:jrevenga/ai-factory#spike-pkg-v0.1.0 install` (the `install` subcommand inherits the forced `npm_config_prefix=.npm-global-bootstrap`), then, in a **new** process without npx, run the executable from that prefix's OS-specific location. Before and after, record `npm prefix -g` of the owner's normal environment to confirm it was not touched.
+Expected: the persistent `factory-spike` exists after the npx process has exited and prints `factory-spike ok`. If this does not work reliably, record it and adopt the two-command design (`npm install -g …` then `factory install`) in Task 11.
 
 - [ ] **Step 3: Record S3 and commit**
 
@@ -183,8 +195,11 @@ git commit -m "chore(spike): verify global CLI install from private git (S3)"
 **Interfaces:**
 - Consumes: `runPi`.
 - Produces: `gate-probe.ts`:
-  - `tool_call`: appends `{ts, toolName, inputKeys}` to `process.env.SPIKE_TOOLLOG` (JSONL); returns `{ block: true, reason: "spike gate" }` when `toolName` is `write` or `edit` and `process.env.SPIKE_BLOCK_WRITES === "1"`.
+  - `session_start`: writes the effective tool inventory (`pi.getAllTools()` names, exposure, annotations) to `process.env.SPIKE_INVENTORY`.
+  - `tool_call`: appends `{ts, toolCallId, toolName, inputKeys, decision}` to `process.env.SPIKE_TOOLLOG` (JSONL). When `process.env.SPIKE_BLOCK_WRITES === "1"` it returns `{ block: true, reason: "spike gate" }` for `write`, `edit` **and `bash`** (so no shell alternative can write), and logs `decision: "blocked"`; otherwise `decision: "allowed"`.
+  - `tool_execution_end`: appends `{toolCallId, toolName, isError, textHead}` (first 200 chars of the result text) to the same log. Blocked calls do **not** go through `tool_result` in Pi 1.4.0 (they are immediate outcomes — `packages/agent/src/agent-loop.ts` v1.4.0), so `tool_execution_end` (or `message_end` with role `toolResult`) is the event used to observe denials.
   - `before_agent_start`: mutates `event.systemPromptOptions` to add a section named `spike-role` with text `End every final answer with the word PINEAPPLE.` (follow `examples/extensions/prompt-customizer.ts` for the exact field shape; read `src/core/extensions/types.ts` at tag v1.4.0).
+- All probe paths passed to Pi are **absolute** (`SPIKE.root`); the temp dir is passed only as `cwd`.
 
 - [ ] **Step 1: Owner action — log in to Codex in the isolated agent dir**
 
@@ -194,21 +209,25 @@ Owner runs `node spikes/phase0/pi.mjs` interactively, `/login` → ChatGPT, then
 
 Run: `node spikes/phase0/pi.mjs install npm:pi-claude-bridge@0.9.3`, then list models (`/model` in an interactive session, or the CLI listing flag if present) and record the exact ids for Claude Opus via `claude-bridge` and for `gpt-6.1-sol` via the native Codex provider.
 
-- [ ] **Step 3: Bridge — tools visible to the hook, sections delivered**
+- [ ] **Step 3: Bridge — control run (unblocked): tools visible to the hook, sections delivered**
 
-In a fresh temp dir (`mktemp -d`), run: `node spikes/phase0/pi.mjs -p --no-session --model <claude-bridge opus id> --extension spikes/phase0/gate-probe.ts "Run the shell command: ls. Then answer in one sentence."` with `SPIKE_TOOLLOG=<tmp>/tools.jsonl`.
-Expected: `tools.jsonl` has a `bash` entry (Pi tool names, lower-case); the answer ends with `PINEAPPLE` (S5 for bridge).
+In a fresh temp dir `T1` (`mktemp -d`), with cwd `T1`: `node <abs>/pi.mjs -p --no-session --model <claude-bridge opus id> --extension <abs>/gate-probe.ts "Create a file named created.txt containing hello, then answer in one sentence."` with `SPIKE_TOOLLOG`, `SPIKE_INVENTORY` under `out/`.
+Expected: `T1/created.txt` exists **and** `tools.jsonl` has an `allowed` entry for the tool that created it (proves writes pass through the hook); the answer ends with `PINEAPPLE` (S5 for bridge).
 
-- [ ] **Step 4: Bridge — block works and no Claude Code built-in tool bypasses it**
+- [ ] **Step 4: Bridge — blocked run: denial asserted, no bypass**
 
-Same dir, `SPIKE_BLOCK_WRITES=1`, prompt: `Create a file named created.txt containing hello. Use any tool you have.`
-Expected: `created.txt` does **not** exist; `tools.jsonl` shows the blocked `write` (or `bash` attempt). If the file exists while no corresponding `tool_call` was logged, Claude Code built-in tools are executing outside Pi → record, then check the bridge's documented option to disable Claude Code built-in tools and repeat (architecture §8.4 [verify]).
+Fresh temp dir `T2`, `SPIKE_BLOCK_WRITES=1`, same prompt.
+Expected: `T2/created.txt` does **not** exist; `tools.jsonl` contains **at least one** `blocked` attempt (zero attempts is an inconclusive run: repeat once with a more explicit prompt, then record as inconclusive); for each blocked `toolCallId` there is a matching `tool_execution_end` with `isError: true` and text containing `spike gate`; no `allowed` write-capable call exists. A file created without a logged `tool_call` means a tool executes outside Pi → record and stop for the owner (architecture §8.4 [verify]).
 
-- [ ] **Step 5: Native Codex — repeat Steps 3–4 with the `gpt-6.1-sol` id**
+- [ ] **Step 5: Bridge — built-in tool absence from the effective configuration**
+
+Inspect `SPIKE_INVENTORY` and confirm only Pi tools are exposed; cite the pinned bridge source that starts Claude Code with `tools: []` on the provider path (`src/index.ts` v0.9.3, lines ~128, ~595, ~916). Expected: no Claude Code built-in tool names in the inventory or in `tools.jsonl`.
+
+- [ ] **Step 6: Native Codex — repeat Steps 3–4 with the `gpt-6.1-sol` id**
 
 Expected: same results. Record any difference.
 
-- [ ] **Step 6: Record S4, S5 and commit**
+- [ ] **Step 7: Record S4, S5 and commit**
 
 ```bash
 git add spikes/phase0/gate-probe.ts docs/superpowers/spikes/2026-10-31-phase0-report.md
@@ -226,12 +245,16 @@ git commit -m "chore(spike): verify tool gate and prompt sections on bridge and 
 **Interfaces:**
 - Produces: handler appends `{ts, provider, model, status, headerNames, rateLimit}` to `process.env.SPIKE_HEADERLOG`, where `rateLimit` contains only headers whose name matches `/ratelimit|rate-limit|retry-after|usage|quota/i` (Review Focus 5).
 
-- [ ] **Step 1: Run one minimal prompt per provider**
+- [ ] **Step 1: Bounded same-session calls per provider**
 
-Run (per provider): `node spikes/phase0/pi.mjs -p --no-session --model <id> --extension spikes/phase0/gate-probe.ts "Say ok."` with `SPIKE_HEADERLOG=spikes/phase0/out/headers-<provider>.jsonl`.
-Expected: bridge → `anthropic-ratelimit-unified-*` names present (possibly one call late, per bridge README); Codex → record whatever rate/usage headers appear, or none.
+Per provider, one RPC session **with sessions enabled** (via `pi.mjs`, absolute `--extension`) with `SPIKE_HEADERLOG=<abs>/out/headers-<provider>.jsonl`; afterwards assert the session file exists under `spikes/phase0/.agent/sessions/` (completes Task 1's isolation check). Three sequential prompts in the same session: `Say ok.`, `Run the shell command: echo hi. Then say done.` (crosses a tool boundary), `Say ok again.` Wait for `agent_settled` after each.
+Expected: bridge → `anthropic-ratelimit-unified-*` names appear on at least one call (they can arrive one provider call late, per bridge README); Codex → record whatever rate/usage headers appear across all calls.
 
-- [ ] **Step 2: Record S6 (three-state limit signal feasibility per provider: known / unknown / exhausted-on-error) and commit**
+- [ ] **Step 2: Exhaustion path (desk check)**
+
+Read how the pinned bridge and Pi's native Codex provider surface quota exhaustion (429 / limit errors) to extensions (`after_provider_response` status, error messages); cite source lines.
+
+- [ ] **Step 3: Record S6 per provider as `known` (observed), `not observed` (absent in this run but possibly available) or `unavailable` (source shows it is never exposed), plus the exhaustion signal, and commit**
 
 ```bash
 git add spikes/phase0/gate-probe.ts docs/superpowers/spikes/2026-10-31-phase0-report.md
@@ -248,7 +271,7 @@ git commit -m "chore(spike): record provider limit signals (S6)"
 
 **Interfaces:**
 - Consumes: `RpcClient` exported by `@earendil-works/pi-coding-agent@1.4.0` (from `.prefix`; see `src/modes/rpc/rpc-client.ts` at v1.4.0), `gate-probe.ts`.
-- Produces: `node spikes/phase0/rpc-subagent.mjs <worktreePath> <modelId>` spawns `pi --mode rpc --no-session --model <modelId> --extension gate-probe.ts` with `cwd=<worktreePath>` and the isolated agent dir, sends one prompt with `promptAndWait`, waits for `agent_settled`, prints `{final, toolCalls, durationMs, usage}`.
+- Produces: `node spikes/phase0/rpc-subagent.mjs <worktreePath> <modelId>` creates an `RpcClient` with `cliPath` = absolute `pi.mjs` (so the child gets the isolated env), `cwd=<worktreePath>`, args `--mode rpc --no-session --model <modelId> --extension <absolute gate-probe.ts>`; sends one prompt with `promptAndWait`, waits for `agent_settled`, prints `{final, toolCalls, durationMs, usage}`.
 
 - [ ] **Step 1: Create a scratch worktree of this repo**
 
@@ -333,22 +356,30 @@ git commit -m "docs(spike): record Codex CLI hook capabilities (S9)"
 
 - [ ] **Step 1: Write `ci-checks.mjs`, the workflow and the checklist**
 
-Checklist (owner, on a Windows machine with Git for Windows and Node ≥ 22.19): clone, `node spikes/phase0/ci-checks.mjs`; `node spikes/phase0/pi.mjs` → `/login` ChatGPT; Task 5 Steps 3–5 with the Codex id only; Task 7 Step 2 with a Windows temp worktree; confirm Pi's `bash` tool runs through Git Bash (`!printf 'Bash is working\n'`); paste outputs into report S10.
+`ci-checks.mjs` also runs Task 4 Step 2 (bootstrap from an empty prefix) and uses the OS-specific executable location.
+Checklist (owner, on a Windows machine with Git for Windows and Node ≥ 22.19): clone; `node spikes/phase0/ci-checks.mjs`; `node spikes/phase0/pi.mjs` → `/login` ChatGPT; Task 5 Steps 3–4 and 6 (Codex); Task 6 Step 1 (Codex); Task 7 Step 2 with a Windows temp worktree; confirm Pi's `bash` tool runs through Git Bash (`!printf 'Bash is working\n'`). **Bridge on Windows**: if Claude Code is installed and logged in on that machine, also run Task 5 Steps 3–5 and Task 6 Step 1 with the bridge; if not, record "not run — no Claude Code on the Windows machine" and Task 11 marks bridge-on-Windows as unverified (the Windows team profile is codex-only). Paste outputs into report S10.
 
-- [ ] **Step 2: Owner approval, then push and dispatch (hard gate)**
+- [ ] **Step 2: Commit the workflow and scripts**
 
-Run (after approval): `git push origin master && gh workflow run spike-phase0.yml && gh run watch`
+```bash
+git add .github/workflows/spike-phase0.yml spikes/phase0/ci-checks.mjs spikes/phase0/windows-checklist.md
+git commit -m "chore(spike): Windows CI matrix and owner checklist (S10)"
+```
+
+- [ ] **Step 3: Owner approval, then push and dispatch (hard gate)**
+
+`workflow_dispatch` requires the workflow on the default branch (`master`). Run (after approval): `git push origin master && gh workflow run spike-phase0.yml --ref master && gh run watch`
 Expected: all four matrix jobs green; record each `totalMs` (input to the < 10 min install target) and any Windows-specific failure.
 
-- [ ] **Step 3: Owner runs the Windows checklist**
+- [ ] **Step 4: Owner runs the Windows checklist**
 
 Expected: all items pass, or failures recorded with output.
 
-- [ ] **Step 4: Record S10 and commit**
+- [ ] **Step 5: Record S10 and commit**
 
 ```bash
-git add .github/workflows/spike-phase0.yml spikes/phase0/ci-checks.mjs spikes/phase0/windows-checklist.md docs/superpowers/spikes/2026-10-31-phase0-report.md
-git commit -m "chore(spike): Windows CI matrix and owner checklist (S10)"
+git add docs/superpowers/spikes/2026-10-31-phase0-report.md
+git commit -m "docs(spike): record Windows results (S10)"
 ```
 
 ---
