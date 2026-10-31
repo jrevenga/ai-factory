@@ -30,15 +30,23 @@ exit=0   (stderr: same ExperimentalWarning; npm update notice only)
 
 ## S2 package from private git
 
-**Question:** TBD
+**Question:** Can Pi 1.4.0 install a Pi package (TS extension with a runtime dependency) from a private GitHub repo by tag, load it without a build step, and what exactly happens when the ref is wrong or credentials are missing?
 
-**Method:** TBD
+**Method:** Private repo `jrevenga/ai-factory` created (owner-approved). Orphan branch `spike/pkg` (commit 8a9eb98, tag `spike-pkg-v0.1.0`) holds only `package.json`, `extensions/probe.ts` (TS source, imports `ms`, type-only `ExtensionAPI`), `bin/factory-spike.mjs`. Node v24.13.1 (Node 22.19 not re-run here). All Pi/npm calls via `spikes/phase0/pi.mjs` / `npm.mjs`; RPC probes use `--model openai-codex/gpt-6.1-sol`, only `get_state`, nonce-stamped marker deleted before each run. Pi docs key for packages in settings is `packages` (docs/packages.md v1.4.0). `session_start` handler receives `SessionStartEvent {reason, previousSessionFile?}`.
 
-**Evidence:** TBD
+**Evidence:**
+- Install: `node spikes/phase0/pi.mjs install git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0` -> "added 1 package ... Installed git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0", exit 0 (re-install also exit 0). Pi ran `npm install` inside the checkout. `pi list` -> `User packages: git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0` at `spikes/phase0/.agent/git/github.com/jrevenga/ai-factory`; `ms` present at `<that path>/node_modules/ms`.
+- Load: RPC `get_state` returned success (exit 0) and `out/marker.json` = `{"loaded":true,"nonce":"a71557da-4c12-4e0f-81dd-b79b89b52d48","ms":7200000}` (this run's nonce) -> TS loaded via jiti, `ms` dependency resolved, `ms("2h")` = 7200000.
+- Bad ref, install: `pi install git:github.com/jrevenga/ai-factory@does-not-exist` (fresh `.agent-badref`) -> exit 1; stdout `Installing git:...@does-not-exist...`; stderr `error: pathspec 'does-not-exist' did not match any file(s) known to git` / `Error: git checkout does-not-exist failed with code 1`.
+- Bad ref, startup: `.agent-badref/settings.json` = `{"packages":["git:github.com/jrevenga/ai-factory@does-not-exist"]}`; RPC start with fresh nonce -> **Pi does NOT warn and continue: it crashes with an unhandled exception**, exit 1, no RPC response, stderr ends `Error: git checkout does-not-exist failed with code 1 at ChildProcess.<anonymous> (.../chunk-MM3LKT73.js:497) ... Node.js v24.13.1`. No marker written (nonce absent). `pi --list-models` in the same agent dir crashes identically, so it affects every command, not just RPC. This contradicts docs/packages.md ("warns and keeps running"), at least for a missing ref on first resolve with an empty checkout dir.
+- No credentials (`spikes/phase0/nocreds.mjs`: empty `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, empty askpass vars, no `SSH_AUTH_SOCK`/`NETRC`/`GIT_CONFIG_*`, scratch HOME, ssh `-F /dev/null -o BatchMode=yes -o IdentityFile=/dev/null`):
+  - Pi: exit 1 in 640 ms, no hang. stderr: `fatal: could not read Username for 'https://github.com': terminal prompts disabled` / `Error: git clone https://github.com/jrevenga/ai-factory <agentDir>/git/github.com/jrevenga/ai-factory failed with code 128`.
+  - npm (`npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0`): exit 128 in 1.3 s, no hang. `npm error code 128 / An unknown git error occurred / command git --no-replace-objects ls-remote ssh://git@github.com/jrevenga/ai-factory.git / Load key "/dev/null": error in libcrypto / git@github.com: Permission denied (publickey). / fatal: Could not read from remote repository.` (npm tried SSH only, no HTTPS message).
+- Positive control with the owner's normal git credentials: `npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0` exit 0; the installed `factory-spike` bin prints `factory-spike ok v24.13.1`; `factory-spike install` (spawns node + npm-cli.js, no shell) exit 0 and creates the bin in a fresh prefix.
 
-**Verdict:** TBD
+**Verdict:** PASS for install-by-tag from a private repo with credentials, and for TS-source extensions with dependencies (no build needed). Failure modes are loud, bounded and distinguishable, but a stale/bad ref in settings is fatal for Pi startup, not a warning.
 
-**Design impact:** TBD
+**Design impact:** (1) Ship TS source; jiti is sufficient, a built JS artifact is not required. (2) Declare Pi as `peerDependencies`, third-party libs in `dependencies`; they land in the checkout's `node_modules`. (3) Pinned refs must be validated before being written to settings, because an unresolvable ref in `settings.json` crashes every Pi command (including `pi list`/`--list-models`); `factory doctor` and the bootstrap must verify the tag exists (`git ls-remote --tags`) first, and recovery needs a non-Pi path (edit settings.json). The guard-extension idea (arch 6.2) cannot help here because Pi dies before extensions load. (4) `factory doctor` credential diagnostics: match `could not read Username for 'https://github.com'` (Pi/git HTTPS) and `Permission denied (publickey)` (npm SSH fallback); exit codes 1 (Pi) and 128 (npm). (5) Marker/nonce assertion is the only valid load check; a zero exit alone proves nothing. (6) Private install needs git credentials for HTTPS (credential helper such as gh) or SSH key; Pi never prompts when terminal prompts are off.
 
 ## S3 CLI install path
 
