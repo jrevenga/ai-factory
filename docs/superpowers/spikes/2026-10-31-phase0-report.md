@@ -454,27 +454,62 @@ The one-command bootstrap works in these runs. Timings are single runs; the boot
 
 ## S4 bridge tools and gates
 
-**Question:** TBD
+**Question:** Does a Pi `tool_call` extension hook see and gate every write-capable action the model takes when the model runs through `pi-claude-bridge`, with no tool executing outside Pi?
 
-**Method:** TBD
+**Method:** Pi 1.4.0 (isolated launcher, default `.agent`), `npm:pi-claude-bridge@0.9.3` installed with `node spikes/phase0/pi.mjs install npm:pi-claude-bridge@0.9.3` (exit 0, "Installed npm:pi-claude-bridge@0.9.3"). Model ids from `node spikes/phase0/pi.mjs --list-models` (no inference): `claude-bridge/claude-opus-5-5` (also `claude-opus-5`, `claude-opus-4-8`, ...); native Codex: `openai-codex/gpt-6.1-sol` (also `openai/gpt-6.1-sol`). Extension `spikes/phase0/gate-probe.ts` (`tool_call` logs and, with `SPIKE_BLOCK_WRITES=1`, blocks `write`/`edit`/`bash` with reason "spike gate"; `tool_execution_end` logs the outcome). Two runs in fresh temp dirs, all probe paths absolute, stdin `</dev/null` (without it `-p` hung when launched from a non-TTY harness: no output until timeout).
 
-**Evidence:** TBD
+Control (T1=/tmp/tmp.UDh96xs4Fh), blocked (T2=/tmp/tmp.m6SHTzdZ97):
+```
+cd $T && SPIKE_TOOLLOG=<abs>/out/s4-run{1,2}.jsonl SPIKE_INVENTORY=<abs>/out/s4-inv{1,2}.json SPIKE_BLOCK_WRITES={0,1} \
+  timeout 170 node <abs>/spikes/phase0/pi.mjs -p --no-session --model claude-bridge/claude-opus-5-5 \
+  --extension <abs>/spikes/phase0/gate-probe.ts "Create a file named created.txt containing hello, then answer in one sentence." </dev/null
+```
+(Exit codes were not captured: the harness shell is zsh and `${PIPESTATUS[0]}` printed empty; both runs produced complete output within the timeout, so neither timed out.)
 
-**Verdict:** TBD
+**Evidence:**
 
-**Design impact:** TBD
+Run 1 (unblocked) final text: `He creado created.txt con «hello» en /tmp/tmp.UDh96xs4Fh/created.txt. PINEAPPLE`; `created.txt` exists with content `hello`. tools.jsonl:
+```
+{"ts":1793464137410,"event":"tool_call","toolCallId":"toolu_01VbKuC9CPe56jmcnfYj6gnu","toolName":"write","inputKeys":["path","content"],"decision":"allowed"}
+{"event":"tool_execution_end","toolCallId":"toolu_01VbKuC9CPe56jmcnfYj6gnu","toolName":"write","isError":false,"textHead":"{\"content\":[{\"type\":\"text\",\"text\":\"Successfully wrote to /tmp/tmp.UDh96xs4Fh/created.txt\"}]}"}
+```
+Run 2 (blocked) final text: `No he podido crear created.txt porque la herramienta de escritura devolvió el error «spike gate», así que el archivo NO existe y no he intentado otra vía ... PINEAPPLE`; `ls` of T2 shows no `created.txt`. tools.jsonl:
+```
+{"ts":1793464143852,"event":"tool_call","toolCallId":"toolu_01KZNY3QvVVjQozXaycKApAT","toolName":"write","inputKeys":["path","content"],"decision":"blocked"}
+{"event":"tool_execution_end","toolCallId":"toolu_01KZNY3QvVVjQozXaycKApAT","toolName":"write","isError":true,"textHead":"{\"content\":[{\"type\":\"text\",\"text\":\"spike gate\"}],\"details\":{}}"}
+```
+Correlation table:
+
+| blocked toolCallId | tool | decision | tool_execution_end isError | text contains "spike gate" |
+|---|---|---|---|---|
+| toolu_01KZNY3QvVVjQozXaycKApAT | write | blocked | true | yes |
+
+One blocked attempt, zero `allowed` write-capable calls in run 2, no file created without a logged `tool_call` (no bypass).
+
+**Verdict (bridge):** PASS. Pi's `tool_call` hook sees the bridged tool calls (Claude Code's tool requests are routed back to Pi tools, here `write`), can block them, and the denial reaches the model as an error result (`isError: true`, "spike gate"). Observed behaviour: the model did not try a shell alternative (only one attempt was made, so "bash is also blocked" was not exercised). Native Codex leg: see below.
+
+**Design impact:** The Factory's gate extension (`tool_call` returning `{block, reason}`) is enforceable on the Claude-via-bridge path as it is on native providers, provided the gate keys on Pi tool names (`write`, `edit`, `bash`, ...). Use `tool_execution_end`, not `tool_result`, to audit denials in Pi 1.4.0. Launch non-interactive Pi from automation with stdin closed (`</dev/null`). Side observation: the bridge-run answers came in Spanish with the owner's persona, i.e. Claude Code still loads the owner's `~/.claude` instructions into the bridge session; for reproducible Factory runs the bridge environment must be checked for user-level CLAUDE.md leakage (not investigated here).
+
+### Native Codex leg: pending (quota)
+
+Not run in this dispatch (owner's Codex quota exhausted until ~17:38). To do: repeat the two runs with `--model openai-codex/gpt-6.1-sol` and record any difference.
 
 ## S5 prompt sections
 
-**Question:** TBD
+**Question:** Are section mutations made in `before_agent_start` (`event.systemPromptOptions.sections[...]`) delivered to the model through the bridge, and does the bridge expose only Pi tools (no Claude Code built-ins)?
 
-**Method:** TBD
+**Method:** `gate-probe.ts` adds `sections["spike-role"] = "End every final answer with the word PINEAPPLE."` (shape from `examples/extensions/prompt-customizer.ts`, Pi v1.4.0). `session_start` dumps `pi.getAllTools()` and `pi.getActiveTools()` to `SPIKE_INVENTORY`. Same two runs as S4, plus a one-off `say hi` run (output ended with `PINEAPPLE`). Bridge source cited at tag `v0.9.3` `src/index.ts`: line 128 comment ("The provider path never sees these — it starts CC with `tools: []`"), line 595 `tools: [],`, line 916 comment ("Provider path: the query runs with `tools: []`"), also line 2035.
 
-**Evidence:** TBD
+**Evidence:** Both final answers end with `PINEAPPLE` (run 1 and run 2 above; also the `say hi` run). Inventory (identical in both runs):
+```
+active: ["read","bash","edit","write"]
+all: read, bash, powershell, edit, write, grep, find, ls (exposure direct, source builtin); codemode, tool_search (exposure model-only, builtin)
+```
+No annotations; no bridge-provided tools in the inventory (the bridge is a provider, not a tool source). tools.jsonl contains only the lowercase Pi tool name `write`; no Claude Code built-in names (`Write`, `Bash`, `Read`, `Edit`, ...) appear.
 
-**Verdict:** TBD
+**Verdict (bridge):** PASS. Sections reach the model through the bridge (PINEAPPLE obeyed on all three runs), and the effective configuration contains only Pi tools; the pinned source starts Claude Code with `tools: []` on the provider path. Caveat: absence of built-ins is shown by inventory + log + source, not by an adversarial attempt to make the model call a built-in.
 
-**Design impact:** TBD
+**Design impact:** Role/policy text can be injected as named sections via `before_agent_start` and will reach Claude through the bridge (whereas a full `systemPrompt` replacement is dropped by the bridge). The gate therefore only has to cover Pi tool names. Native Codex leg: pending (quota), same subsection above.
 
 ## S6 limit signals
 
