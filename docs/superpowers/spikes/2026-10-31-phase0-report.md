@@ -32,23 +32,33 @@ exit=0   (stderr: same ExperimentalWarning; npm update notice only)
 
 **Question:** Can Pi 1.4.0 install a Pi package (TS extension with a runtime dependency) from a private GitHub repo by tag, load it without a build step, and what exactly happens when the ref is wrong or credentials are missing?
 
-**Method:** Private repo `jrevenga/ai-factory` (owner-approved). Orphan branch `spike/pkg`, commit `8a9eb98` (tag `spike-pkg-v0.1.0`), contains exactly three files: `package.json`, `extensions/probe.ts` (TS source; `import ms from "ms"`, type-only `ExtensionAPI`; on `session_start` writes the marker if `SPIKE_MARKER` is set and emits `factory:handshake`), `bin/factory-spike.mjs`. Probes run through `spikes/phase0/s2-probe.mjs` (resets the scenario's agent dir, npm prefix and npm cache before each run, fresh nonce per run, marker deleted first, explicit `--model openai-codex/gpt-6.1-sol`, only `get_state`) and `spikes/phase0/nocreds.mjs` (resets scenario `nocreds` and scratch HOME). Runners take `timeoutMs` and kill the whole process tree on timeout (`spawnBounded` in `pi.mjs`). Pi settings key for packages is `packages` (docs/packages.md v1.4.0). `session_start` handler gets `SessionStartEvent {reason, previousSessionFile?}`. Node 24.13.1 and 22.19.0 (via `npx -y node@22.19.0` in runner scenario `s2n22x`).
+**Method:** Private repo `jrevenga/ai-factory` (owner-approved). Orphan branch `spike/pkg`, commit `8a9eb98` (tag `spike-pkg-v0.1.0`), contains exactly three files: `package.json`, `extensions/probe.ts` (TS source; `import ms from "ms"`, type-only `ExtensionAPI`; on `session_start` writes the marker if `SPIKE_MARKER` is set and emits `factory:handshake`), `bin/factory-spike.mjs`. Probes run through `spikes/phase0/s2-probe.mjs` (resets the scenario's agent dir, npm prefix and npm cache before each run, fresh nonce per run, marker deleted first, explicit `--model openai-codex/gpt-6.1-sol`, only `get_state`) and `spikes/phase0/nocreds.mjs` (resets scenario `nocreds` and scratch HOME). Runners (`spawnBounded` in `pi.mjs`) take `timeoutMs`/`signal`; on timeout they SIGTERM the child process group, poll `kill(-pgid, 0)` until the group is gone, escalate to SIGKILL after 2 s, and resolve only then (Windows: awaited `taskkill /T /F`); the parent also traps SIGINT/SIGTERM, tears down all active groups and exits 130/143. `runNpm` accepts `opts.node` to run the system npm JS entry under another node binary. Pi settings key for packages is `packages` (docs/packages.md v1.4.0). `session_start` handler gets `SessionStartEvent {reason, previousSessionFile?}`. Node 24.13.1 and 22.19.0 (binary installed by `node spikes/phase0/npm.mjs n22 npm install --prefix /home/jorge/projects/ai-factory/spikes/phase0/out/node22 node@22.19.0`, exit 0, `node@22.19.0` then reports `v22.19.0`; used below as `$N22` = `/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node`).
 
 **Evidence:**
 
+### 0. Node 22.19.0 binary
+```
+rm -rf /home/jorge/projects/ai-factory/spikes/phase0/out/node22 /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-n22 /home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-n22; mkdir -p /home/jorge/projects/ai-factory/spikes/phase0/out/node22
+node spikes/phase0/npm.mjs n22 npm install --prefix /home/jorge/projects/ai-factory/spikes/phase0/out/node22 node@22.19.0   # exit 0, 'added 2 packages in 7s'
+/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node -v   # v22.19.0
+```
+
 ### 1. Install by tag, list, marker load (Node 24.13.1)
-Command:
+Scenario cleanup (performed inside the script by `resetScenario('s2n24')`, equivalent to): `rm -rf spikes/phase0/.agent-s2n24 spikes/phase0/.npm-global-s2n24 spikes/phase0/out/npm-cache-s2n24` followed by `mkdir -p` of the same three paths, after the guard confirmed each resolves inside spikes/phase0/.
+
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/s2-probe.mjs load s2n24   # resets .agent-s2n24/.npm-global-s2n24/out/npm-cache-s2n24; nonce = randomUUID(); exit code of script: 0
+node spikes/phase0/s2-probe.mjs load s2n24   # script exit 0
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+The script deletes `spikes/phase0/out/marker-s2n24.json`, generates `nonce = crypto.randomUUID()`, passes `SPIKE_MARKER`/`SPIKE_NONCE` to the RPC child and checks the marker's nonce. `ms` is at `/home/jorge/projects/ai-factory/spikes/phase0/.agent-s2n24/git/github.com/jrevenga/ai-factory/node_modules/ms` (`ms dir exists: true`). Script exit 0 means RPC exit 0 AND marker carries this run's nonce.
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
 node v24.13.1; reset scenario s2n24
 $ pi install git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0
 exit=0 timedOut=false
 --- stdout ---
 Installing git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0...
-added 1 package, and audited 2 packages in 630ms
+added 1 package, and audited 2 packages in 615ms
 found 0 vulnerabilities
 Installed git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0
 --- stderr ---
@@ -62,31 +72,31 @@ User packages:
     /home/jorge/projects/ai-factory/spikes/phase0/.agent-s2n24/git/github.com/jrevenga/ai-factory
 --- stderr ---
 ms dir exists: true
-nonce=600de39d-f698-4df5-a817-c5d2e7d58bb3
+nonce=a442a807-9475-4797-8c30-96903e9afe74
 $ pi --mode rpc --no-session --model openai-codex/gpt-6.1-sol  <<< get_state
 exit=0 timedOut=false
 --- stdout ---
 {"id":"1","type":"response","command":"get_state","success":true,"data":{"model":{"id":"gpt-6.1-sol","name":"GPT-6.1 Sol","api":"openai-codex-responses","provid [stdout truncated]
 --- stderr ---
-marker: {"loaded":true,"nonce":"600de39d-f698-4df5-a817-c5d2e7d58bb3","ms":7200000}
+marker: {"loaded":true,"nonce":"a442a807-9475-4797-8c30-96903e9afe74","ms":7200000}
 marker carries this run's nonce: true
 ```
 
-`ms` is at `spikes/phase0/.agent-s2n24/git/github.com/jrevenga/ai-factory/node_modules/ms` (`ms dir exists: true`). Script exit 0 means: RPC exit 0 AND marker carries this run's nonce.
-
 ### 2. Same on Node 22.19.0 (declared minimum)
-Command:
+Scenario cleanup (performed inside the script by `resetScenario('s2n22')`, equivalent to): `rm -rf spikes/phase0/.agent-s2n22 spikes/phase0/.npm-global-s2n22 spikes/phase0/out/npm-cache-s2n22` followed by `mkdir -p` of the same three paths, after the guard confirmed each resolves inside spikes/phase0/.
+
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/npm.mjs s2n22x npx -y node@22.19.0 spikes/phase0/s2-probe.mjs load s2n22   # runner scenario s2n22x differs from the probe scenario so the reset does not delete the npx cache; exit 0
+/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node spikes/phase0/s2-probe.mjs load s2n22   # script exit 0
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
 node v22.19.0; reset scenario s2n22
 $ pi install git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0
 exit=0 timedOut=false
 --- stdout ---
 Installing git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0...
-added 1 package, and audited 2 packages in 618ms
+added 1 package, and audited 2 packages in 598ms
 found 0 vulnerabilities
 Installed git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0
 --- stderr ---
@@ -100,23 +110,24 @@ User packages:
     /home/jorge/projects/ai-factory/spikes/phase0/.agent-s2n22/git/github.com/jrevenga/ai-factory
 --- stderr ---
 ms dir exists: true
-nonce=122f1398-aa79-418d-bde5-e02410afe641
+nonce=d5224662-c957-4f32-8669-d9201e423ea9
 $ pi --mode rpc --no-session --model openai-codex/gpt-6.1-sol  <<< get_state
 exit=0 timedOut=false
 --- stdout ---
 {"id":"1","type":"response","command":"get_state","success":true,"data":{"model":{"id":"gpt-6.1-sol","name":"GPT-6.1 Sol","api":"openai-codex-responses","provid [stdout truncated]
 --- stderr ---
-marker: {"loaded":true,"nonce":"122f1398-aa79-418d-bde5-e02410afe641","ms":7200000}
+marker: {"loaded":true,"nonce":"d5224662-c957-4f32-8669-d9201e423ea9","ms":7200000}
 marker carries this run's nonce: true
 ```
 
+### 3. Bad ref: install, then startup
+Scenario cleanup (performed inside the script by `resetScenario('badref')`, equivalent to): `rm -rf spikes/phase0/.agent-badref spikes/phase0/.npm-global-badref spikes/phase0/out/npm-cache-badref` followed by `mkdir -p` of the same three paths, after the guard confirmed each resolves inside spikes/phase0/.
 
-### 3. Bad ref: install, then startup (Node 24.13.1)
-Command:
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/s2-probe.mjs badref badref   # reset scenario; pi install ...@does-not-exist; write .agent-badref/settings.json {"packages":["git:github.com/jrevenga/ai-factory@does-not-exist"]}; fresh nonce; RPC get_state; script exit 0 = no marker with this nonce
+node spikes/phase0/s2-probe.mjs badref badref   # after the failed install it writes spikes/phase0/.agent-badref/settings.json = {"packages":["git:github.com/jrevenga/ai-factory@does-not-exist"]}, fresh nonce, RPC get_state; script exit 0 = no marker with this nonce
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
 node v24.13.1; reset scenario badref
 $ pi install git:github.com/jrevenga/ai-factory@does-not-exist
@@ -127,7 +138,7 @@ Installing git:github.com/jrevenga/ai-factory@does-not-exist...
 Cloning into '/home/jorge/projects/ai-factory/spikes/phase0/.agent-badref/git/github.com/jrevenga/ai-factory'...
 error: pathspec 'does-not-exist' did not match any file(s) known to git
 Error: git checkout does-not-exist failed with code 1
-nonce=65195ea9-2aa0-4541-93ec-c09771628635
+nonce=9943fb1c-bd0c-427f-aa80-c53170836d7c
 $ pi --mode rpc --no-session --model openai-codex/gpt-6.1-sol  <<< get_state
 exit=1 timedOut=false
 --- stdout ---
@@ -147,21 +158,30 @@ marker: null
 marker carries this run's nonce: null
 ```
 
-Pi does NOT warn and continue: it dies with an unhandled exception, exit 1, no RPC response, no marker. `pi --list-models` in the same agent dir (scenario badref, settings as above) crashes identically. Command: `node --input-type=module -e "import {runPi} from './spikes/phase0/pi.mjs'; const r=await runPi(['--list-models'],{scenario:'badref',timeoutMs:60000}); console.log(r.code, r.stderr)"`; filtered output:
+Pi does NOT warn and continue: it dies with an unhandled exception, exit 1, no RPC response, no marker. This contradicts docs/packages.md ("warns and keeps running").
+
+`--list-models` in the same agent dir (scenario badref, settings as above) crashes identically (it affects every command):
+Command (cwd /home/jorge/projects/ai-factory):
+```
+node --input-type=module -e "import {runPi} from './spikes/phase0/pi.mjs'; const r=await runPi(['--list-models'],{scenario:'badref',timeoutMs:60000}); console.log('exit='+r.code+' timedOut='+r.timedOut); console.log(r.stderr.split('\n').filter(l=>/pathspec|^Error|Node.js/.test(l)).join('\n'));"
+```
+(output filtered by the one-liner to pathspec/Error/Node.js lines)
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
 exit=1 timedOut=false
 error: pathspec 'does-not-exist' did not match any file(s) known to git
 Error: git checkout does-not-exist failed with code 1
 Node.js v24.13.1
 ```
-This contradicts docs/packages.md ("warns and keeps running").
 
 Same on Node 22.19.0:
-Command:
+Scenario cleanup (performed inside the script by `resetScenario('badref22')`, equivalent to): `rm -rf spikes/phase0/.agent-badref22 spikes/phase0/.npm-global-badref22 spikes/phase0/out/npm-cache-badref22` followed by `mkdir -p` of the same three paths, after the guard confirmed each resolves inside spikes/phase0/.
+
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/npm.mjs s2n22x npx -y node@22.19.0 spikes/phase0/s2-probe.mjs badref badref22   # exit 0 = no marker
+/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node spikes/phase0/s2-probe.mjs badref badref22   # script exit 0 = no marker
 ```
-Output (same trims):
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
 node v22.19.0; reset scenario badref22
 $ pi install git:github.com/jrevenga/ai-factory@does-not-exist
@@ -172,7 +192,7 @@ Installing git:github.com/jrevenga/ai-factory@does-not-exist...
 Cloning into '/home/jorge/projects/ai-factory/spikes/phase0/.agent-badref22/git/github.com/jrevenga/ai-factory'...
 error: pathspec 'does-not-exist' did not match any file(s) known to git
 Error: git checkout does-not-exist failed with code 1
-nonce=19048ec0-fea9-40c1-89b2-cfd683e0e359
+nonce=6b78b271-7f86-43cd-bcc7-0c4e9228c467
 $ pi --mode rpc --no-session --model openai-codex/gpt-6.1-sol  <<< get_state
 exit=1 timedOut=false
 --- stdout ---
@@ -192,16 +212,17 @@ marker: null
 marker carries this run's nonce: null
 ```
 
+### 4. No credentials, Pi
+Environment built by `spikes/phase0/nocreds.mjs`: `GIT_CONFIG_GLOBAL=/home/jorge/projects/ai-factory/spikes/phase0/out/empty.gitconfig` (empty file), `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `GIT_ASKPASS=`, `SSH_ASKPASS=`, `HOME`/`USERPROFILE`/`HOMEDRIVE`/`HOMEPATH` = `/home/jorge/projects/ai-factory/spikes/phase0/out/home-nocreds` (deleted and recreated empty each run), `GIT_SSH_COMMAND="ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null"`, `SSH_AUTH_SOCK`, `NETRC`, `GIT_CONFIG_COUNT`/`KEY_*`/`VALUE_*`/`PARAMETERS` removed; 120 s `timeoutMs` with tree kill; the mode argument must be exactly `pi` or `npm` (otherwise usage and exit 2, before any cleanup). Cleanup: `resetScenario('nocreds', ['/home/jorge/projects/ai-factory/spikes/phase0/out/home-nocreds'])`.
 
-### 4. No credentials, Pi (Node 24.13.1), then Node 22.19.0
-Environment built by `nocreds.mjs`: `GIT_CONFIG_GLOBAL=<abs>/out/empty.gitconfig`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `GIT_ASKPASS=`, `SSH_ASKPASS=`, HOME/USERPROFILE/HOMEDRIVE/HOMEPATH = `<abs>/out/home-nocreds` (recreated empty each run), `GIT_SSH_COMMAND="ssh -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=/dev/null"`, `SSH_AUTH_SOCK`, `NETRC`, `GIT_CONFIG_COUNT/KEY_*/VALUE_*/PARAMETERS` removed; 120 s timeout with tree kill; scenario `nocreds` reset first. The argument is validated (`pi|npm`, otherwise usage + exit 2).
-Command:
+Node 24.13.1:
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/nocreds.mjs pi   # script exits 0 and prints Pi's own exit code on the first line
+node spikes/phase0/nocreds.mjs pi   # script exits 0 and prints Pi's own exit code on its first output line
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
-exit=1 timedOut=false elapsed=650ms
+exit=1 timedOut=false elapsed=624ms
 --- stdout ---
 Installing git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0...
 --- stderr ---
@@ -210,13 +231,14 @@ fatal: could not read Username for 'https://github.com': terminal prompts disabl
 Error: git clone https://github.com/jrevenga/ai-factory /home/jorge/projects/ai-factory/spikes/phase0/.agent-nocreds/git/github.com/jrevenga/ai-factory failed with code 128
 ```
 
-Command:
+Node 22.19.0:
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/npm.mjs s2n22x npx -y node@22.19.0 spikes/phase0/nocreds.mjs pi
+/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node spikes/phase0/nocreds.mjs pi
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
-exit=1 timedOut=false elapsed=499ms
+exit=1 timedOut=false elapsed=466ms
 --- stdout ---
 Installing git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0...
 --- stderr ---
@@ -225,15 +247,16 @@ fatal: could not read Username for 'https://github.com': terminal prompts disabl
 Error: git clone https://github.com/jrevenga/ai-factory /home/jorge/projects/ai-factory/spikes/phase0/.agent-nocreds/git/github.com/jrevenga/ai-factory failed with code 128
 ```
 
-
-### 5. No credentials, npm (Node 24.13.1)
-Command:
+### 5. No credentials, npm
+Node 24.13.1:
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/nocreds.mjs npm   # npm.mjs scenario nocreds; exit code printed on first line
+node spikes/phase0/nocreds.mjs npm   # exit code printed on first output line
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+npm tried only SSH (pacote falls back from HTTPS).
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
-exit=128 timedOut=false elapsed=1277ms
+exit=128 timedOut=false elapsed=1334ms
 --- stdout ---
 --- stderr ---
 npm error code 128
@@ -245,51 +268,112 @@ npm error fatal: Could not read from remote repository.
 npm error
 npm error Please make sure you have the correct access rights
 npm error and the repository exists.
-npm error A complete log of this run can be found in: /home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-nocreds/_logs/2026-10-31T15_47_08_166Z-debug-0.log
+npm error A complete log of this run can be found in: /home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-nocreds/_logs/2026-10-31T16_01_07_051Z-debug-0.log
 ```
 
-npm tried only SSH (pacote falls back from HTTPS). The npm leg on Node 22.19.0 was not run: the `node@22.19.0` npm package ships no bundled npm, and `npm.mjs` resolves npm's JS entry next to `process.execPath`. The npm client itself is identical (the system npm), so only the Node binary differs.
+Node 22.19.0 (npm's JS entry run with the 22.19.0 binary through `opts.node`; the npm debug log of that run says `verbose node v22.19.0`):
+Command (cwd /home/jorge/projects/ai-factory):
+```
+SPIKE_NODE=/home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node node spikes/phase0/nocreds.mjs npm
+```
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
+```
+exit=128 timedOut=false elapsed=1175ms
+--- stdout ---
+--- stderr ---
+npm error code 128
+npm error An unknown git error occurred
+npm error command git --no-replace-objects ls-remote ssh://git@github.com/jrevenga/ai-factory.git
+npm error Load key "/dev/null": error in libcrypto
+npm error git@github.com: Permission denied (publickey).
+npm error fatal: Could not read from remote repository.
+npm error
+npm error Please make sure you have the correct access rights
+npm error and the repository exists.
+npm error A complete log of this run can be found in: /home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-nocreds/_logs/2026-10-31T16_01_08_462Z-debug-0.log
+```
 
-### 6. Positive control with the owner's normal git credentials
-Command:
+### 6. Positive control with the owner's normal git credentials (npm leg)
+Cleanup: `rm -rf /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-npmok /home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-npmok /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-npmok2 /home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-npmok2`
+Command (cwd /home/jorge/projects/ai-factory):
 ```
-node spikes/phase0/npm.mjs npmok npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0 ; node spikes/phase0/.npm-global-npmok/bin/factory-spike ; (npm_config_prefix=$PWD/spikes/phase0/.npm-global-npmok2 npm_config_cache=$PWD/spikes/phase0/out/npm-cache-npmok2 node .../factory-spike.mjs install)   # scenario dirs deleted beforehand
+node spikes/phase0/npm.mjs npmok npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+node /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-npmok/bin/factory-spike
+npm_config_prefix=/home/jorge/projects/ai-factory/spikes/phase0/.npm-global-npmok2 npm_config_cache=/home/jorge/projects/ai-factory/spikes/phase0/out/npm-cache-npmok2 node /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-npmok/lib/node_modules/ai-factory-spike/bin/factory-spike.mjs install
+ls /home/jorge/projects/ai-factory/spikes/phase0/.npm-global-npmok2/bin
 ```
-Output (verbatim; trimmed: blank lines, git detached-HEAD advice, npm update notices, long lines marked):
+(Output order: install, exit; bin, exit; `factory-spike install` output, exit; `ls`.) 122 packages were installed because npm auto-installs the `@earendil-works/pi-coding-agent` peer dependency.
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
 ```
-$ node spikes/phase0/npm.mjs npmok npm install -g git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
-added 122 packages in 11s
+added 122 packages in 12s
 9 packages are looking for funding
   run `npm fund` for details
 npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
 exit=0
-$ node spikes/phase0/.npm-global-npmok/bin/factory-spike
 factory-spike ok v24.13.1
 exit=0
-$ npm_config_prefix=.../.npm-global-npmok2 npm_config_cache=.../out/npm-cache-npmok2 node spikes/phase0/.npm-global-npmok/lib/node_modules/ai-factory-spike/bin/factory-spike.mjs install
 npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
-added 122 packages in 12s
+added 122 packages in 11s
 9 packages are looking for funding
   run `npm fund` for details
 exit=0
 factory-spike
 ```
 
-Note: 122 packages were installed because npm auto-installs the `@earendil-works/pi-coding-agent` peer dependency for a global npm install of the package. Design impact below.
-
-### 7. Timeout kills and reaps the whole tree
-Command: `node spikes/phase0/timeout-proof.mjs` (runNpm with `timeoutMs: 3000` on a private-repo install whose git credential helper is `sleep 300`; ps listed at t=2 s and after the timeout)
+Same npm install under Node 22.19.0 (`npm-cli.js` run by the 22.19.0 binary; npm debug log: `verbose node v22.19.0`; `.npm-global-s2n22npm/bin` contains `factory-spike`):
+Command (cwd /home/jorge/projects/ai-factory):
 ```
+node spikes/phase0/npm-node.mjs s2n22npm /home/jorge/projects/ai-factory/spikes/phase0/out/node22/node_modules/node/bin/node   # resetScenario("s2n22npm") inside; exit 0
+```
+Output (verbatim; trimmed only: blank lines, git detached-HEAD advice, npm update notices; long lines marked):
+```
+exit=0 timedOut=false
+--- stdout ---
+added 122 packages in 12s
+9 packages are looking for funding
+  run `npm fund` for details
+--- stderr ---
+npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
+```
+
+### 7. Timeout kills and awaits the whole tree, including a SIGTERM-ignoring descendant
+Tree: `npm -> git -> git remote-https -> /bin/sh -c "sh -c 'trap \"\" TERM; sleep 300'"` (credential helper ignores SIGTERM). `runNpm(..., {timeoutMs: 3000})`; elapsed 5074 ms = 3 s + 2 s grace, i.e. SIGKILL escalation was awaited; `ps` immediately after the runner resolved (no extra wait) shows nothing. Cleanup: `resetScenario('tmo')`.
+```
+node spikes/phase0/timeout-proof.mjs   # exit 0
 descendants while running (t=2s):
-2065555 2065548 2065555 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
-2065566 2065555 2065555 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
-2065570 2065568 2065555 /bin/sh -c sleep 300 #spike-tmo-marker get sleep 300 #spike-tmo-marker get
-result: code=null timedOut=true elapsed=3022ms
-leftover processes after timeout: none
-exit=0
+2120014 2120007 2120014 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+2120025 2120014 2120014 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
+2120029 2120027 2120014 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get
+2120030 2120029 2120014 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
+process group of the whole tree: 2120014 
+all members:
+2120014 2120007 2120014 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+2120025 2120014 2120014 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
+2120026 2120025 2120014 /home/linuxbrew/.linuxbrew/opt/git/libexec/git-core/git remote-https https://github.com/jrevenga/ai-factory.git https://github.com/jrevenga/ai-factory.git
+2120027 2120026 2120014 /home/linuxbrew/.linuxbrew/opt/git/libexec/git-core/git-remote-https https://github.com/jrevenga/ai-factory.git https://github.com/jrevenga/ai-factory.git
+2120029 2120027 2120014 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get
+2120030 2120029 2120014 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
+2120031 2120030 2120014 sleep 300
+result: code=null timedOut=true elapsed=5074ms
+leftover processes (name match + every member of the process group) immediately after runner resolved: none
 ```
 
-**Verdict:** PASS on Node 24.13.1 and 22.19.0 for install-by-tag from a private repo with credentials, and for TS-source extension plus dependency (no build step). Failure modes (bad tag, missing credentials) are loud, bounded and distinguishable, but an unresolvable ref in settings is fatal for every Pi command rather than a warning.
+### 8. Ctrl+C on the parent kills the detached groups
+`spikes/phase0/sigint-proof.sh` starts `node spikes/phase0/timeout-proof.mjs sigint` (120 s timeout, same tree; cleanup `resetScenario('sigint')`), waits 4 s, sends SIGINT to the parent:
+```
+sh spikes/phase0/sigint-proof.sh   # script exit 0
+parent pid=2125790; processes before SIGINT:
+2125853 2125853 npm install git+https://github.com/jrevenga/ai-factory.git#spike-pkg-v0.1.0
+2125965 2125853 git --no-replace-objects ls-remote https://github.com/jrevenga/ai-factory.git
+2125969 2125853 /bin/sh -c sh -c 'trap "" TERM; sleep 300 #spike-tmo-marker' get sh -c 'trap "" TERM; sleep 30
+2125970 2125853 sh -c trap "" TERM; sleep 300 #spike-tmo-marker get
+2125971 2125853 sleep 300
+parent exit code=130 (130 expected)
+processes after parent exit:
+(end of list)
+```
+
+**Verdict:** PASS on Node 24.13.1 and 22.19.0 (Pi legs and npm legs) for install-by-tag from a private repo with credentials, and for TS-source extension plus dependency (no build step). Failure modes (bad tag, missing credentials) are loud, bounded and distinguishable, but an unresolvable ref in settings is fatal for every Pi command rather than a warning.
 
 **Design impact:** (1) Ship TS source; jiti is sufficient, no built JS artifact required. (2) Pi stays in `peerDependencies`, libraries in `dependencies`; they land in the checkout's `node_modules`. (3) Pinned refs must be validated before being written to settings (e.g. `git ls-remote --tags`), because a bad ref in `settings.json` crashes every Pi command including `pi list`/`--list-models`; recovery needs a non-Pi path (edit settings.json). The guard-extension idea (architecture 6.2) cannot cover this since Pi dies before extensions load. (4) `factory doctor` credential diagnostics: match `could not read Username for 'https://github.com'` (Pi/git HTTPS, Pi exit 1, git 128) and `Permission denied (publickey)` (npm SSH fallback, exit 128). (5) Only a nonce-carrying marker proves a load; exit 0 alone proves nothing. (6) Private installs need git credentials (HTTPS credential helper or SSH key); with prompts off nothing hangs. (7) `npm install -g` of the package also installs Pi as a peer dependency (npm 7+), so the self-install path must account for that or use `--legacy-peer-deps`/`--omit=peer`.
 

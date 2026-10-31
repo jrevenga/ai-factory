@@ -38,7 +38,8 @@ for (const k of Object.keys(process.env)) {
 
 const t0 = Date.now();
 try {
-  const o = { scenario: "nocreds", env, timeoutMs: 120000 };
+  // SPIKE_NODE (optional): run npm's JS entry with this node binary instead of the current one.
+  const o = { scenario: "nocreds", env, timeoutMs: 120000, node: process.env.SPIKE_NODE || undefined };
   const r =
     mode === "pi"
       ? await runPi(["install", "git:github.com/jrevenga/ai-factory@spike-pkg-v0.1.0"], o)

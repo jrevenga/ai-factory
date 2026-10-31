@@ -21,6 +21,7 @@ function npmEntry(tool) {
   return entry;
 }
 
+// opts.node: path to a different node binary used to run the (system) npm JS entry.
 export function runNpm(tool, args, opts) {
   if (tool !== "npm" && tool !== "npx") fail(`unknown tool ${tool}`);
   const scenario = opts?.scenario;
@@ -34,7 +35,7 @@ export function runNpm(tool, args, opts) {
   env.npm_config_prefix = prefix;
   env.npm_config_cache = cache;
   const entry = npmEntry(tool);
-  return spawnBounded(process.execPath, [entry, ...args], { env, stdio: ["ignore", "pipe", "pipe"] }, opts);
+  return spawnBounded(opts.node ?? process.execPath, [entry, ...args], { env, stdio: ["ignore", "pipe", "pipe"] }, opts);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

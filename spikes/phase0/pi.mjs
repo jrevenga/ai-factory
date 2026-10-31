@@ -1,6 +1,6 @@
 // Isolated Pi launcher. Usage: node spikes/phase0/pi.mjs <pi args...>
 // Also usable as RpcClient's cliPath. Never touches ~/.pi/agent.
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
@@ -54,45 +54,88 @@ export function cleanEnv(base) {
   return env;
 }
 
-// Kill a child and its whole process tree. POSIX: children are spawned detached
-// (own process group) so -pid reaches every descendant; SIGTERM, then SIGKILL after a grace period.
-function killTree(child, graceMs = 2000) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// POSIX: true while any process of the group (pgid === leader pid) exists.
+function groupAlive(pgid) {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+// Kill a child and its whole process tree and resolve only when the tree is gone.
+// POSIX: children are spawned detached (own process group); SIGTERM, then SIGKILL after graceMs,
+// polling kill(-pgid, 0) until ESRCH. Windows: taskkill /T /F, awaited.
+export async function terminateTree(child, graceMs = 2000, maxMs = 15000) {
   if (child.pid === undefined) return;
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    await new Promise((res) => spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }).on("close", res).on("error", res));
     return;
   }
+  const pgid = child.pid;
   const send = (sig) => {
     try {
-      process.kill(-child.pid, sig);
+      process.kill(-pgid, sig);
     } catch {}
   };
+  const t0 = Date.now();
   send("SIGTERM");
-  setTimeout(() => send("SIGKILL"), graceMs).unref();
+  let killed = false;
+  while (groupAlive(pgid) && Date.now() - t0 < maxMs) {
+    if (!killed && Date.now() - t0 >= graceMs) {
+      send("SIGKILL");
+      killed = true;
+    }
+    await sleep(50);
+  }
+}
+
+// Children currently running; Ctrl+C / SIGTERM on the parent tears all of them down (they are detached,
+// so the terminal's SIGINT does not reach them).
+const active = new Set();
+let handlersInstalled = false;
+function installSignalHandlers() {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+  for (const [sig, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
+    process.on(sig, async () => {
+      await Promise.all([...active].map((c) => terminateTree(c)));
+      process.exit(code);
+    });
+  }
 }
 
 // Spawn with stdout/stderr capture, optional stdin, timeoutMs and AbortSignal.
-// Resolves { code, stdout, stderr, timedOut } and (on timeout/abort) only after the child has exited.
+// Resolves { code, stdout, stderr, timedOut }; on timeout/abort only after the whole process tree is gone.
 export function spawnBounded(cmd, args, spawnOpts, { input, timeoutMs, signal } = {}) {
+  installSignalHandlers();
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { ...spawnOpts, shell: false, detached: process.platform !== "win32" });
+    active.add(child);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let terminating;
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
     const stop = () => {
       timedOut = true;
-      killTree(child);
+      terminating ??= terminateTree(child);
     };
     const timer = timeoutMs ? setTimeout(stop, timeoutMs) : undefined;
     if (signal) signal.aborted ? stop() : signal.addEventListener("abort", stop, { once: true });
     child.on("error", (e) => {
       clearTimeout(timer);
+      active.delete(child);
       reject(e);
     });
-    child.on("close", (code) => {
+    child.on("close", async (code) => {
       clearTimeout(timer);
+      if (terminating) await terminating;
+      active.delete(child);
       resolve({ code: timedOut ? null : code ?? 1, stdout, stderr, timedOut });
     });
     if (child.stdin) {
