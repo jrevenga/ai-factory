@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
@@ -158,5 +158,63 @@ describe("acquireLock", () => {
     await lock.release();
     expect(await readFile(ownerFilePath(paths), "utf8")).toBe(foreign);
     expect(existsSync(paths.lock)).toBe(false);
+  });
+
+  it("review r3 interleaving: a stale owner file of a dead pid never lends another process's fresh lock", async () => {
+    // A exited leaving its owner file; B has just created the lock directory and not yet published its owner file.
+    const dead = await deadPid();
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(ownerFilePath(paths), `${JSON.stringify({ pid: dead, at: "2026-10-31T00:00:00.000Z" })}\n`);
+    await mkdir(paths.lock);
+    const err = await acquireLock(paths, { ownerPid: dead }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Locked);
+    expect(existsSync(paths.lock)).toBe(true);
+  });
+
+  it("refuses to borrow when the owner pid is alive but the owner file names another lock directory", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(
+      ownerFilePath(paths),
+      `${JSON.stringify({ pid: process.pid, at: "2026-10-31T00:00:00.000Z", lockDir: { ino: "1", birthtimeMs: "0" } })}\n`,
+    );
+    await mkdir(paths.lock);
+    await expect(acquireLock(paths, { ownerPid: process.pid })).rejects.toBeInstanceOf(Locked);
+  });
+
+  it("refuses to borrow from an owner file without lock directory identity", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(ownerFilePath(paths), `${JSON.stringify({ pid: process.pid, at: "2026-10-31T00:00:00.000Z" })}\n`);
+    await mkdir(paths.lock);
+    await expect(acquireLock(paths, { ownerPid: process.pid })).rejects.toBeInstanceOf(Locked);
+  });
+
+  it("refuses to borrow after the owner's lock directory was replaced by another acquisition", async () => {
+    const owner = await acquireLock(paths);
+    const recorded = await readFile(ownerFilePath(paths), "utf8");
+    await owner.release();
+    await mkdir(paths.lock); // a new acquisition's directory, before it publishes its owner file
+    await writeFile(ownerFilePath(paths), recorded); // the previous owner's metadata is still there
+    await expect(acquireLock(paths, { ownerPid: process.pid })).rejects.toBeInstanceOf(Locked);
+  });
+
+  it("refuses to borrow when only the nanosecond birth time differs (inode reused within the same millisecond)", async () => {
+    const owner = await acquireLock(paths);
+    const recorded = JSON.parse(await readFile(ownerFilePath(paths), "utf8")) as { lockDir: Record<string, string> };
+    recorded.lockDir.birthtimeNs = (BigInt(recorded.lockDir.birthtimeNs as string) + 1n).toString();
+    await writeFile(ownerFilePath(paths), JSON.stringify(recorded));
+    await expect(acquireLock(paths, { ownerPid: process.pid })).rejects.toBeInstanceOf(Locked);
+    await owner.release();
+  });
+
+  it("records the lock directory identity in the owner file", async () => {
+    const lock = await acquireLock(paths);
+    const owner = JSON.parse(await readFile(ownerFilePath(paths), "utf8")) as { lockDir: Record<string, string> };
+    const st = await stat(paths.lock, { bigint: true });
+    expect(owner.lockDir).toEqual({
+      ino: st.ino.toString(),
+      birthtimeMs: st.birthtimeMs.toString(),
+      birthtimeNs: st.birthtimeNs.toString(),
+    });
+    await lock.release();
   });
 });

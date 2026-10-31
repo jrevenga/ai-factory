@@ -5,10 +5,14 @@
 // `<home>/factory.lock` is its lock directory, created with an atomic mkdir, kept fresh by a heartbeat
 // (mtime update every `update` ms) and considered stale once its mtime is older than `stale` ms, i.e.
 // after the holder stopped refreshing (crash, kill). `<home>/factory.lock.owner.json` (`{ pid, at }`)
-// is informational only: written by the holder right after acquiring, it names the holder in `Locked`
-// and enables borrowing by a child process (`ownerPid`). It never decides who holds the lock.
+// is written by the holder right after acquiring, outside the lock directory (proper-lockfile removes
+// that with a non-recursive rmdir). It names the holder in `Locked` and enables borrowing by a child
+// process (`ownerPid`), but never decides who holds the lock. Because an exited holder can leave it
+// behind, it also records the identity of the lock directory it was written for (`lockDir`: inode and
+// ms/ns birth time from a bigint stat); a borrow is granted only while that exact directory is the current,
+// fresh lock and `ownerPid` is alive, so stale metadata can never lend another acquisition's lock.
 import lockfile from "proper-lockfile";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { writeJsonAtomic } from "../platform/json-file.ts";
 import type { FactoryPaths } from "../platform/paths.ts";
 
@@ -68,9 +72,28 @@ export function ownerFilePath(paths: FactoryPaths): string {
   return `${paths.lock}.owner.json`;
 }
 
+interface LockDirId {
+  ino: string;
+  birthtimeMs: string;
+  /** Nanosecond birth time: ext4 reuses a removed directory's inode at once, so ms alone can collide. */
+  birthtimeNs: string;
+}
+
 interface Owner {
   pid: number | undefined;
   at: string | undefined;
+  lockDir: LockDirId | undefined;
+}
+
+/** Identity of the current lock directory (bigint stat: exact inode / Windows file id), or undefined if absent. */
+async function lockDirId(paths: FactoryPaths): Promise<LockDirId | undefined> {
+  try {
+    const st = await stat(paths.lock, { bigint: true });
+    return { ino: st.ino.toString(), birthtimeMs: st.birthtimeMs.toString(), birthtimeNs: st.birthtimeNs.toString() };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
 }
 
 /** The owner file, tolerantly: missing → undefined, unreadable content → unknown pid. */
@@ -83,13 +106,26 @@ async function readOwner(paths: FactoryPaths): Promise<Owner | undefined> {
     throw e;
   }
   try {
-    const parsed = JSON.parse(text) as { pid?: unknown; at?: unknown };
+    const parsed = JSON.parse(text) as {
+      pid?: unknown;
+      at?: unknown;
+      lockDir?: { ino?: unknown; birthtimeMs?: unknown; birthtimeNs?: unknown };
+    };
+    const dir = parsed.lockDir;
     return {
       pid: typeof parsed.pid === "number" && Number.isInteger(parsed.pid) && parsed.pid > 0 ? parsed.pid : undefined,
       at: typeof parsed.at === "string" ? parsed.at : undefined,
+      lockDir:
+        typeof dir === "object" &&
+        dir !== null &&
+        typeof dir.ino === "string" &&
+        typeof dir.birthtimeMs === "string" &&
+        typeof dir.birthtimeNs === "string"
+          ? { ino: dir.ino, birthtimeMs: dir.birthtimeMs, birthtimeNs: dir.birthtimeNs }
+          : undefined,
     };
   } catch {
-    return { pid: undefined, at: undefined };
+    return { pid: undefined, at: undefined, lockDir: undefined };
   }
 }
 
@@ -107,17 +143,31 @@ export async function readLockHolder(
   return { path: paths.lock, pid: owner?.pid, at: owner?.at };
 }
 
+/**
+ * A borrow is granted only when all hold: the lock is held (fresh per `check`), the owner file names
+ * `ownerPid`, `ownerPid` is alive, and the owner file was written for the current lock directory.
+ */
+async function mayBorrow(paths: FactoryPaths, ownerPid: number, tuning: LockTuning): Promise<boolean> {
+  if (!(await lockfile.check(paths.home, baseOptions(paths, tuning)))) return false;
+  const owner = await readOwner(paths);
+  if (owner?.pid !== ownerPid || owner.lockDir === undefined || !isPidAlive(ownerPid)) return false;
+  const current = await lockDirId(paths);
+  return (
+    current !== undefined &&
+    current.ino === owner.lockDir.ino &&
+    current.birthtimeMs === owner.lockDir.birthtimeMs &&
+    current.birthtimeNs === owner.lockDir.birthtimeNs
+  );
+}
+
 export async function acquireLock(
   paths: FactoryPaths,
   opts: { ownerPid?: number } = {},
   tuning: LockTuning = {},
 ): Promise<Lock> {
   await mkdir(paths.home, { recursive: true });
-  if (opts.ownerPid !== undefined) {
-    const holder = await readLockHolder(paths, tuning);
-    if (holder !== undefined && holder.pid === opts.ownerPid) {
-      return { path: paths.lock, pid: opts.ownerPid, borrowed: true, compromised: undefined, release: async () => {} };
-    }
+  if (opts.ownerPid !== undefined && (await mayBorrow(paths, opts.ownerPid, tuning))) {
+    return { path: paths.lock, pid: opts.ownerPid, borrowed: true, compromised: undefined, release: async () => {} };
   }
 
   let compromised: Error | undefined;
@@ -141,7 +191,9 @@ export async function acquireLock(
 
   const owner = { pid: process.pid, at: new Date().toISOString() };
   try {
-    await writeJsonAtomic(ownerFilePath(paths), owner);
+    const lockDir = await lockDirId(paths);
+    if (lockDir === undefined) throw new Error(`The factory lock directory ${paths.lock} vanished right after it was acquired.`);
+    await writeJsonAtomic(ownerFilePath(paths), { ...owner, lockDir });
   } catch (writeError) {
     try {
       await releaseLock();
