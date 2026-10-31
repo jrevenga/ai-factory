@@ -26,7 +26,8 @@ Task 11 outcome: one row per question S1-S10, per **[verify]** marker in the two
 | S9 positive live hook denial | confirmed | [S9 live smoke](#live-smoke-negative-control-and-positive-run) | A §7.5: marker replaced by the verified fact (trusted project-local hook denied a live model-issued command in `codex exec`, 0.166.0); adapter must establish project trust and hook trust, `--dangerously-bypass-hook-trust` is test-only |
 | C12 `codex exec` answers carried the owner's language/persona (user-level Codex configuration, most likely the global `AGENTS.md`; cause not diagnosed) | changed | [S9 live smoke](#live-smoke-negative-control-and-positive-run) | A §7.5 (**[call]**, extends the owner-confirmed C4 decision, which covers the bridge only): the Codex adapter isolates user-level Codex instructions from factory runs without touching the login; builder diagnoses the path with a marker-control test and chooses the mechanism **[builder]** |
 | S10 Windows CI matrix (S1, Pi install, install-by-tag + marker, CLI install, bootstrap) | confirmed | [S10 CI](#ci-matrix) | A §6.1/§6.2: Windows CI cited; `.cmd` shim location stated. Install times (≤ 111 s for the five checks) are well inside the < 10 min target (A §3), no change |
-| S10 Windows owner checklist (login, Codex gate/sections/limits, RPC worktree, Git Bash `bash` tool, bridge on Windows) = A §15 Phase 0 acceptance | blocked | [S10 owner checklist](#owner-windows-checklist---pending) | A §15 Phase 0 row: status note + `**[verify]** deferred — blocked on owner action: S10 Windows owner checklist` |
+| S10 Windows owner checklist (login, Codex gate/sections/limits, RPC worktree, Git Bash `bash` tool) = A §15 Phase 0 acceptance | changed | [S10 owner checklist](#owner-windows-checklist) | Items 1-7 pass on the owner's Windows machine (spaced path, Node 24 and 22.19 ci-checks, native Codex gate and sections, RPC worktree, Git Bash `bash`). A §6.2 `doctor`: detect missing git credentials in non-interactive sessions; A §15 Phase 0 row: verified status. Not tested on Windows: `sse`, process-tree teardown, Node 22.19 for model runs |
+| S10 item 8: bridge on Windows | changed | [S10 owner checklist](#owner-windows-checklist) | Not run (no Claude Code on the machine): bridge on Windows unverified; A §15 and A §6.2: Windows team profile is codex-only until verified |
 | C1 validate a package ref before writing it to Pi settings | changed | [S2 bad ref](#3-bad-ref-install-then-startup) | A §6.2 install step 2 (also update/rollback); launcher paragraph: guard extension cannot cover this crash |
 | C2 global install pulls the Pi peer (122 packages) and runs dependency install scripts | changed | [S2](#s2-package-from-private-git) item 6, [S3](#s3-cli-install-path) | A §6.2 install-path requirements: no second Pi version (`--omit=peer`/`--legacy-peer-deps` or exact peer pin, **[builder]**, untested); dependency scripts reviewed with the release manifest; A §6.1 cross-reference |
 | C3 locate npm via `npm_execpath` / PATH, not `process.execPath` | changed | [S3](#s3-cli-install-path) | A §6.2 install-path requirements |
@@ -39,10 +40,9 @@ Task 11 outcome: one row per question S1-S10, per **[verify]** marker in the two
 | C10 `pi -p` from automation needs stdin closed | changed | [S4](#s4-bridge-tools-and-gates) | A §7.3: non-interactive Pi invocations run with stdin closed |
 | C11 Codex CLI self-updates (0.163 → 0.166 in one day) | changed | [S9](#s9-codex-cli-hooks-desk-check) | A §7.5: adapter contract tests pinned to a Codex CLI version; `doctor` reports drift |
 
-Counts: 7 confirmed, 17 changed, 1 blocked. The C8 row is only a pointer to the S8 row and is not counted separately.
+Counts: 7 confirmed, 19 changed, 0 blocked. The C8 row is only a pointer to the S8 row and is not counted separately.
 
-**Blocked — raise with owner before Phase 1 planning:**
-1. S10 Windows owner checklist, and with it the A §15 Phase 0 acceptance on Windows (A §15 deferral). Unblocking action: on a Windows machine with Git for Windows and Node >= 22.19, the owner runs items 1-8 of `spikes/phase0/windows-checklist.md` in Git Bash and pastes each item's command, relevant output, exit code and pass/fail into [S10 owner checklist](#owner-windows-checklist---pending). Item 8 (bridge on Windows) may be recorded as "not run - no Claude Code on the Windows machine"; bridge-on-Windows then stays unverified and the Windows team profile is codex-only.
+**Blocked — raise with owner before Phase 1 planning:** None. (The S10 owner checklist, previously blocked, was run on 2026-10-31; see [S10](#owner-windows-checklist).)
 
 **Owner decisions** (confirmed 2026-10-31; the spec marks them **[owner]**):
 1. C4, A §7.2: isolate factory bridge runs from user-level Claude Code instructions and hooks — confirmed (alternative rejected: only document the leak as a known risk). Isolation must not move or copy the Claude login; the leak's cause was not investigated in Phase 0, so the mechanism is still open.
@@ -939,10 +939,39 @@ Windows specifics observed in the logs: the executable was `D:\a\ai-factory\ai-f
 
 **Limits:** CI proves install/CLI/marker behaviour and the `.cmd` shim on Windows; it does not cover login, Codex, the bridge, worktrees or Pi's `bash` tool via Git Bash (no credentials on runners). Those are the owner checklist below.
 
-### Owner Windows checklist - pending
+### Owner Windows checklist
 
-Not yet run. Checklist: `spikes/phase0/windows-checklist.md`. Results (outputs per item, bridge-on-Windows status) will be pasted here.
+**Method and deviations.** Machine: the owner's Windows 11 (build 26300) PC, Git for Windows 2.52.0 (Git Bash 5.2.37, msys). Commands are those of `spikes/phase0/windows-checklist.md` items 1-8, scripted in `spikes/phase0/out/windows/{w1,w3,w4,w5}.sh` (git-ignored, with `RUNLOG.md` and the evidence files). Deviations from "the owner runs the checklist in Git Bash", all with the owner's consent:
 
-**Verdict:** TBD (CI portion passes; final verdict after the owner checklist).
+- The controller (Claude) ran everything over SSH through a reverse tunnel opened by the owner (`ssh -N -R 2222:127.0.0.1:22`), with a dedicated VPS key authorised in the machine's OpenSSH Server and `DefaultShell` = Git Bash. The owner performed only the OpenSSH setup and `/login`.
+- Node was absent: official portable zips v22.19.0 and v24.22.1, SHA256-verified against nodejs.org `SHASUMS256.txt`, PATH prepended per command only. All model runs used Node 24.22.1; Node 22.19.0 only ran `ci-checks`.
+- Git auth: the owner's own Windows SSH key failed under OpenSSH ("error in libcrypto") and Git Credential Manager cannot use `wincredman` from an SSH session ("Unable to persist credentials with the 'wincredman' credential store"). A GitHub token was therefore passed over stdin and exported only as session `GIT_CONFIG_*` `insteadOf` env (same mechanism as CI), `credential.helper` disabled per session, output redacted. Verified afterwards that no token is in `.git/config`, `~/.gitconfig`, `~/.git-credentials`, the repo tree or the npm cache.
+- Installing the OpenSSH Server: PowerShell 7 `Add-WindowsCapability` failed ("Clase no registrada"); `dism` worked.
+- Item 7 was done through a `-p` prompt asking Pi's `bash` tool to run the command, not the interactive `!printf` form.
+- Checkout: `C:\Users\jorge\ai factory\ai-factory` (space in the path), commit `8b8050b`.
 
-**Design impact:** TBD (after the owner checklist).
+**Results.**
+
+| # | Command | Key output | Exit | Result |
+|---|---|---|---|---|
+| 1 | `git clone` into `C:\Users\jorge\ai factory\ai-factory`; `npm install --prefix spikes/phase0/.prefix --ignore-scripts @earendil-works/pi-coding-agent@1.4.0` (`w1.sh`) | clone at `8b8050b`, isolated Pi 1.4.0 installed | 0 | pass |
+| 2 | `node spikes/phase0/ci-checks.mjs` on Node 24.22.1 and 22.19.0 (`w3.sh`) | 5/5 `ok: true` on both. Node 24.22.1: s1 51 ms, isolated Pi install 582 ms (prefix already populated by item 1, "up to date"), install-by-tag 2736 ms, cli-install-run 19886 ms, bootstrap 40099 ms. Node 22.19.0: 50, 8304, 3498, 22128, 44113 ms. `factory-spike.cmd` under the spaced path (`C:\Users\jorge\ai factory\ai-factory\spikes\phase0\.npm-global-ci-cli\factory-spike.cmd`, same for `-bootstrap`); printed `factory-spike ok v24.22.1` and `factory-spike ok v22.19.0` | 0 (per run log; the summary JSON has no exit field) | pass |
+| 3 | `node spikes\phase0\pi.mjs`, `/login` ChatGPT, done by the owner in PowerShell | `auth.json` present in the isolated `.agent` (existence checked, contents never read) | n/a | pass |
+| 4 | S4/S5 native Codex, Node 24, `pi.mjs -p --no-session --model openai-codex/gpt-6.1-sol --extension gate-probe.ts`, three runs (`w4.sh`) | run1 (`SPIKE_BLOCK_WRITES=0`): `write` `decision: allowed`, `Successfully wrote to created.txt`, file `created.txt` = `hello`, answer ends `PINEAPPLE`. run2 (block=1): `write` `blocked` (`spike gate`), the model then tried `read` (allowed, ENOENT) and `bash` (`blocked`, `spike gate`), no file, answer ends `PINEAPPLE`. run3 (block=1, prompt forcing `echo hello > created.txt` via bash): `bash` `blocked` (`spike gate`), no file, answer ends `PINEAPPLE`. Inventory: read, bash, powershell, edit, write, grep, find, ls (direct) + codemode, tool_search (model-only) | 0 per run | pass |
+| 5 | `s6-probe.mjs win-codex-<nonce> openai-codex/gpt-6.1-sol` (default transport `auto`) | `--- prompt 1 settled`, `--- prompt 2 settled`, `--- prompt 3 settled`; `sessions dir exists: true` with one `.jsonl`; no `headers-win-codex-*.jsonl` log in `out/` | 0 | pass (same as Linux `auto`: hook never fires) |
+| 6 | `rpc-subagent.mjs ../ai-factory-spike-wt openai-codex/gpt-6.1-sol` in a worktree `C:/Users/jorge/ai factory/ai-factory-spike-wt` (space), branch `spike/wt` | final `No README.md exists; the directory contains .git, .github/, docs/, and spikes/—PINEAPPLE`; one tool call (`bash`: `if [ -f README.md ]; ... ls -la`), `decision: allowed`; `durationMs` 4134; stderr 0 bytes; worktree removed and branch deleted afterwards | 0 | pass |
+| 7 | Pi `bash` tool via `-p` prompt: `printf 'Bash is working\n'; echo "$BASH_VERSION $OSTYPE $0"` | tool result `Bash is working` / `5.2.37(1)-release msys /usr/bin/bash` | 0 | pass |
+| 8 | Bridge on Windows | not run: no Claude Code (nor Codex CLI) on the machine (`command -v claude codex` empty) | n/a | unverified |
+
+**Comparison with Linux.** The Windows inventory in item 4 is identical to the Linux list recorded in S5 (same ten names in the same order and the same exposures: eight `direct`, `codemode` and `tool_search` `model-only`; `powershell` is listed on Linux too). The `active` set was `read, bash, edit, write`. Item 5 matches Linux: default transport `auto` writes a session file and no header log. Items 4 and 6 show the gate blocking `write` and `bash` through `tool_call` on Windows with the same `spike gate` result as Linux.
+
+**Not tested on Windows:** Codex transport `sse` (limit headers), process-tree teardown and timeouts of the RPC runner (C7), Node 22.19.0 for model runs, the bridge.
+
+**Observations.**
+- Install `doctor` on Windows: an SSH or other non-interactive session has no usable credential store (GCM cannot use `wincredman`) and the user's SSH key may be unreadable ("error in libcrypto"). `doctor` should detect missing git credentials in non-interactive sessions and print the fix (credential helper or token env), beyond the two error strings already listed for S2.
+- `dism` is the working route to install OpenSSH Server when `Add-WindowsCapability` fails; only relevant to remote-support docs.
+- The isolated Pi install took 8.3 s (Node 22) on a cold prefix; the Node 24 run reused the prefix, so it is not a timing sample.
+
+**Verdict:** changed (two small spec additions, see Design impact); items 1-7 of the checklist are confirmed (all pass on the owner's machine, including a path with a space), with one gap: bridge on Windows (item 8) is unverified.
+
+**Design impact:** (1) The Windows team profile is codex-only: the bridge cannot be claimed to work on Windows until someone runs Task 5 Steps 3-5 and Task 6 Step 1 with Claude Code installed. (2) `factory doctor` gains the non-interactive git-credential check above (A §6.2). (3) A §15 Phase 0 acceptance is closed on Linux, Windows CI and the owner's Windows machine. (4) `sse`, process-tree teardown and timeouts on Windows stay in the Phase 1+ test list.
