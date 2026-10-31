@@ -1,4 +1,4 @@
-// Throwaway S4/S5 probe. Env: SPIKE_TOOLLOG, SPIKE_INVENTORY, SPIKE_BLOCK_WRITES.
+// Throwaway S4/S5/S6 probe. Env: SPIKE_TOOLLOG, SPIKE_INVENTORY, SPIKE_BLOCK_WRITES, SPIKE_HEADERLOG.
 import { appendFileSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -26,5 +26,14 @@ export default function gateProbe(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event) => {
 		event.systemPromptOptions.sections["spike-role"] = "End every final answer with the word PINEAPPLE.";
+	});
+
+	// S6: response header NAMES plus values of rate-limit headers only. Never request headers, never tokens.
+	pi.on("after_provider_response", (event, ctx) => {
+		if (!process.env.SPIKE_HEADERLOG) return;
+		const headers = (event.headers ?? {}) as Record<string, string>;
+		const rateLimit: Record<string, string> = {};
+		for (const [k, v] of Object.entries(headers)) if (/ratelimit|rate-limit|retry-after|usage|quota/i.test(k)) rateLimit[k] = String(v);
+		appendFileSync(process.env.SPIKE_HEADERLOG, JSON.stringify({ ts: Date.now(), provider: ctx?.model?.provider, model: ctx?.model?.id, status: event.status, headerNames: Object.keys(headers), rateLimit }) + "\n");
 	});
 }

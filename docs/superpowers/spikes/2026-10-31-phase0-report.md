@@ -519,15 +519,39 @@ No annotations; no bridge-provided tools in the inventory (the bridge is a provi
 
 ## S6 limit signals
 
-**Question:** TBD
+**Question:** Do Pi's `after_provider_response` hook and the provider layer expose subscription limit state (rate-limit headers) and a recognisable exhaustion signal, for Claude via `pi-claude-bridge` and for native Codex?
 
-**Method:** TBD
+**Method:** Pi 1.4.0, `pi-claude-bridge@0.9.3`, Node as installed in the launcher. `spikes/phase0/gate-probe.ts` gained an `after_provider_response` handler that appends `{ts, provider, model, status, headerNames, rateLimit}` to `SPIKE_HEADERLOG`; `rateLimit` holds only response headers whose name matches `/ratelimit|rate-limit|retry-after|usage|quota/i` (names of all other headers only; no request headers, no tokens). Driver `spikes/phase0/s6-probe.mjs` spawns `pi.mjs --mode rpc --model <m> --extension <abs>/gate-probe.ts` (sessions enabled, default `.agent`), sends three sequential `prompt` commands (`Say ok.`; `Run the shell command: echo hi. Then say done.`; `Say ok again.`) and waits for `agent_settled` after each.
 
-**Evidence:** TBD
+### Bridge: live observation
 
-**Verdict:** TBD
+```
+$ cd /tmp && node /home/jorge/projects/ai-factory/spikes/phase0/s6-probe.mjs bridge claude-bridge/claude-opus-5-5   # exit=0
+--- prompt 1 settled / --- prompt 2 settled (tool_execution_start/end seen) / --- prompt 3 settled
+sessions dir exists: true [ '2026-10-31T16-33-28-431Z_...jsonl', '2026-10-31T16-36-09-691Z_01a192d1-....jsonl' ]
+```
+(The first session file is from an earlier identical run whose driver output I did not capture; the second is the captured run.) `out/headers-bridge.jsonl` of the captured run (3 lines, rate-limit values only, one line shown in full, the others identical except `ts` and, in run 1, utilization 0.36):
+```
+{"ts":1793464576690,"provider":"claude-bridge","model":"claude-opus-5-5","status":200,"headerNames":["anthropic-ratelimit-unified-status","anthropic-ratelimit-unified-reset","anthropic-ratelimit-unified-representative-claim","anthropic-ratelimit-unified-overage-status","anthropic-ratelimit-unified-5h-utilization","anthropic-ratelimit-unified-5h-reset","anthropic-ratelimit-unified-7d-utilization","anthropic-ratelimit-unified-7d-reset"],"rateLimit":{...status:"allowed", representative-claim:"five_hour", overage-status:"rejected", 5h-utilization:"0.37", 7d-utilization:"0.44", reset epochs...}}
+```
+Observed: 3 header events for 4 provider turns (prompt 2 has two turns around the tool call), always `status` 200, same 8 names. The values are taken from Claude Code `rate_limit_event`s, so they are emitted at most once per query and may lag a call. The earlier run showed 5h utilization 0.36, this one 0.37, so the values do move. Windows exposed: `5h`, `7d`.
 
-**Design impact:** TBD
+### Exhaustion path (desk check)
+
+**Bridge** (`.agent/npm/node_modules/pi-claude-bridge/src/`): Claude Code reports plan usage as `rate_limit_event` SDK messages, not HTTP (`rate-limit.ts` L1-3); `rateLimitResponse()` rebuilds `anthropic-ratelimit-unified-{status,reset,representative-claim,overage-status,overage-reset,<5h|7d|7d_oi>-utilization,-reset}` and always returns status 200 (`rate-limit.ts` ~L31-50, "a 'rejected' status can still be served from overage"). `index.ts` L1529-1536 handles the event and calls `reportHeldRateLimit` (L534-539) which calls `onResponse` (so `after_provider_response`) before the next stream event of the owning call. On `status === "rejected"` the bridge also stores `rateLimitRejection` and shows a UI notice (L1536-1543). The failing result arrives afterwards as `is_error` on a success-shaped result (`resultErrorText`, L502-507) and the turn ends with `stopReason: "error"`; `errorMessage` is rewritten by `describeRateLimitFailure` (L526-530) to `Claude quota exceeded — rate limit (<type>) — resets <time>: <Claude Code text>` (e.g. Claude Code's "You're out of extra usage · resets 6:30pm", comment L514-524). So the exhaustion signal for extensions is: header `anthropic-ratelimit-unified-status` = `rejected` (status code stays 200) plus an assistant message with `stopReason: "error"` and the "Claude quota exceeded — rate limit" prefix. Warning level: `allowed_warning` status with utilization fraction (L1546-1558). Not live-tested (would need an exhausted account).
+
+**Native Codex** (Pi v1.4.0 `packages/ai/src/api/openai-codex-responses.ts`, same code as the installed `.prefix/.../pi-ai/dist/api/openai-codex-responses.js`):
+- `onResponse` (which Pi wires to `after_provider_response`: `pi-coding-agent/dist/core/sdk.js` L232-235, event is only `{status, headers}`) is called in exactly one place, the SSE path after `fetch` (source L429-432; dist L286), and before the `response.ok` check, so a 429 reaches the hook with its real status and all response headers.
+- The default transport is `auto` (`core/settings-defaults.js` L4), which tries WebSocket first (source L316-358) and only falls back to SSE on transport failure. `onResponse` is not called anywhere in the WebSocket path (grep: one occurrence in the file). Inference, to be confirmed live: with the default transport, `after_provider_response` probably never fires for Codex, so rate/usage headers are not observable unless `transport: "sse"` is set.
+- Exhaustion: HTTP 429 (SSE). `isTerminalRateLimitError` (L127-131: GoUsageLimitError, FreeUsageLimitError, "Monthly usage limit reached", insufficient_quota, quota exceeded, billing...) makes it non-retryable; other 429/5xx are retried with `retry-after-ms`/`retry-after` (L133-156, L439-448). The final error is built by `parseErrorResponse` (L1618-1642): for code `usage_limit_reached|usage_not_included|rate_limit_exceeded` or any 429, message `You have hit your ChatGPT usage limit (<plan> plan). Try again in ~N min.` (from `error.plan_type`, `error.resets_at`), thrown as `Error` (L450-456) and surfaced as an assistant message with `stopReason: "error"` (L505-507); the retry loop does not retry messages containing "usage limit" (L468). On the WebSocket path, errors arrive as `type: "error"` / `response.failed` events (L781-793) and become `CodexApiError("Codex error: ...")`. The Codex CLI's own wording earlier today ("You've hit your usage limit ... try again at 5:38 PM") differs from Pi's friendly message; extensions must not match on either string alone, preferably on `stopReason: "error"` plus a pattern like `/usage limit|rate limit|quota/i`.
+
+### Native Codex live observation: pending (quota)
+
+Not run (owner's Codex quota exhausted until ~17:38). To do: same driver with `node spikes/phase0/s6-probe.mjs codex openai-codex/gpt-6.1-sol`, record header names across all calls, and whether `after_provider_response` fires at all on the default `auto` transport (and with `transport: "sse"`).
+
+**Verdict (bridge):** `known` (observed): `after_provider_response` receives `anthropic-ratelimit-unified-*` headers on the bridge, including 5h and 7d utilization (fraction) and reset epochs, status always 200; exhaustion is `unified-status: rejected` plus an error message prefixed "Claude quota exceeded — rate limit". Native Codex: live status pending; desk check says headers are exposed only on the SSE path (`not observed` until tested) and exhaustion is a 429 whose message reads "You have hit your ChatGPT usage limit".
+
+**Design impact:** A quota-aware scheduler can read 5h/7d utilization from the bridge via `after_provider_response` without extra calls, but must treat it as best effort (one event per query, may lag, no per-call guarantee), and must detect exhaustion from the header status or the error message, not the HTTP status. For Codex no header-based budgeting should be assumed until the live leg confirms it; fall back to error-message detection.
 
 ## S7 RPC subagent
 
