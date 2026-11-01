@@ -35,12 +35,6 @@ describe("main router", () => {
     expect(c.err.join("")).toBe(`factory ${cmd} arrives in a later phase`);
   });
 
-  it("commands owned by later tasks are stubs that exit 2", async () => {
-    const c = capture();
-    expect(await main(["init"], c.io)).toBe(2);
-    expect(c.err.join("")).toMatch(/not implemented yet/);
-  });
-
   it("doctor rejects unknown flags with exit 2", async () => {
     const c = capture();
     expect(await main(["doctor", "--bogus"], c.io)).toBe(2);

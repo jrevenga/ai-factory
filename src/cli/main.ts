@@ -7,9 +7,12 @@ import { factoryPaths } from "../adapters/platform/paths.ts";
 import { PiRuntime } from "../adapters/pi/runtime.ts";
 import { ReleaseManifest } from "../core/release/manifest.ts";
 import { APPLY_REASONS, applyRelease, ApplyFailed, type ApplyContext, type ApplyDeps, type ApplyReason } from "./commands/apply-release.ts";
-import { runDoctor, formatDoctor } from "./commands/doctor.ts";
+import { configExplain } from "./commands/config.ts";
+import { runDoctor, formatDoctor, type DoctorCheck } from "./commands/doctor.ts";
+import { init } from "./commands/init.ts";
 import { install } from "./commands/install.ts";
 import type { ReleaseDeps } from "./commands/release-txn.ts";
+import { launch } from "./commands/launch.ts";
 import { rollback } from "./commands/rollback.ts";
 import { update } from "./commands/update.ts";
 import { defaultIO, type CliIO } from "./io.ts";
@@ -24,12 +27,16 @@ export interface MainDeps {
   applyDeps?: Partial<ApplyDeps>;
   /** Test seams for update/rollback. */
   releaseDeps?: Partial<ReleaseDeps>;
+  /** Test seams for the launcher and init/config. */
+  doctor?: () => Promise<DoctorCheck[]>;
+  cwd?: string;
 }
 
 const USAGE = `Usage: factory [command]
 
 Commands:
-  (none)                       start the factory
+  (none)                       start the factory (Pi); arguments starting with "-"
+                               and everything after "--" are passed to Pi
   install [--yes] [--profile <name>]
                                install or repair the factory
   doctor [--offline] [--json]  check the installation
@@ -40,8 +47,7 @@ Commands:
   version                      print the factory version`;
 
 const LATER_PHASE = new Set(["runs", "eval", "radar"]);
-const STUBS = new Set(["init", "config"]);
-const COMMANDS = new Set(["version", "doctor", "install", "_apply-release", "update", "rollback"]);
+const COMMANDS = new Set(["version", "doctor", "install", "_apply-release", "update", "rollback", "init", "config"]);
 
 export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
@@ -60,14 +66,15 @@ export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDe
     io.err(`factory ${cmd} arrives in a later phase`);
     return 2;
   }
-  if (cmd !== undefined && !STUBS.has(cmd) && !COMMANDS.has(cmd)) return usage(`Unknown command: ${cmd}`);
-
-  if (cmd === undefined || STUBS.has(cmd)) {
-    io.err(`factory ${cmd ?? "launcher"} is not implemented yet`);
-    return 2;
-  }
+  // Launcher: no command, `--` (everything after it goes to Pi), or a leading option (all of argv goes to Pi).
+  const toPi = cmd === undefined ? [] : cmd === "--" ? rest : cmd.startsWith("-") ? argv : undefined;
+  if (toPi === undefined && cmd !== undefined && !COMMANDS.has(cmd)) return usage(`Unknown command: ${cmd}`);
 
   const manifest = ReleaseManifest.parse(JSON.parse(readFileSync(join(root, "release.json"), "utf8")));
+
+  if (toPi !== undefined) {
+    return launch({ paths: factoryPaths(env), env, manifest, io, root, doctor: deps.doctor }, toPi);
+  }
 
   if (cmd === "version") {
     io.out(manifest.factory);
@@ -117,6 +124,21 @@ export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDe
     const ctx = { paths: factoryPaths(env), env, manifest, io, now: () => new Date(), deps: deps.releaseDeps };
     const yes = parsed.values.yes === true;
     return cmd === "update" ? update(ctx, { to: parsed.values.to, yes }) : rollback(ctx, { version: parsed.positionals[0], yes });
+  }
+
+  if (cmd === "init") {
+    let yes: boolean | undefined;
+    try {
+      yes = parseArgs({ args: rest, options: { yes: { type: "boolean" } }, allowPositionals: false, strict: true }).values.yes;
+    } catch (e) {
+      return usage((e as Error).message);
+    }
+    return init({ io, env }, { yes: yes === true, cwd: deps.cwd ?? process.cwd() });
+  }
+
+  if (cmd === "config") {
+    if (rest[0] !== "explain" || rest.length !== 2 || rest[1]?.startsWith("-")) return usage("config takes: explain <key>");
+    return configExplain({ paths: factoryPaths(env), env, io, root, cwd: deps.cwd ?? process.cwd() }, rest[1] as string);
   }
 
   let flags: { offline?: boolean; json?: boolean };
