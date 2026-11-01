@@ -62,6 +62,14 @@ describe("redact: prefixed and structured keys", () => {
   });
 });
 
+describe("redact: quoted values", () => {
+  it("masks the whole quoted value", () => {
+    expect(redact('GH_TOKEN="abc def" next')).toBe("GH_TOKEN=*** next");
+    expect(redact("password = 'a b c' next")).toBe("password = *** next");
+    expect(redact('password="unterminated x')).toBe("password=*** x");
+  });
+});
+
 describe("redact: documented over-redaction", () => {
   it("lets key=value cross a newline", () => {
     expect(redact("token:\nvalue next")).toBe("token:\n*** next");

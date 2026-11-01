@@ -24,7 +24,7 @@ const RULES: readonly Rule[] = [
   [/(--[A-Za-z0-9-]*(?:password|passwd|secret|token|api-?key)[A-Za-z0-9-]*)(\s+)(?!-)\S+/gi, `$1$2${MASK}`],
   // NAME=value, including prefixed/suffixed names (DB_PASSWORD, AWS_SECRET_ACCESS_KEY). May cross a newline.
   [
-    /(?<![A-Za-z])([A-Za-z0-9_]*(?:password|passwd|secret|token|api[_-]?key)[A-Za-z0-9_]*)(\s*[=:]\s*)\S+/gi,
+    /(?<![A-Za-z])([A-Za-z0-9_]*(?:password|passwd|secret|token|api[_-]?key)[A-Za-z0-9_]*)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|\S+)/gi,
     `$1$2${MASK}`,
   ],
 ];

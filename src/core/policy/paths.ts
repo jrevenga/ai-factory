@@ -58,6 +58,8 @@ interface Canonical {
   path: string;
   /** True when a `.` or `..` segment was present and collapsed lexically. */
   dots: boolean;
+  /** Literal (untrimmed) spelling when it differs from `path`; secrets are checked on both. */
+  alt?: string;
 }
 
 /**
@@ -72,8 +74,14 @@ function canon(raw: string, platform: PathPlatform): Canonical | undefined {
     return { path: path.posix.normalize(raw), dots };
   }
   let p = normalizeWindowsShellPath(raw);
-  if (/^\\\\[?.]\\UNC\\/i.test(p)) p = `\\\\${p.slice(8)}`;
-  else if (/^\\\\[?.]\\/.test(p)) p = p.slice(4);
+  let verbatim = false;
+  if (/^\\\\[?.]\\UNC\\/i.test(p)) {
+    p = `\\\\${p.slice(8)}`;
+    verbatim = true;
+  } else if (/^\\\\[?.]\\/.test(p)) {
+    p = p.slice(4);
+    verbatim = true;
+  }
   let root: string;
   if (WIN_DRIVE_ROOT.test(p)) root = `${p.slice(0, 2).toUpperCase()}\\`;
   else if (WIN_UNC_ROOT.test(p)) {
@@ -84,16 +92,29 @@ function canon(raw: string, platform: PathPlatform): Canonical | undefined {
   const rest = p.slice(root.length);
   if (rest.includes(":")) return undefined; // alternate data streams, device names
   if (root.startsWith("\\\\") && root.slice(2).includes(":")) return undefined;
+  // Win32 trims trailing dots/spaces only from the final segment (and never under \\?\).
+  // Any other segment that would be altered, or an all-dots name, is ambiguous: fail closed.
   let dots = false;
-  const segs: string[] = [];
-  for (const seg of rest.split(/[\\/]+/)) {
+  const raws = rest.split(/[\\/]+/).filter((x) => x !== "");
+  const trimmedSegs: string[] = [];
+  const literalSegs: string[] = [];
+  raws.forEach((seg, i) => {
+    const last = i === raws.length - 1;
     const t = seg.replace(/ +$/, "");
-    if (t === "." || t === "..") dots = true;
+    if (t === "." || t === "..") {
+      dots = true;
+      trimmedSegs.push(t);
+      literalSegs.push(t);
+      return;
+    }
     const trimmed = seg.replace(/[. ]+$/, "");
-    if (t === "." || t === "..") segs.push(t);
-    else if (trimmed !== "") segs.push(trimmed);
-  }
-  return { path: path.win32.normalize(root + segs.join("\\")), dots };
+    if (/^\.+$/.test(seg) || (trimmed !== seg && (!last || verbatim))) dots = true;
+    if (trimmed !== "") trimmedSegs.push(trimmed);
+    literalSegs.push(seg);
+  });
+  const result = path.win32.normalize(root + trimmedSegs.join("\\"));
+  const literal = path.win32.normalize(root + literalSegs.join("\\"));
+  return { path: result, dots, ...(literal !== result ? { alt: literal } : {}) };
 }
 
 function stripTrailingSep(p: string, platform: PathPlatform): string {
@@ -156,6 +177,11 @@ function secretOfCanonical(target: string, ctx: SecretContext): boolean {
   ].includes(joined);
 }
 
+function secretOfCanonicals(c: Canonical, ctx: SecretContext): boolean {
+  const forms = c.alt === undefined ? [c.path] : [c.path, c.alt];
+  return forms.some((f) => secretOfCanonical(stripTrailingSep(f, ctx.platform), ctx));
+}
+
 /**
  * True for secret files. A path that is not a usable absolute path is treated as secret (fail closed).
  * Throws when `home` or `piAgentDir` is not absolute (configuration error).
@@ -165,7 +191,7 @@ export function isSecretPath(resolved: string, ctx: SecretContext): boolean {
   requireAbsolute(ctx.piAgentDir, "piAgentDir", ctx.platform);
   const c = canon(resolved, ctx.platform);
   if (!c) return true;
-  return secretOfCanonical(stripTrailingSep(c.path, ctx.platform), ctx);
+  return secretOfCanonicals(c, ctx);
 }
 
 export function classifyPath(p: PathFacts, ctx: PathContext): PathClassification {
@@ -179,8 +205,7 @@ export function classifyPath(p: PathFacts, ctx: PathContext): PathClassification
 
   const inputCanon = canon(p.input, p.platform);
   const secret =
-    secretOfCanonical(target, sctx) ||
-    (inputCanon !== undefined && secretOfCanonical(stripTrailingSep(inputCanon.path, p.platform), sctx));
+    secretOfCanonicals(c, sctx) || (inputCanon !== undefined && secretOfCanonicals(inputCanon, sctx));
   // A leftover `.`/`..` means the caller did not canonicalize: never grant containment.
   if (c.dots) return { secret, within: "outside" };
 

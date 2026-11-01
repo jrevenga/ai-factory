@@ -217,3 +217,27 @@ describe("win32 shell path conversion (mirrors Pi normalizeWindowsShellPath)", (
     expect(w("/mnt/repo/a")).toBe("outside");
   });
 });
+
+describe("win32 verbatim paths and non-final trailing dots/spaces", () => {
+  const ctx = { ...winCtx, writeRoots: ["C:\\repo"] };
+  const within = (p: string, c = ctx) => classifyPath(win(p), c).within;
+  it("never maps literal verbatim names into the write root", () => {
+    expect(within("\\\\?\\C:\\repo \\x")).toBe("outside");
+    expect(within("\\\\?\\C:\\repo.\\x")).toBe("outside");
+    expect(within("\\\\?\\C:\\...\\x", { ...winCtx, writeRoots: ["C:\\x"] })).toBe("outside");
+    expect(within("\\\\?\\C:\\repo\\x.")).toBe("outside");
+    expect(within("\\\\?\\C:\\repo\\x ")).toBe("outside");
+    expect(within("\\\\?\\C:\\repo\\x")).toBe("write-root");
+  });
+  it("fails closed on non-final segments that end in dot/space or are all dots", () => {
+    expect(within("C:\\repo \\x")).toBe("outside");
+    expect(within("C:\\repo.\\x")).toBe("outside");
+    expect(within("C:\\repo\\...\\x")).toBe("outside");
+    expect(within("C:\\repo\\sub.\\x")).toBe("outside");
+    expect(within("C:\\repo\\sub\\x. ")).toBe("write-root"); // only the final segment is trimmed
+  });
+  it("still computes secret on both the literal and the trimmed form", () => {
+    expect(classifyPath(win("C:\\Users\\u\\.ssh.\\config"), winCtx)).toMatchObject({ secret: true, within: "outside" });
+    expect(classifyPath(win("\\\\?\\C:\\repo\\.env "), ctx)).toMatchObject({ secret: true, within: "outside" });
+  });
+});
