@@ -21,6 +21,7 @@ export interface ReleaseDeps {
   /** Runs `node <args>` with the terminal's output and resolves to its exit code. */
   runNode: (args: string[], env: NodeJS.ProcessEnv) => Promise<number>;
   liveSessions: typeof liveSessions;
+  acquireLock: typeof acquireLock;
   /** Version of the running Node.js. */
   nodeVersion: string;
 }
@@ -36,7 +37,7 @@ export interface ReleaseContext {
 }
 
 export function releaseDeps(ctx: ReleaseContext): ReleaseDeps {
-  return { lsRemoteTags, cloneTag, npm, runNode: runNodeInherited, liveSessions, nodeVersion: process.versions.node, ...ctx.deps };
+  return { lsRemoteTags, cloneTag, npm, runNode: runNodeInherited, liveSessions, acquireLock, nodeVersion: process.versions.node, ...ctx.deps };
 }
 
 const NPM_TIMEOUT_MS = 10 * 60_000;
@@ -58,13 +59,15 @@ export interface HeldLock {
 
 /**
  * Runs `body` holding the factory lock, after checking (under the lock, so none can register meanwhile)
- * that no factory-launched Pi session is running. The lock is released in every case.
+ * that no factory-launched Pi session is running. The lock is released in every case; a release failure
+ * (e.g. the lock was compromised while a borrowing child ran, which the child cannot see) makes the
+ * result non-zero, because another process may have held the lock meanwhile.
  */
 export async function withTxnLock(ctx: ReleaseContext, deps: ReleaseDeps, body: (held: HeldLock) => Promise<number>): Promise<number> {
   const { io, paths } = ctx;
   let lock: Lock;
   try {
-    lock = await acquireLock(paths);
+    lock = await deps.acquireLock(paths);
   } catch (e) {
     io.err(e instanceof Locked ? e.message : `Could not take the factory lock ${paths.lock}: ${msg(e)}`);
     return 1;
@@ -76,6 +79,7 @@ export async function withTxnLock(ctx: ReleaseContext, deps: ReleaseDeps, body: 
     },
   };
   let code: number;
+  let releaseFailed = false;
   try {
     let sessions: number[];
     try {
@@ -89,10 +93,11 @@ export async function withTxnLock(ctx: ReleaseContext, deps: ReleaseDeps, body: 
     try {
       await lock.release();
     } catch (e) {
-      io.err(`The factory lock ${paths.lock} could not be released cleanly: ${msg(e)}. Run "factory doctor".`);
+      io.err(`The factory lock ${paths.lock} could not be released cleanly: ${msg(e)}. Another factory process may have run meanwhile; run "factory doctor".`);
+      releaseFailed = true;
     }
   }
-  return code;
+  return releaseFailed && code === 0 ? 1 : code;
 }
 
 function sessionsOpen(io: CliIO, pids: number[]): number {

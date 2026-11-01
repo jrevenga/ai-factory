@@ -137,6 +137,32 @@ describe("factory update", () => {
     expect(borrowed).toBe(true);
   });
 
+  it("child exits 0 but state.json does not record the target → exit 1 with the rollback instruction", async () => {
+    w.onApply = async () => 0;
+    expect(await update(w.ctx(), { yes: true })).toBe(1);
+    expect(w.err.join("\n")).toMatch(/does not record[\s\S]*Update failed\. Your previous state is in snapshot \S+\. Run "factory rollback"\./);
+  });
+
+  it("child exits 0 and writes state but leaves the journal → exit 1 with the rollback instruction", async () => {
+    w.onApply = (args, world) => realisticApply(args, world, { clear: false });
+    expect(await update(w.ctx(), { yes: true })).toBe(1);
+    expect(w.err.join("\n")).toMatch(/journal[\s\S]*Run "factory rollback"/);
+  });
+
+  it("a lock release failure after a successful child → exit 1 with the error", async () => {
+    const ctx = w.ctx({
+      acquireLock: async (paths, opts) => {
+        const real = await acquireLock(paths, opts);
+        return { ...real, release: async () => {
+          await real.release();
+          throw new Error("lock compromised while the child ran");
+        } };
+      },
+    });
+    expect(await update(ctx, { yes: true })).toBe(1);
+    expect(w.err.join("\n")).toContain("lock compromised while the child ran");
+  });
+
   it("target release needing a newer Node → exit 1 with the fix, nothing changed", async () => {
     w.releases["v0.2.0"] = { nodeMin: "99.0.0" };
     const before = tree(w.paths.home);

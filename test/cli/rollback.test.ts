@@ -112,6 +112,55 @@ describe("factory rollback (normal mode)", () => {
     expect(w.log).toContain(`node ${w.globalCli} _apply-release --reason rollback --from 3.0.0 --parent-lock ${process.pid} --yes`);
   });
 
+  it("skips a from === target snapshot whose copy is newer than the target and restores from an older compatible one", async () => {
+    const h1 = { version: "0.1.0", at: "2026-09-01T00:00:00.000Z", reason: "install" as const };
+    const h3 = { version: "0.3.0", at: "2026-09-20T00:00:00.000Z", reason: "install" as const };
+    await writeState(w.paths, stateAt("0.1.0", [h1]));
+    const genuine = await writeConfig({ schema: 1, profile: "codex-only", genuine: true });
+    await createSnapshot(w.paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: at("2026-09-10") });
+    // A later snapshot labelled as leaving 0.1.0 that holds a schema-2 config (a half-applied update).
+    await writeConfig({ schema: 2, profile: "codex-only", halfMigrated: true });
+    await createSnapshot(w.paths, { from: "0.1.0", to: "0.1.0", kind: "rollback", now: at("2026-09-15") });
+    await writeState(w.paths, stateAt("0.3.0", [h1, h3]));
+    await writeConfig({ schema: 2, profile: "codex-only", era: 3 });
+    w.releases = { "v0.1.0": { stateSchemas: { "config.json": 1 } } };
+
+    expect(await rollback(w.ctx(), { version: "0.1.0", yes: true }), w.err.join("\n")).toBe(0);
+    expect(readFileSync(w.paths.config, "utf8")).toBe(genuine);
+  });
+
+  it("refuses when the only from === target snapshot holds a copy newer than the target", async () => {
+    const h1 = { version: "0.1.0", at: "2026-09-01T00:00:00.000Z", reason: "install" as const };
+    const h3 = { version: "0.3.0", at: "2026-09-20T00:00:00.000Z", reason: "install" as const };
+    await writeState(w.paths, stateAt("0.1.0", [h1]));
+    await writeConfig({ schema: 2, profile: "codex-only", halfMigrated: true });
+    await createSnapshot(w.paths, { from: "0.1.0", to: "0.1.0", kind: "rollback", now: at("2026-09-15") });
+    await writeState(w.paths, stateAt("0.3.0", [h1, h3]));
+    await writeConfig({ schema: 2, profile: "codex-only", era: 3 });
+    w.releases = { "v0.1.0": { stateSchemas: { "config.json": 1 } } };
+    const before = tree(w.paths.home);
+
+    expect(await rollback(w.ctx(), { version: "0.1.0", yes: true })).toBe(1);
+    expect(w.err.join("\n")).toContain("Cannot roll back config.json: no snapshot holds a compatible copy.");
+    expect(tree(w.paths.home)).toEqual(before);
+  });
+
+  it("a lock release failure after a successful child → exit 1 with the error", async () => {
+    await installedThenUpdated();
+    w.releases = { "v0.1.0": {} };
+    const ctx = w.ctx({
+      acquireLock: async (paths, opts) => {
+        const real = await acquireLock(paths, opts);
+        return { ...real, release: async () => {
+          await real.release();
+          throw new Error("lock compromised while the child ran");
+        } };
+      },
+    });
+    expect(await rollback(ctx, { yes: true })).toBe(1);
+    expect(w.err.join("\n")).toContain("lock compromised while the child ran");
+  });
+
   it("a live session → exit 1, nothing changed", async () => {
     await installedThenUpdated();
     w.releases = { "v0.1.0": {} };
@@ -143,11 +192,15 @@ describe("factory rollback (recovery mode)", () => {
   it("failed update after migration recovers exactly", async () => {
     await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
     const preUpdate = await writeConfig({ schema: 1, profile: "codex-only", mine: "keep me" });
+    const preManaged = `${JSON.stringify({ schema: 1, keys: { theme: "dark" } }, null, 2)}\n`;
+    await writeFile(w.paths.managedSettings, preManaged);
     w.tags = ["v0.1.0", "v0.2.0"];
     w.releases = { "v0.1.0": {}, "v0.2.0": { stateSchemas: { "config.json": 2 } } };
-    // The new CLI's apply migrates config.json, then dies (exit 1) before writing state.json.
+    // The new CLI's apply migrates config.json and rewrites managed-settings.json at the same schema
+    // (a change a normal-mode plan would keep), then dies (exit 1) before writing state.json.
     w.onApply = async () => {
       await writeConfig({ schema: 2, profile: "codex-only", migrated: true });
+      await writeFile(w.paths.managedSettings, JSON.stringify({ schema: 1, keys: { theme: "light", added: true } }));
       return 1;
     };
     expect(await update(w.ctx(), { yes: true })).toBe(1);
@@ -163,18 +216,23 @@ describe("factory rollback (recovery mode)", () => {
     const code = await rollback(w.ctx(), { yes: true });
     expect(code, w.err.join("\n")).toBe(0);
     expect(readFileSync(w.paths.config, "utf8")).toBe(preUpdate);
+    // Recovery restores every snapshotted file, not only those whose schema is newer than the target.
+    expect(readFileSync(w.paths.managedSettings, "utf8")).toBe(preManaged);
     expect(tree(recoveryDir)).toEqual(recoveryBytes);
     const snaps = await listSnapshots(w.paths);
     expect(snaps).toHaveLength(2);
-    expect(snaps.find((s) => s.id !== txn!.snapshot)).toMatchObject({ kind: "rollback", to: "0.1.0" });
+    // The new snapshot holds the half-applied 0.2.0 state, so it is labelled as leaving 0.2.0, never 0.1.0.
+    expect(snaps.find((s) => s.id !== txn!.snapshot)).toMatchObject({ kind: "rollback", from: "0.2.0", to: "0.1.0" });
     expect(w.log).toEqual([
       "clone v0.1.0",
       `npm install -g --legacy-peer-deps git+${SOURCE}#v0.1.0`,
       "npm root -g",
-      `node ${w.globalCli} _apply-release --reason rollback --from 0.1.0 --parent-lock ${process.pid} --yes`,
+      `node ${w.globalCli} _apply-release --reason rollback --from 0.2.0 --parent-lock ${process.pid} --yes`,
     ]);
     expect(existsSync(w.paths.txn)).toBe(false);
-    expect(JSON.parse(readFileSync(w.paths.state, "utf8")).version).toBe("0.1.0");
+    const state = JSON.parse(readFileSync(w.paths.state, "utf8"));
+    expect(state.version).toBe("0.1.0");
+    expect(state.history.at(-1)).toMatchObject({ version: "0.1.0", reason: "rollback", from: "0.2.0" });
   });
 
   it("a failed recovery keeps the journal and the recovery snapshot, so it can be retried", async () => {

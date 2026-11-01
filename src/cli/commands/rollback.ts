@@ -4,14 +4,19 @@
 //
 // Recovery mode: a journal left by an unfinished update/rollback is recovered exactly — target is the
 // version it left, and every restorable file of its snapshot is restored (ruling 12). That snapshot is
-// never written to: a new rollback snapshot of the current (half-applied) state is taken first.
-import { createSnapshot, listSnapshots, RESTORABLE, restoreSnapshot } from "../../adapters/store/snapshots.ts";
+// never written to: a new rollback snapshot of the current (half-applied) state is taken first, labelled
+// as leaving the version the unfinished transaction was moving to (`txn.to`), which is also recorded as
+// `from` in history; it is never labelled as leaving `txn.from`, because it may hold newer-schema documents.
+import { join } from "node:path";
+import { MalformedJson, readJson } from "../../adapters/platform/json-file.ts";
+import type { FactoryPaths } from "../../adapters/platform/paths.ts";
+import { createSnapshot, listSnapshots, RESTORABLE, restoreSnapshot, snapshotDir } from "../../adapters/store/snapshots.ts";
 import { docSchemas, readState } from "../../adapters/store/state-store.ts";
 import { beginTxn, clearTxn, readTxn } from "../../adapters/store/transaction.ts";
-import { effectiveSource } from "../../core/release/manifest.ts";
+import { effectiveSource, STATE_DOCS } from "../../core/release/manifest.ts";
 import { compareSemver } from "../../core/release/semver.ts";
 import { planRollback } from "../../core/state/rollback-plan.ts";
-import type { SnapshotInfo, StateDoc, TxnRecord } from "../../core/state/schema.ts";
+import { schemaOf, type SnapshotInfo, type StateDoc, type TxnRecord } from "../../core/state/schema.ts";
 import { fetchRelease, installAndApply, msg, parseVersion, releaseDeps, withTxnLock, type ReleaseContext } from "./release-txn.ts";
 
 export interface RollbackOptions {
@@ -20,13 +25,46 @@ export interface RollbackOptions {
   yes: boolean;
 }
 
-/** What to roll back to and which files of which snapshot to restore. */
 interface Plan {
   target: string;
-  /** Snapshot to restore from; undefined when no snapshot was taken when leaving the target. */
-  snapshot: SnapshotInfo | undefined;
   /** The journal being recovered (restore every file of its snapshot), or undefined in normal mode. */
   recovery: TxnRecord | undefined;
+}
+
+/** The `schema` of a document's copy in a snapshot; undefined when unreadable or without one. */
+async function copySchema(paths: FactoryPaths, id: string, doc: StateDoc): Promise<number | undefined> {
+  try {
+    return schemaOf(await readJson(join(snapshotDir(paths, id), doc)));
+  } catch (e) {
+    if (e instanceof MalformedJson) return undefined;
+    throw e;
+  }
+}
+
+/**
+ * For each state document, the newest snapshot taken when leaving `target` whose copy the target can read
+ * (copy `schema` ≤ the target's). Snapshots are trusted by content, not by label: an incompatible copy is
+ * skipped in favour of an older matching snapshot.
+ */
+async function compatibleCopies(
+  paths: FactoryPaths,
+  snapshots: SnapshotInfo[],
+  target: string,
+  targetSchemas: Record<StateDoc, number>,
+): Promise<Partial<Record<StateDoc, string>>> {
+  const candidates = snapshots.filter((s) => s.from === target); // newest first
+  const out: Partial<Record<StateDoc, string>> = {};
+  for (const doc of STATE_DOCS) {
+    for (const snap of candidates) {
+      if (!snap.files.includes(doc)) continue;
+      const schema = await copySchema(paths, snap.id, doc);
+      if (schema !== undefined && schema <= targetSchemas[doc]) {
+        out[doc] = snap.id;
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Promise<number> {
@@ -61,7 +99,7 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
           io.err(`The unfinished ${txn.kind} ${txn.from} → ${txn.to} names snapshot ${txn.snapshot}, which is missing or incomplete in ${paths.backups}. It cannot be recovered automatically.`);
           return 1;
         }
-        plan = { target: txn.from, snapshot, recovery: txn };
+        plan = { target: txn.from, recovery: txn };
         io.out(`Recovering the unfinished ${txn.kind} ${txn.from} → ${txn.to} from snapshot ${snapshot.id}.`);
       } else {
         if (state === undefined) {
@@ -82,31 +120,38 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
           io.err(`${target} is newer than the installed ${state.version}. Use "factory update --to ${target}" instead.`);
           return 1;
         }
-        // A snapshot taken when leaving the target holds the target's state, whatever release it went to.
-        plan = { target, snapshot: snapshots.find((s) => s.from === target), recovery: undefined };
+        plan = { target, recovery: undefined };
       }
-      const current = state?.version ?? txn?.to;
+      // Recovery: the half-applied state belongs to the version the transaction was moving to.
+      const current = txn?.to ?? state?.version;
       if (current === undefined) throw new Error("no installed version is recorded");
 
       const release = await fetchRelease(ctx, deps, effectiveSource(ctx.manifest, env), plan.target);
 
-      let restore: string[];
-      if (plan.recovery !== undefined) {
-        restore = (plan.snapshot?.files ?? []).filter((f) => RESTORABLE.includes(f));
+      /** Snapshot id → files to restore from it. */
+      const restore = new Map<string, string[]>();
+      const recovering = plan.recovery;
+      if (recovering !== undefined) {
+        const snapshot = snapshots.find((s) => s.id === recovering.snapshot);
+        restore.set(recovering.snapshot, (snapshot?.files ?? []).filter((f) => RESTORABLE.includes(f)));
       } else {
-        const files = plan.snapshot?.files ?? [];
+        // A snapshot taken when leaving the target holds the target's state, whatever release it went to.
+        const copies = await compatibleCopies(paths, snapshots, plan.target, release.manifest.stateSchemas);
         const decision = planRollback({
           current: await docSchemas(paths),
           target: release.manifest.stateSchemas,
-          snapshotHas: Object.fromEntries(files.map((f) => [f, true])) as Partial<Record<StateDoc, boolean>>,
+          snapshotHas: Object.fromEntries(Object.keys(copies).map((d) => [d, true])) as Partial<Record<StateDoc, boolean>>,
         });
         if (decision.refuse.length > 0) {
           io.err(`Cannot roll back ${decision.refuse.join(", ")}: no snapshot holds a compatible copy. Nothing was changed.`);
           return 1;
         }
-        restore = decision.restore;
-        if (restore.length > 0) {
-          io.out(`Rolling back loses changes in: ${restore.join(", ")}`);
+        for (const doc of decision.restore) {
+          const id = copies[doc] as string;
+          restore.set(id, [...(restore.get(id) ?? []), doc]);
+        }
+        if (decision.restore.length > 0) {
+          io.out(`Rolling back loses changes in: ${decision.restore.join(", ")}`);
           if (!opts.yes && !(await io.confirm(`Roll back factory ${current} → ${plan.target}?`))) {
             io.err("Rollback cancelled. Nothing was changed.");
             return 1;
@@ -122,9 +167,10 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
         await beginTxn(paths, { id: snap.id, kind: "rollback", from: current, to: plan.target, snapshot: snap.id, now: ctx.now() });
       }
       mutating = true;
-      if (restore.length > 0 && plan.snapshot !== undefined) {
+      for (const [id, files] of restore) {
+        if (files.length === 0) continue;
         held.live();
-        await restoreSnapshot(paths, plan.snapshot.id, restore);
+        await restoreSnapshot(paths, id, files);
       }
 
       const code = await installAndApply(ctx, deps, held, release.manifest, { reason: "rollback", from: current });

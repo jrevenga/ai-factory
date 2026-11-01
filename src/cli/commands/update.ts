@@ -108,8 +108,21 @@ export async function update(ctx: ReleaseContext, opts: UpdateOptions): Promise<
 
       // The new CLI's `_apply-release` removes the journal once it has written state.json.
       const code = await installAndApply(ctx, deps, held, release.manifest, { reason: "update", from: current });
-      if (code !== 0) io.err(failedMessage(snapshotId));
-      return code;
+      if (code !== 0) {
+        io.err(failedMessage(snapshotId));
+        return code;
+      }
+      // Trust but verify the child's contract: state.json records the target and the journal is gone.
+      const recorded = (await readState(paths))?.version;
+      if (recorded !== target) {
+        io.err(`factory ${target} reported success but ${paths.state} does not record it (it records ${recorded ?? "nothing"}).\n${failedMessage(snapshotId)}`);
+        return 1;
+      }
+      if (existsSync(paths.txn)) {
+        io.err(`factory ${target} reported success but left the journal ${paths.txn} in place.\n${failedMessage(snapshotId)}`);
+        return 1;
+      }
+      return 0;
     } catch (e) {
       if (snapshotId === undefined) io.err(`Update did not start: ${msg(e)}. Nothing was changed.`);
       else io.err(`${msg(e)}\n${failedMessage(snapshotId)}`);
