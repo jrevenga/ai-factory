@@ -9,6 +9,9 @@ import { ReleaseManifest } from "../core/release/manifest.ts";
 import { APPLY_REASONS, applyRelease, ApplyFailed, type ApplyContext, type ApplyDeps, type ApplyReason } from "./commands/apply-release.ts";
 import { runDoctor, formatDoctor } from "./commands/doctor.ts";
 import { install } from "./commands/install.ts";
+import type { ReleaseDeps } from "./commands/release-txn.ts";
+import { rollback } from "./commands/rollback.ts";
+import { update } from "./commands/update.ts";
 import { defaultIO, type CliIO } from "./io.ts";
 
 export interface MainDeps {
@@ -19,6 +22,8 @@ export interface MainDeps {
   /** Test seams for install/_apply-release. */
   pi?: PiRuntime;
   applyDeps?: Partial<ApplyDeps>;
+  /** Test seams for update/rollback. */
+  releaseDeps?: Partial<ReleaseDeps>;
 }
 
 const USAGE = `Usage: factory [command]
@@ -35,8 +40,8 @@ Commands:
   version                      print the factory version`;
 
 const LATER_PHASE = new Set(["runs", "eval", "radar"]);
-const STUBS = new Set(["update", "rollback", "init", "config"]);
-const COMMANDS = new Set(["version", "doctor", "install", "_apply-release"]);
+const STUBS = new Set(["init", "config"]);
+const COMMANDS = new Set(["version", "doctor", "install", "_apply-release", "update", "rollback"]);
 
 export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
@@ -96,6 +101,22 @@ export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDe
       if (!(e instanceof ApplyFailed)) io.err(`Install did not complete: ${(e as Error).message}`);
       return 1;
     }
+  }
+
+  if (cmd === "update" || cmd === "rollback") {
+    let parsed: { values: { yes?: boolean; to?: string }; positionals: string[] };
+    try {
+      parsed =
+        cmd === "update"
+          ? parseArgs({ args: rest, options: { yes: { type: "boolean" }, to: { type: "string" } }, allowPositionals: false, strict: true })
+          : parseArgs({ args: rest, options: { yes: { type: "boolean" } }, allowPositionals: true, strict: true });
+    } catch (e) {
+      return usage((e as Error).message);
+    }
+    if (parsed.positionals.length > 1) return usage(`rollback takes at most one version, got ${parsed.positionals.join(" ")}`);
+    const ctx = { paths: factoryPaths(env), env, manifest, io, now: () => new Date(), deps: deps.releaseDeps };
+    const yes = parsed.values.yes === true;
+    return cmd === "update" ? update(ctx, { to: parsed.values.to, yes }) : rollback(ctx, { version: parsed.positionals[0], yes });
   }
 
   let flags: { offline?: boolean; json?: boolean };

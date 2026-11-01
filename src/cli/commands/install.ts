@@ -37,7 +37,7 @@ function ownCliPath(): string {
 }
 
 /** `node <args>` with stdin closed and output going straight to the terminal (no shell). */
-function runNodeInherited(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
+export function runNodeInherited(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, args, { env, stdio: ["ignore", "inherit", "inherit"], windowsHide: true });
     child.once("error", reject);
@@ -78,6 +78,26 @@ export async function install(ctx: ApplyContext, opts: InstallOptions, overrides
 }
 
 /**
+ * Entry file of the globally installed factory CLI (`<npm root -g>/ai-factory/bin/factory.mjs`), checked
+ * to exist and to lie outside the npx cache. Throws an error whose message tells the user what to do.
+ */
+export async function locateGlobalCli(npmFn: typeof npm, env: NodeJS.ProcessEnv): Promise<string> {
+  const rootResult = await npmFn(["root", "-g"], { env, timeoutMs: 60_000 });
+  const globalRoot = rootResult.stdout.trim();
+  if (rootResult.code !== 0 || globalRoot === "") {
+    throw new Error(`Could not determine npm's global root (\`npm root -g\` exited with ${rootResult.code}).\n${rootResult.stderr.trim()}`);
+  }
+  const globalCli = join(globalRoot, "ai-factory", "bin", "factory.mjs");
+  if (isNpxPath(globalCli)) {
+    throw new Error(`npm's global root ${globalRoot} is inside the npx cache; refusing to hand over to it. Set a user-owned global prefix (\`npm config set prefix <dir>\`) and retry.`);
+  }
+  if (!existsSync(globalCli)) {
+    throw new Error(`npm reported success but ${globalCli} does not exist. Run \`npm ls -g ai-factory\` to inspect the global install, then retry.`);
+  }
+  return globalCli;
+}
+
+/**
  * Running from the npx cache: install this release globally (`--legacy-peer-deps`, ruling 5), then run
  * the global CLI's `install` with the same flags so the installed copy does the work.
  */
@@ -91,19 +111,11 @@ async function bootstrap(ctx: ApplyContext, opts: InstallOptions, deps: InstallD
     io.err(`npm install -g of ${spec} ${how}. Check your network and access to the repository, then retry.\n${installed.stderr.trim()}`);
     return 1;
   }
-  const rootResult = await deps.npm(["root", "-g"], { env, timeoutMs: 60_000 });
-  const globalRoot = rootResult.stdout.trim();
-  if (rootResult.code !== 0 || globalRoot === "") {
-    io.err(`Could not determine npm's global root (\`npm root -g\` exited with ${rootResult.code}).\n${rootResult.stderr.trim()}`);
-    return 1;
-  }
-  const globalCli = join(globalRoot, "ai-factory", "bin", "factory.mjs");
-  if (isNpxPath(globalCli)) {
-    io.err(`npm's global root ${globalRoot} is inside the npx cache; refusing to hand over to it. Set a user-owned global prefix (\`npm config set prefix <dir>\`) and retry.`);
-    return 1;
-  }
-  if (!existsSync(globalCli)) {
-    io.err(`npm reported success but ${globalCli} does not exist. Run \`npm ls -g ai-factory\` to inspect the global install, then retry.`);
+  let globalCli: string;
+  try {
+    globalCli = await locateGlobalCli(deps.npm, env);
+  } catch (e) {
+    io.err(msg(e));
     return 1;
   }
   const args = [globalCli, "install", ...(opts.yes ? ["--yes"] : []), ...(opts.profile === undefined ? [] : ["--profile", opts.profile])];

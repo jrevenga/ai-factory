@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import { factoryPaths } from "../../src/adapters/platform/paths.ts";
 import { PiRuntime } from "../../src/adapters/pi/runtime.ts";
 import { acquireLock } from "../../src/adapters/store/lock.ts";
+import { writeState } from "../../src/adapters/store/state-store.ts";
 import { main } from "../../src/cli/main.ts";
 import type { CliIO } from "../../src/cli/io.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
+import { makeWorld, stateAt } from "../helpers/release-world.ts";
 import { makeTmp } from "../helpers/tmp.ts";
 
 function capture(): { io: CliIO; out: string[]; err: string[] } {
@@ -35,7 +37,7 @@ describe("main router", () => {
 
   it("commands owned by later tasks are stubs that exit 2", async () => {
     const c = capture();
-    expect(await main(["update"], c.io)).toBe(2);
+    expect(await main(["init"], c.io)).toBe(2);
     expect(c.err.join("")).toMatch(/not implemented yet/);
   });
 
@@ -51,6 +53,10 @@ describe("main router", () => {
     [["_apply-release", "--reason", "bogus"]],
     [["_apply-release", "--reason", "update", "--parent-lock", "abc"]],
     [["_apply-release", "--reason", "update", "--parent-lock", "0"]],
+    [["update", "--bogus"]],
+    [["update", "0.2.0"]],
+    [["rollback", "--to", "0.1.0"]],
+    [["rollback", "0.1.0", "0.0.9"]],
   ])("%j is a usage error (exit 2)", async (argv) => {
     const c = capture();
     expect(await main(argv, c.io)).toBe(2);
@@ -128,6 +134,27 @@ describe("main _apply-release", () => {
       expect(existsSync(factoryPaths(env).state)).toBe(false);
     } finally {
       await t.cleanup();
+    }
+  });
+});
+
+describe("main update/rollback", () => {
+  it("maps update --to/--yes and rollback <version>/--yes onto the commands", async () => {
+    const w = await makeWorld("main-release");
+    try {
+      await writeState(w.paths, stateAt("0.2.0", [{ version: "0.2.0", at: "2026-10-01T00:00:00.000Z", reason: "install" }]));
+      w.tags = ["v0.2.0"];
+      const c = capture();
+      expect(await main(["update", "--to", "v9.9.9", "--yes"], c.io, { env: w.env, releaseDeps: w.ctx().deps })).toBe(1);
+      expect(c.err.join("\n")).toContain("Release v9.9.9 was not found");
+
+      w.releases = { "v0.1.0": {} };
+      const r = capture();
+      expect(await main(["rollback", "v0.1.0", "--yes"], r.io, { env: w.env, releaseDeps: w.ctx().deps }), r.err.join("\n")).toBe(0);
+      expect(w.log).toContain("clone v0.1.0");
+      expect(w.log.at(-1)).toMatch(/_apply-release --reason rollback --from 0\.2\.0 --parent-lock \d+ --yes$/);
+    } finally {
+      await w.cleanup();
     }
   });
 });
