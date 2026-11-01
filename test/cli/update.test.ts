@@ -180,6 +180,26 @@ describe("factory update", () => {
     expect(w.log.some((l) => l.startsWith("node "))).toBe(false);
   });
 
+  it.each([
+    ["config.json", "malformed JSON", '{ "schema": 1, "profile": "codex-only", }\n'],
+    ["config.json", "a value the reader rejects", `${JSON.stringify({ schema: 1, profile: 5 })}\n`],
+    ["managed-settings.json", "a value the reader rejects", `${JSON.stringify({ schema: 1, keys: { transport: "sse" } })}\n`],
+    ["state.json", "malformed JSON", "{"],
+  ] as const)("an invalid %s (%s) → exit 1 before any change, naming the file and the fix", async (doc, _what, bytes) => {
+    const path = doc === "config.json" ? w.paths.config : doc === "state.json" ? w.paths.state : w.paths.managedSettings;
+    await writeFile(path, bytes);
+    const before = tree(w.paths.home);
+    expect(await update(w.ctx(), { yes: true })).toBe(1);
+    const text = w.err.join("\n");
+    expect(text).toContain(path);
+    expect(text).toContain("Nothing was changed.");
+    expect(text).toMatch(/fix: Fix or remove .*then run "factory update" again/);
+    expect(tree(w.paths.home)).toEqual(before);
+    expect(existsSync(w.paths.backups)).toBe(false);
+    expect(existsSync(w.paths.txn)).toBe(false);
+    expect(w.log.some((l) => l.startsWith("npm ") || l.startsWith("node "))).toBe(false);
+  });
+
   it("a failing child apply → exit with its code and the recovery message; journal kept", async () => {
     w.onApply = async () => 1;
     expect(await update(w.ctx(), { yes: true })).toBe(1);

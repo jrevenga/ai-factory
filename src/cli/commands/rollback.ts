@@ -11,13 +11,13 @@ import { join } from "node:path";
 import { MalformedJson, readJson } from "../../adapters/platform/json-file.ts";
 import type { FactoryPaths } from "../../adapters/platform/paths.ts";
 import { createSnapshot, listSnapshots, RESTORABLE, restoreSnapshot, snapshotDir } from "../../adapters/store/snapshots.ts";
-import { docSchemas, readState } from "../../adapters/store/state-store.ts";
+import { inspectStateDocs, readState } from "../../adapters/store/state-store.ts";
 import { beginTxn, clearTxn, readTxn } from "../../adapters/store/transaction.ts";
 import { effectiveSource, STATE_DOCS } from "../../core/release/manifest.ts";
 import { compareSemver } from "../../core/release/semver.ts";
 import { planRollback } from "../../core/state/rollback-plan.ts";
-import { schemaOf, type SnapshotInfo, type StateDoc, type TxnRecord } from "../../core/state/schema.ts";
-import { fetchRelease, installAndApply, msg, parseVersion, releaseDeps, withTxnLock, type ReleaseContext } from "./release-txn.ts";
+import { schemaOf, type FactoryState, type SnapshotInfo, type StateDoc, type TxnRecord } from "../../core/state/schema.ts";
+import { fetchRelease, installAndApply, invalidDocsMessage, msg, parseVersion, releaseDeps, withTxnLock, type ReleaseContext } from "./release-txn.ts";
 
 export interface RollbackOptions {
   /** Target release (`v1.2.3` or `1.2.3`); default the most recent history version other than the installed one. */
@@ -85,8 +85,31 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
     let plan: Plan | undefined;
     let rollbackSnapshot: string | undefined;
     try {
-      const txn = await readTxn(paths);
-      const state = await readState(paths);
+      let txn: TxnRecord | undefined;
+      try {
+        txn = await readTxn(paths);
+      } catch (e) {
+        if (!(e instanceof MalformedJson)) throw e;
+        io.err(
+          `The transaction journal ${paths.txn} is unreadable: ${msg(e.cause)}. Nothing was changed.\n` +
+            `  fix: It records an unfinished update or rollback. Its snapshot is the newest directory in ${paths.backups} (snapshot.json names the transaction); ` +
+            `repair the journal from it, or remove ${paths.txn} if no transaction was running, then run "factory rollback" again.`,
+        );
+        return 1;
+      }
+      // Recovery never reads the current documents (they belong to the half-applied transaction and are
+      // replaced from its snapshot); a normal rollback checks every one of them before any change (I1).
+      let state: FactoryState | undefined;
+      let currentSchemas: Partial<Record<StateDoc, number>> = {};
+      if (txn === undefined) {
+        const inspected = await inspectStateDocs(paths, ctx.manifest.stateSchemas);
+        if (inspected.problems.length > 0) {
+          io.err(invalidDocsMessage(inspected.problems, "factory rollback"));
+          return 1;
+        }
+        currentSchemas = inspected.schemas;
+        state = await readState(paths);
+      }
       const snapshots = await listSnapshots(paths);
 
       if (txn !== undefined) {
@@ -138,7 +161,7 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
         // A snapshot taken when leaving the target holds the target's state, whatever release it went to.
         const copies = await compatibleCopies(paths, snapshots, plan.target, release.manifest.stateSchemas);
         const decision = planRollback({
-          current: await docSchemas(paths),
+          current: currentSchemas,
           target: release.manifest.stateSchemas,
           snapshotHas: Object.fromEntries(Object.keys(copies).map((d) => [d, true])) as Partial<Record<StateDoc, boolean>>,
         });
@@ -170,7 +193,8 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
       for (const [id, files] of restore) {
         if (files.length === 0) continue;
         held.live();
-        await restoreSnapshot(paths, id, files);
+        // A journal's snapshot is restored as it is (I1); normal-mode copies were chosen by content.
+        await restoreSnapshot(paths, id, files, { verbatim: plan.recovery !== undefined });
       }
 
       const code = await installAndApply(ctx, deps, held, release.manifest, { reason: "rollback", from: current });

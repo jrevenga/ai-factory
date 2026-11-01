@@ -8,6 +8,7 @@ import { npm } from "../../adapters/platform/npm.ts";
 import type { FactoryPaths } from "../../adapters/platform/paths.ts";
 import { acquireLock, Locked, type Lock } from "../../adapters/store/lock.ts";
 import { liveSessions } from "../../adapters/store/sessions.ts";
+import type { StateDocProblem } from "../../adapters/store/state-store.ts";
 import { cloneTag, lsRemoteTags } from "../../adapters/vcs/git.ts";
 import { npmInstallSpec, ReleaseManifest, tagFor } from "../../core/release/manifest.ts";
 import type { CliIO } from "../io.ts";
@@ -49,6 +50,16 @@ export const msg = (e: unknown): string => (e instanceof Error ? e.message : Str
 export function parseVersion(input: string): string | undefined {
   const m = /^v?(\d+\.\d+\.\d+)$/.exec(input.trim());
   return m?.[1];
+}
+
+/** The refusal printed when the preflight finds invalid state documents; `retry` is the command to rerun. */
+export function invalidDocsMessage(problems: StateDocProblem[], retry: string): string {
+  return [
+    "These factory documents are invalid, so no transaction was started. Nothing was changed.",
+    ...problems.map(
+      (p) => `  ${p.path}: ${p.detail}\n     fix: Fix or remove ${p.path} (a removed file is recreated by "factory install"), then run "${retry}" again.`,
+    ),
+  ].join("\n");
 }
 
 export interface HeldLock {

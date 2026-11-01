@@ -5,6 +5,7 @@ import type { z } from "zod";
 import { PersonalConfig } from "../../core/config/schema.ts";
 import { Profile } from "../../core/profiles/schema.ts";
 import { STATE_DOCS } from "../../core/release/manifest.ts";
+import { ManagedRecord } from "../../core/settings/managed.ts";
 import { FactoryState, schemaOf, type StateDoc } from "../../core/state/schema.ts";
 import { MalformedJson, readJson, writeJsonAtomic } from "../platform/json-file.ts";
 import type { FactoryPaths } from "../platform/paths.ts";
@@ -74,4 +75,55 @@ export async function docSchemas(paths: FactoryPaths): Promise<Partial<Record<St
     out[doc] = schema;
   }
   return out;
+}
+
+/** This CLI's reader of each state document. */
+const READERS: Record<StateDoc, z.ZodType> = {
+  "config.json": PersonalConfig,
+  "state.json": FactoryState,
+  "managed-settings.json": ManagedRecord,
+};
+
+export interface StateDocProblem {
+  doc: StateDoc;
+  path: string;
+  detail: string;
+}
+
+export interface StateDocsInspection {
+  /** The `schema` of each present document that has one. */
+  schemas: Partial<Record<StateDoc, number>>;
+  problems: StateDocProblem[];
+}
+
+/**
+ * Checks every present state document without changing anything: it must be JSON with an integer
+ * `schema`, and a document at the schema this CLI reads (`readable`) must pass this CLI's real reader.
+ * A document at another schema is only reported in `schemas`; callers decide what that means.
+ */
+export async function inspectStateDocs(paths: FactoryPaths, readable: Record<StateDoc, number>): Promise<StateDocsInspection> {
+  const schemas: Partial<Record<StateDoc, number>> = {};
+  const problems: StateDocProblem[] = [];
+  for (const doc of STATE_DOCS) {
+    const path = stateDocPath(paths, doc);
+    let raw: unknown;
+    try {
+      raw = await readJson(path);
+    } catch (e) {
+      if (!(e instanceof MalformedJson)) throw e;
+      problems.push({ doc, path, detail: `it is not valid JSON (${(e.cause as Error).message})` });
+      continue;
+    }
+    if (raw === undefined) continue;
+    const schema = schemaOf(raw);
+    if (schema === undefined) {
+      problems.push({ doc, path, detail: 'it has no integer "schema" field' });
+      continue;
+    }
+    schemas[doc] = schema;
+    if (schema !== readable[doc]) continue;
+    const parsed = READERS[doc].safeParse(raw);
+    if (!parsed.success) problems.push({ doc, path, detail: `it does not match its format: ${parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ")}` });
+  }
+  return { schemas, problems };
 }

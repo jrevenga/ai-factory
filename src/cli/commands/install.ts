@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { npm } from "../../adapters/platform/npm.ts";
 import { npmInstallSpec } from "../../core/release/manifest.ts";
-import { applyRelease, ApplyFailed, TXN_PENDING_MESSAGE, type ApplyContext } from "./apply-release.ts";
+import { MIGRATIONS } from "../../core/state/migrations.ts";
+import { applyPreflight, applyRelease, ApplyFailed, ApplyRefused, TXN_PENDING_MESSAGE, type ApplyContext } from "./apply-release.ts";
 import { requirementChecks } from "./doctor.ts";
 
 /** Seams for tests; production uses the real implementations. */
@@ -52,6 +53,15 @@ export async function install(ctx: ApplyContext, opts: InstallOptions, overrides
   // Ruling R8: never install over an unfinished update/rollback; checked before the npx bootstrap too.
   if (existsSync(ctx.paths.txn)) {
     io.err(TXN_PENDING_MESSAGE);
+    return 1;
+  }
+
+  // I2: refuse a downgrade or an unmigratable document before anything changes, including the npx
+  // bootstrap's global npm install (applyRelease repeats this under the factory lock).
+  try {
+    await applyPreflight(ctx.paths, manifest, ctx.deps?.migrations ?? MIGRATIONS, "install");
+  } catch (e) {
+    io.err(e instanceof ApplyRefused ? e.message : `Install did not start: ${msg(e)}. Nothing was changed.`);
     return 1;
   }
 

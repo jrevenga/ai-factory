@@ -145,6 +145,20 @@ describe("factory rollback (normal mode)", () => {
     expect(tree(w.paths.home)).toEqual(before);
   });
 
+  it("a config.json the reader rejects → exit 1 before any change, naming the file and the fix", async () => {
+    await installedThenUpdated();
+    await writeConfig({ schema: 1, profile: 5 });
+    w.releases = { "v0.1.0": {} };
+    const before = tree(w.paths.home);
+    expect(await rollback(w.ctx(), { yes: true })).toBe(1);
+    const text = w.err.join("\n");
+    expect(text).toContain(w.paths.config);
+    expect(text).toContain("Nothing was changed.");
+    expect(text).toMatch(/fix: Fix or remove .*then run "factory rollback" again/);
+    expect(tree(w.paths.home)).toEqual(before);
+    expect(w.log.some((l) => l.startsWith("npm ") || l.startsWith("node "))).toBe(false);
+  });
+
   it("a lock release failure after a successful child → exit 1 with the error", async () => {
     await installedThenUpdated();
     w.releases = { "v0.1.0": {} };
@@ -192,7 +206,7 @@ describe("factory rollback (recovery mode)", () => {
   it("failed update after migration recovers exactly", async () => {
     await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
     const preUpdate = await writeConfig({ schema: 1, profile: "codex-only", mine: "keep me" });
-    const preManaged = `${JSON.stringify({ schema: 1, keys: { theme: "dark" } }, null, 2)}\n`;
+    const preManaged = `${JSON.stringify({ schema: 1, keys: { theme: { value: "dark", writtenAt: "2026-10-01T00:00:00.000Z", factoryVersion: "0.1.0" } } }, null, 2)}\n`;
     await writeFile(w.paths.managedSettings, preManaged);
     w.tags = ["v0.1.0", "v0.2.0"];
     w.releases = { "v0.1.0": {}, "v0.2.0": { stateSchemas: { "config.json": 2 } } };
@@ -233,6 +247,30 @@ describe("factory rollback (recovery mode)", () => {
     const state = JSON.parse(readFileSync(w.paths.state, "utf8"));
     expect(state.version).toBe("0.1.0");
     expect(state.history.at(-1)).toMatchObject({ version: "0.1.0", reason: "rollback", from: "0.2.0" });
+  });
+
+  it("recovery restores snapshot files byte for byte even when a reader would reject them, and ignores a broken current state.json", async () => {
+    await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
+    // Hand-edited before the transaction (written by an earlier release without the preflight).
+    const handEdited = '{ "schema": 1, "profile": "codex-only", }\n';
+    await writeFile(w.paths.config, handEdited);
+    const snap = await createSnapshot(w.paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: at("2026-10-31") });
+    await writeFile(w.paths.txn, JSON.stringify({ id: snap.id, kind: "update", from: "0.1.0", to: "0.2.0", snapshot: snap.id, startedAt: "2026-10-31T00:00:00.000Z" }));
+    // The failed transaction left a half-written state.json and a migrated config.
+    await writeFile(w.paths.state, "{ half");
+    await writeConfig({ schema: 2, profile: "codex-only" });
+    w.releases = { "v0.1.0": {} };
+    let configAtApply: string | undefined;
+    w.onApply = (args, world) => {
+      configAtApply = readFileSync(world.paths.config, "utf8");
+      return realisticApply(args, world, { clear: false });
+    };
+    const code = await rollback(w.ctx(), { yes: true });
+    expect(code, w.err.join("\n")).toBe(0);
+    expect(configAtApply).toBe(handEdited);
+    expect(readFileSync(w.paths.config, "utf8")).toBe(handEdited);
+    expect(JSON.parse(readFileSync(w.paths.state, "utf8")).version).toBe("0.1.0");
+    expect(existsSync(w.paths.txn)).toBe(false);
   });
 
   it("a failed recovery keeps the journal and the recovery snapshot, so it can be retried", async () => {

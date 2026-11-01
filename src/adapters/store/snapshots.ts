@@ -174,8 +174,8 @@ export class SnapshotFileMissing extends Error {
   }
 }
 
-/** Copies `src` next to `target` as a flushed temporary file and returns its path; validates JSON documents. */
-async function stage(id: string, file: string, src: string, target: string): Promise<string> {
+/** Copies `src` next to `target` as a flushed temporary file and returns its path; validates JSON documents unless `verbatim`. */
+async function stage(id: string, file: string, src: string, target: string, verbatim: boolean): Promise<string> {
   let bytes: Buffer;
   try {
     bytes = await readFile(src);
@@ -183,7 +183,7 @@ async function stage(id: string, file: string, src: string, target: string): Pro
     if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new SnapshotFileMissing(id, file, `${src} is missing`);
     throw e;
   }
-  if (file !== MEMORY_DB_FILE) {
+  if (!verbatim && file !== MEMORY_DB_FILE) {
     const text = bytes.toString("utf8");
     try {
       JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
@@ -207,11 +207,14 @@ async function stage(id: string, file: string, src: string, target: string): Pro
 
 /**
  * Restores `files` of snapshot `id` byte-for-byte. All-or-nothing up front: every requested file is
- * checked against the snapshot, read, validated (JSON documents must parse) and staged as a flushed
- * temporary file next to its destination before any destination is replaced; only then is each staged
- * file renamed over its destination. Accepts only RESTORABLE files.
+ * checked against the snapshot, read, validated (JSON documents must parse, unless `verbatim`) and
+ * staged as a flushed temporary file next to its destination before any destination is replaced; only
+ * then is each staged file renamed over its destination. Accepts only RESTORABLE files.
+ *
+ * `verbatim` is for recovering a journal: the snapshot is exactly what existed before the transaction,
+ * so it is restored as it is, even a document no reader accepts (validation belongs in the preflight).
  */
-export async function restoreSnapshot(paths: FactoryPaths, id: string, files: string[]): Promise<void> {
+export async function restoreSnapshot(paths: FactoryPaths, id: string, files: string[], opts: { verbatim?: boolean } = {}): Promise<void> {
   const dir = snapshotDir(paths, id);
   const info = await readInfo(dir);
   if (info === undefined || info.id !== id) throw new SnapshotNotFound(id, dir);
@@ -224,7 +227,7 @@ export async function restoreSnapshot(paths: FactoryPaths, id: string, files: st
   try {
     for (const file of files) {
       const target = targetOf(paths, file);
-      staged.push({ tmp: await stage(id, file, join(dir, file), target), target });
+      staged.push({ tmp: await stage(id, file, join(dir, file), target, opts.verbatim === true), target });
     }
     while (staged.length > 0) {
       const next = staged[0] as { tmp: string; target: string };

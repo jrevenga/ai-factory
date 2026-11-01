@@ -166,6 +166,45 @@ describe("unfinished transaction (ruling R8)", () => {
   });
 });
 
+describe("preflight before any change (I2)", () => {
+  const NEWER_STATE = PREVIOUS_STATE.replaceAll("0.0.9", "0.2.0");
+
+  it("--reason install refuses when the installed factory is newer than this release; guard, Pi and state untouched", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, NEWER_STATE);
+    const e = await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(Error);
+    const text = err.join("\n");
+    expect(text).toContain("Installed factory 0.2.0 is newer than this release (0.1.0). Nothing was changed.");
+    expect(text).toContain('use "factory rollback 0.1.0"');
+    expect(readFileSync(paths.state, "utf8")).toBe(NEWER_STATE);
+    expect(existsSync(guardPath())).toBe(false);
+    expect(log).toEqual([]);
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("--reason rollback applies an older release over a newer state (the parent decided)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, NEWER_STATE);
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "rollback", from: "0.2.0" });
+    expect(readJsonFile(paths.state).version).toBe("0.1.0");
+  });
+
+  it("no migration path → refuses before the guard copy and any Pi change", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, PREVIOUS_STATE);
+    await writeFile(paths.config, JSON.stringify({ schema: 2, profile: "codex-only" }));
+    const e = await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(Error);
+    const text = err.join("\n");
+    expect(text).toContain("No migration path for config.json from schema 2 to schema 1.");
+    expect(text).toContain("Nothing was changed.");
+    expect(existsSync(guardPath())).toBe(false);
+    expect(log).toEqual([]);
+    expect(readFileSync(paths.state, "utf8")).toBe(PREVIOUS_STATE);
+  });
+});
+
 describe("after state is written", () => {
   it("a doctor that throws does not turn a completed install into a failure", async () => {
     const throwing: Partial<ApplyDeps> = {

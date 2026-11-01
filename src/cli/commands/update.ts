@@ -3,13 +3,13 @@
 // snapshot and the journal are written (ruling 12) and the new release's CLI applies itself (ruling 10).
 import { existsSync } from "node:fs";
 import { createSnapshot } from "../../adapters/store/snapshots.ts";
-import { readState } from "../../adapters/store/state-store.ts";
+import { inspectStateDocs, readState, stateDocPath, type StateDocProblem } from "../../adapters/store/state-store.ts";
 import { beginTxn } from "../../adapters/store/transaction.ts";
 import { changelogBetween } from "../../core/release/changelog.ts";
-import { effectiveSource, tagFor } from "../../core/release/manifest.ts";
+import { effectiveSource, STATE_DOCS, tagFor } from "../../core/release/manifest.ts";
 import { compareSemver } from "../../core/release/semver.ts";
 import { TXN_PENDING_MESSAGE } from "./apply-release.ts";
-import { fetchRelease, installAndApply, msg, parseVersion, releaseDeps, withTxnLock, type ReleaseContext } from "./release-txn.ts";
+import { fetchRelease, installAndApply, invalidDocsMessage, msg, parseVersion, releaseDeps, withTxnLock, type ReleaseContext } from "./release-txn.ts";
 
 export interface UpdateOptions {
   /** Target release (`v1.2.3` or `1.2.3`); default the highest `v*` tag above the installed version. */
@@ -43,6 +43,21 @@ export async function update(ctx: ReleaseContext, opts: UpdateOptions): Promise<
       // Re-checked under the lock: a transaction may have started since the check above.
       if (existsSync(paths.txn)) {
         io.err(TXN_PENDING_MESSAGE);
+        return 1;
+      }
+      // Preflight (I1): every state document must be readable by this release, or a failed update
+      // could never be recovered (the snapshot would hold a document nothing can read).
+      const inspected = await inspectStateDocs(paths, ctx.manifest.stateSchemas);
+      const problems: StateDocProblem[] = [...inspected.problems];
+      for (const doc of STATE_DOCS) {
+        const schema = inspected.schemas[doc];
+        const readable = ctx.manifest.stateSchemas[doc];
+        if (schema !== undefined && schema !== readable && !problems.some((p) => p.doc === doc)) {
+          problems.push({ doc, path: stateDocPath(paths, doc), detail: `it has schema ${schema}, but factory ${ctx.manifest.factory} reads schema ${readable}` });
+        }
+      }
+      if (problems.length > 0) {
+        io.err(invalidDocsMessage(problems, "factory update"));
         return 1;
       }
       const state = await readState(paths);

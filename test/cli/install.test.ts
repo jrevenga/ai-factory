@@ -124,6 +124,25 @@ describe("install", () => {
     expect(existsSync(paths.state)).toBe(false);
   });
 
+  it.each([GLOBAL_CLI, NPX_CLI])("refuses an installed factory newer than this release before any change, from %s (I2)", async (cliPath) => {
+    await mkdir(paths.home, { recursive: true });
+    const state = JSON.stringify({ schema: 1, version: "0.2.0", installedAt: "2026-10-01T00:00:00.000Z", source: SOURCE, piVersion: "1.4.0", piCli: "/x/cli.js", history: [] });
+    await writeFile(paths.state, state);
+    expect(await install(ctx(), { yes: true }, deps({ cliPath }))).toBe(1);
+    expect(err.join("\n")).toContain("Installed factory 0.2.0 is newer than this release (0.1.0). Nothing was changed.");
+    expect(log).toEqual([]);
+    expect(readFileSync(paths.state, "utf8")).toBe(state);
+  });
+
+  it.each([GLOBAL_CLI, NPX_CLI])("refuses a document this release cannot migrate before any change, from %s (I2)", async (cliPath) => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.managedSettings, JSON.stringify({ schema: 7, keys: {} }));
+    expect(await install(ctx(), { yes: true }, deps({ cliPath }))).toBe(1);
+    expect(err.join("\n")).toContain("No migration path for managed-settings.json from schema 7 to schema 1.");
+    expect(log).toEqual([]);
+    expect(existsSync(paths.state)).toBe(false);
+  });
+
   it("outside npx, a failed apply → exit 1", async () => {
     const c = ctx();
     c.pi = new (class extends FakePi {

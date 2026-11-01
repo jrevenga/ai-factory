@@ -10,7 +10,7 @@ import { copyFile, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { GUARD_FILE_NAME } from "../../../guard/factory-guard.ts";
-import { readJson, renameWithRetry, writeJsonAtomic } from "../../adapters/platform/json-file.ts";
+import { MalformedJson, readJson, renameWithRetry, writeJsonAtomic } from "../../adapters/platform/json-file.ts";
 import type { FactoryPaths } from "../../adapters/platform/paths.ts";
 import type { PiRuntime } from "../../adapters/pi/runtime.ts";
 import { applyManagedPiSettings } from "../../adapters/pi/settings-file.ts";
@@ -21,7 +21,8 @@ import { clearTxn } from "../../adapters/store/transaction.ts";
 import type { LoginState } from "../../core/profiles/propose.ts";
 import { proposeProfile } from "../../core/profiles/propose.ts";
 import { effectiveSource, packageRef, type ReleaseManifest } from "../../core/release/manifest.ts";
-import { MIGRATIONS, planMigrations, type Migration } from "../../core/state/migrations.ts";
+import { compareSemver } from "../../core/release/semver.ts";
+import { MIGRATIONS, NoMigrationPath, planMigrations, type Migration } from "../../core/state/migrations.ts";
 import { FactoryState, type StateDoc } from "../../core/state/schema.ts";
 import type { CliIO } from "../io.ts";
 import { formatDoctor, runDoctor } from "./doctor.ts";
@@ -67,6 +68,57 @@ class InstallBlockedByTxn extends Error {
   constructor() {
     super(TXN_PENDING_MESSAGE);
     this.name = "InstallBlockedByTxn";
+  }
+}
+
+/** A preflight refusal: raised before any change, its message is shown as it is. */
+export class ApplyRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApplyRefused";
+  }
+}
+
+/**
+ * Checks that need no change and must pass before the first one (I2): an install never downgrades a
+ * newer installation (that is a rollback, which snapshots first), and every present document has a
+ * migration path to this release's schema. Throws ApplyRefused naming the file and the fix.
+ */
+export async function applyPreflight(paths: FactoryPaths, manifest: ReleaseManifest, migrations: readonly Migration[], reason: ApplyReason): Promise<void> {
+  const unreadable = (e: MalformedJson): ApplyRefused =>
+    new ApplyRefused(`${e.path} is unreadable: ${stripPeriod(msg(e.cause))}. Nothing was changed.\n  fix: Fix or remove ${e.path} (a removed file is recreated by "factory install"), then retry.`);
+  if (reason === "install") {
+    let raw: unknown;
+    try {
+      raw = await readJson(paths.state);
+    } catch (e) {
+      if (e instanceof MalformedJson) throw unreadable(e);
+      throw e;
+    }
+    const installed = typeof raw === "object" && raw !== null ? (raw as { version?: unknown }).version : undefined;
+    if (typeof installed === "string" && /^\d+\.\d+\.\d+$/.test(installed) && compareSemver(installed, manifest.factory) > 0) {
+      throw new ApplyRefused(
+        `Installed factory ${installed} is newer than this release (${manifest.factory}). Nothing was changed.\n` +
+          `  fix: To go back to ${manifest.factory}, use "factory rollback ${manifest.factory}" (it snapshots your state first).`,
+      );
+    }
+  }
+  let schemas: Partial<Record<StateDoc, number>>;
+  try {
+    schemas = await docSchemas(paths);
+  } catch (e) {
+    if (e instanceof MalformedJson) throw unreadable(e);
+    throw e;
+  }
+  try {
+    planMigrations(schemas, migrations, manifest.stateSchemas);
+  } catch (e) {
+    if (!(e instanceof NoMigrationPath)) throw e;
+    const hint =
+      e.from > e.to
+        ? `It was written by a newer factory; use "factory rollback ${manifest.factory}" to return to this release.`
+        : `Install a factory release that can migrate it ("factory update").`;
+    throw new ApplyRefused(`${e.message} Nothing was changed.\n  fix: ${hint}`);
   }
 }
 
@@ -164,6 +216,8 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
     lock = await acquireLock(paths, { ownerPid: opts.parentLockPid });
     live();
     if (opts.reason === "install" && existsSync(paths.txn)) throw new InstallBlockedByTxn();
+    await applyPreflight(paths, manifest, deps.migrations, opts.reason);
+    live();
     await installGuard(root, paths);
     live();
     const piCli = await pi.ensurePinned(paths, manifest.pi.version, { env });
@@ -217,6 +271,10 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
 
   if (failure instanceof InstallBlockedByTxn) {
     io.err(`${TXN_PENDING_MESSAGE}${releaseNote}`);
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (failure instanceof ApplyRefused) {
+    io.err(`${failure.message}${releaseNote}`);
     throw new ApplyFailed(msg(failure), { cause: failure });
   }
   if (failure !== undefined && !committed) {
