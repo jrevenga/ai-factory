@@ -33,11 +33,18 @@
             "type": "string"
           },
           "reason": {
-            "type": "string",
-            "enum": [
-              "install",
-              "update",
-              "rollback"
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "install",
+                  "update",
+                  "rollback"
+                ]
+              },
+              {
+                "type": "string"
+              }
             ]
           }
         },

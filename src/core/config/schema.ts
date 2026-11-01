@@ -14,9 +14,19 @@ export const HARD_GATES = ["destructive", "remote-mutation", "secrets", "integra
 export const HardGateId = z.enum(HARD_GATES);
 export type HardGateId = z.infer<typeof HardGateId>;
 
-export const Autonomy = z.enum(["low", "medium", "high"]);
+export const AUTONOMY_LEVELS = ["low", "medium", "high"] as const;
+export const Autonomy = z.enum(AUTONOMY_LEVELS);
 export const Parallelism = z.int().min(1).max(16);
-const Budgets = z.partialRecord(z.enum(["claude", "codex"]), z.looseObject({ weeklyTokens: z.number().optional() }));
+export const BUDGET_PROVIDERS = ["claude", "codex"] as const;
+const Budget = z.looseObject({ weeklyTokens: z.number().optional() });
+const Budgets = z.partialRecord(z.enum(BUDGET_PROVIDERS), Budget);
+
+/**
+ * Ruling R13: a reader of a persisted document accepts values a newer release may add to an enum (the
+ * known values stay listed for editors), so a rollback never meets a document it cannot read; the
+ * effective-config resolution ignores unknown values and records a violation for each.
+ */
+const openEnum = <T extends readonly [string, ...string[]]>(values: T) => z.union([z.enum(values), z.string()]);
 
 /** Shipped defaults (`defaults/config.json`). */
 export const CoreConfig = z.looseObject({
@@ -41,17 +51,20 @@ export const CoreConfig = z.looseObject({
 });
 export type CoreConfig = z.infer<typeof CoreConfig>;
 
-/** `~/.factory/config.json`. Unknown fields are preserved. `gates.hard` is accepted so it can be reported as locked. */
+/**
+ * `~/.factory/config.json`. Unknown fields and unknown enum values (R13) are preserved. `gates.hard` is
+ * accepted so it can be reported as locked.
+ */
 export const PersonalConfig = z.looseObject({
   schema: z.literal(1),
   profile: z.string(),
-  autonomy: Autonomy.optional(),
+  autonomy: openEnum(AUTONOMY_LEVELS).optional(),
   parallelism: Parallelism.optional(),
   language: z.string().optional(),
   radar: z.boolean().optional(),
   maintainer: z.boolean().optional(),
-  gates: z.looseObject({ soften: z.array(SoftGateId).optional() }).optional(),
-  budgets: Budgets.optional(),
+  gates: z.looseObject({ soften: z.array(openEnum(SOFT_GATES)).optional() }).optional(),
+  budgets: z.record(z.string(), Budget).optional(),
   machine: z.record(z.string(), z.string()).optional(),
 });
 export type PersonalConfig = z.infer<typeof PersonalConfig>;

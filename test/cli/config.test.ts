@@ -62,6 +62,13 @@ describe("config explain", () => {
     expect(outs.join("\n")).toMatch(/violation: personal.*gates\.hard/);
   });
 
+  it("an autonomy value from a newer release is ignored with a violation; the core value applies (R13)", async () => {
+    personal({ autonomy: "autopilot" });
+    expect(await explain("autonomy")).toBe(0);
+    expect(outs[0]).toBe('autonomy = "medium"  (from core)');
+    expect(outs.join("\n")).toMatch(/violation: personal layer tried to set autonomy \(a value this release does not know\); ignored/);
+  });
+
   it("an unknown key exits 1", async () => {
     expect(await explain("nope.nothing")).toBe(1);
     expect(errs.join("")).toMatch(/Unknown setting/);

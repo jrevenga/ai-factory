@@ -1,4 +1,4 @@
-import type { CoreConfig, PersonalConfig, ProjectConfig, SoftGateId } from "./schema.ts";
+import { AUTONOMY_LEVELS, BUDGET_PROVIDERS, SOFT_GATES, type CoreConfig, type PersonalConfig, type ProjectConfig, type SoftGateId } from "./schema.ts";
 
 export type Source = "core" | "personal" | "project";
 export interface Provenance {
@@ -8,7 +8,8 @@ export interface Provenance {
 export interface ConfigViolation {
   key: string;
   source: "personal" | "project";
-  reason: "locked";
+  /** `locked`: the key cannot be set from this layer; `unknown`: a value this release does not know (R13). */
+  reason: "locked" | "unknown";
 }
 export type EffectiveConfig = CoreConfig & { profile?: string; machine?: Record<string, string> };
 export interface ResolvedConfig {
@@ -91,7 +92,24 @@ export function resolveConfig(layers: { core: CoreConfig; personal?: PersonalCon
     if (isRec(pg) && Object.hasOwn(pg, "hard")) violations.push({ key: "gates.hard", source: "personal", reason: "locked" });
     const picked: Rec = {};
     for (const k of KNOWN_PERSONAL) if (Object.hasOwn(personal, k) && personal[k] !== undefined) defineOwn(picked, k, personal[k]);
-    if (isRec(pg) && Object.hasOwn(pg, "soften") && pg.soften !== undefined) defineOwn(picked, "gates", { soften: pg.soften });
+    // R13: values a newer release added are ignored (the lower layer's value stays) and reported.
+    if (Object.hasOwn(picked, "autonomy") && !(AUTONOMY_LEVELS as readonly unknown[]).includes(picked.autonomy)) {
+      delete picked.autonomy;
+      violations.push({ key: "autonomy", source: "personal", reason: "unknown" });
+    }
+    if (isRec(picked.budgets)) {
+      const known: Rec = {};
+      for (const k of Object.keys(picked.budgets)) {
+        if ((BUDGET_PROVIDERS as readonly string[]).includes(k)) defineOwn(known, k, picked.budgets[k]);
+        else violations.push({ key: `budgets.${k}`, source: "personal", reason: "unknown" });
+      }
+      defineOwn(picked, "budgets", known);
+    }
+    if (isRec(pg) && Object.hasOwn(pg, "soften") && Array.isArray(pg.soften)) {
+      const known = pg.soften.filter((g) => (SOFT_GATES as readonly unknown[]).includes(g));
+      if (known.length !== pg.soften.length) violations.push({ key: "gates.soften", source: "personal", reason: "unknown" });
+      defineOwn(picked, "gates", { soften: known });
+    }
     for (const [path, v] of leaves(picked)) apply("personal", path, v);
   }
 

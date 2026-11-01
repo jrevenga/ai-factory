@@ -37,7 +37,7 @@ export async function configExplain(ctx: ConfigContext, key: string): Promise<nu
     }
     io.out(`${e.key} = ${JSON.stringify(e.value)}  (from ${e.source})`);
     for (const o of e.overridden) io.out(`overrides: ${o.source}=${JSON.stringify(o.value)}`);
-    for (const v of e.violations) io.out(`violation: ${v.source} layer tried to set ${v.key} (${v.reason}); ignored`);
+    for (const v of e.violations) io.out(`violation: ${v.source} layer tried to set ${v.key} (${v.reason === "unknown" ? "a value this release does not know" : v.reason}); ignored`);
     return 0;
   } catch (err) {
     io.err(`Could not read the configuration: ${(err as Error).message}`);

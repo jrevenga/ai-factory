@@ -17,8 +17,9 @@ describe("FactoryState", () => {
     expect(parsed).toMatchObject({ futureField: { a: 1 }, history: [{ note: "x" }] });
   });
 
-  it("rejects an unknown history reason and a different schema", () => {
-    expect(FactoryState.safeParse({ ...STATE, history: [{ version: "0.1.0", at: "x", reason: "reinstall" }] }).success).toBe(false);
+  it("accepts a history reason a newer release may add (R13) and rejects a non-string reason and a different schema", () => {
+    expect(FactoryState.safeParse({ ...STATE, history: [{ version: "0.1.0", at: "x", reason: "reinstall" }] }).success).toBe(true);
+    expect(FactoryState.safeParse({ ...STATE, history: [{ version: "0.1.0", at: "x", reason: 3 }] }).success).toBe(false);
     expect(FactoryState.safeParse({ ...STATE, schema: 2 }).success).toBe(false);
   });
 });
@@ -29,7 +30,9 @@ describe("SnapshotInfo and TxnRecord", () => {
       SnapshotInfo.parse({ id: "a", from: "0.1.0", to: "0.2.0", kind: "update", at: "t", files: ["state.json"] }).files,
     ).toEqual(["state.json"]);
     expect(TxnRecord.safeParse({ id: "a", kind: "rollback", from: "0.2.0", to: "0.1.0", snapshot: "a", startedAt: "t" }).success).toBe(true);
-    expect(TxnRecord.safeParse({ id: "a", kind: "install", from: "", to: "", snapshot: "a", startedAt: "t" }).success).toBe(false);
+    // R13: a kind a newer release may add is read (rollback recovers it like any journal).
+    expect(TxnRecord.safeParse({ id: "a", kind: "migrate", from: "", to: "", snapshot: "a", startedAt: "t" }).success).toBe(true);
+    expect(TxnRecord.safeParse({ id: "a", kind: 1, from: "", to: "", snapshot: "a", startedAt: "t" }).success).toBe(false);
   });
 });
 

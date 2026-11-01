@@ -140,6 +140,14 @@ describe("applyRelease happy path", () => {
     expect(await readLockHolder(paths)).toBeUndefined();
   });
 
+  it("keeps a history reason written by a newer release when it rewrites state.json (R13)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, PREVIOUS_STATE.replace('"reason":"install"', '"reason":"reinstall-from-backup"'));
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "rollback", from: "0.2.0" });
+    const history = readJsonFile(paths.state).history as Array<Record<string, unknown>>;
+    expect(history.map((h) => h.reason)).toEqual(["reinstall-from-backup", "rollback"]);
+  });
+
   it("a second apply keeps the first installedAt and appends history", async () => {
     await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" });
     const later = { ...ctx(new FakePi(), { claude: "absent", codex: "present" }), now: () => new Date("2026-11-05T08:00:00.000Z") };

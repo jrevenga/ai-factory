@@ -273,6 +273,20 @@ describe("factory rollback (recovery mode)", () => {
     expect(existsSync(w.paths.txn)).toBe(false);
   });
 
+  it("a journal of a kind this release does not know is recovered like any other (R13)", async () => {
+    await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
+    const before = await writeConfig({ schema: 1, profile: "codex-only" });
+    const snap = await createSnapshot(w.paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: at("2026-10-31") });
+    await writeFile(w.paths.txn, JSON.stringify({ id: snap.id, kind: "migrate", from: "0.1.0", to: "0.2.0", snapshot: snap.id, startedAt: "2026-10-31T00:00:00.000Z" }));
+    await writeConfig({ schema: 1, profile: "claude-only", halfApplied: true });
+    w.releases = { "v0.1.0": {} };
+    w.onApply = (args, world) => realisticApply(args, world, { clear: false });
+    expect(await rollback(w.ctx(), { yes: true }), w.err.join("\n")).toBe(0);
+    expect(w.out.join("\n")).toContain("Recovering the unfinished migrate 0.1.0 → 0.2.0");
+    expect(readFileSync(w.paths.config, "utf8")).toBe(before);
+    expect(existsSync(w.paths.txn)).toBe(false);
+  });
+
   it("a failed recovery keeps the journal and the recovery snapshot, so it can be retried", async () => {
     await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
     await writeConfig({ schema: 1, profile: "codex-only" });
