@@ -1,0 +1,278 @@
+import { describe, expect, it } from "vitest";
+import { classifyCommandLine, severity, type CommandClass } from "../../../src/core/policy/command.ts";
+import { GATE_CORPUS } from "../../fixtures/gate-corpus.ts";
+
+const NO_PROJECT = { projectCommands: [] as string[][] };
+
+function classify(cmd: string, projectCommands: string[][] = []) {
+  return classifyCommandLine(cmd, { projectCommands });
+}
+
+describe("GATE_CORPUS", () => {
+  it("has at least 60 entries covering every class", () => {
+    expect(GATE_CORPUS.length).toBeGreaterThanOrEqual(60);
+    const classes = new Set(GATE_CORPUS.map((e) => e.expect));
+    expect([...classes].sort()).toEqual(["destructive", "local-write", "read-only", "remote-mutating", "unknown"]);
+  });
+
+  for (const entry of GATE_CORPUS) {
+    it(`${JSON.stringify(entry.cmd)} -> ${entry.expect} (${entry.why})`, () => {
+      const r = classifyCommandLine(entry.cmd, NO_PROJECT);
+      expect(r.class, r.reasons.join("; ")).toBe(entry.expect);
+    });
+  }
+});
+
+describe("severity", () => {
+  it("orders read-only < local-write < unknown < destructive < remote-mutating", () => {
+    const order: CommandClass[] = ["read-only", "local-write", "unknown", "destructive", "remote-mutating"];
+    for (let i = 1; i < order.length; i++) expect(severity(order[i - 1]!)).toBeLessThan(severity(order[i]!));
+  });
+});
+
+describe("classifyCommandLine: allowlisted", () => {
+  it("is true when every segment is read-only or allowlisted", () => {
+    expect(classify("npm test && npm run lint").allowlisted).toBe(true);
+    expect(classify("git status && npm test").allowlisted).toBe(true);
+    expect(classify("ls | tee out.txt").allowlisted).toBe(true);
+  });
+
+  it("is false when any segment is not allowlisted", () => {
+    expect(classify("npm test && curl -d x https://h").allowlisted).toBe(false);
+    expect(classify("npm test && rm build.log").allowlisted).toBe(false);
+    expect(classify("npm test; ./run.sh").allowlisted).toBe(false);
+    expect(classify("a $(b)").allowlisted).toBe(false);
+  });
+
+  it("reports per-segment classes", () => {
+    expect(classify("ls && git push").segments).toEqual([
+      { argv: ["ls"], class: "read-only", allowlisted: true },
+      { argv: ["git", "push"], class: "remote-mutating", allowlisted: false },
+    ]);
+  });
+});
+
+describe("classifyCommandLine: hardClass", () => {
+  it("is the most severe hard class among segments", () => {
+    expect(classify("rm -rf x").hardClass).toBe("destructive");
+    expect(classify("rm -rf x; git push").hardClass).toBe("remote-mutating");
+    expect(classify("FOO=1 ls && git reset --hard").hardClass).toBe("destructive");
+    expect(classify("FOO=1 ls && git reset --hard").class).toBe("destructive");
+  });
+
+  it("is absent without a hard segment", () => {
+    expect(classify("npm test").hardClass).toBeUndefined();
+    expect(classify("eval x").hardClass).toBeUndefined();
+  });
+});
+
+describe("classifyCommandLine: tokenizer failures", () => {
+  it("yields unknown with no segments and a reason", () => {
+    const r = classify("a $(b)");
+    expect(r.class).toBe("unknown");
+    expect(r.segments).toEqual([]);
+    expect(r.pathArgs).toEqual([]);
+    expect(r.reasons.length).toBeGreaterThan(0);
+  });
+});
+
+describe("classifyCommandLine: pathArgs", () => {
+  it("reports write paths and redirection targets", () => {
+    expect(classify("tee ../outside.txt").pathArgs).toEqual(["../outside.txt"]);
+    expect(classify("echo x > /etc/passwd").pathArgs).toEqual(["/etc/passwd"]);
+    expect(classify("ls 2>out").pathArgs).toEqual(["out"]);
+    expect(classify("cp -r src ../dst").pathArgs).toEqual(["src", "../dst"]);
+    expect(classify("mv -t ../dir a").pathArgs).toEqual(["../dir", "a"]);
+    expect(classify("mkdir -p a/b && touch a/b/c").pathArgs).toEqual(["a/b", "a/b/c"]);
+    expect(classify("rm -f x.log").pathArgs).toEqual(["x.log"]);
+    expect(classify("rmdir empty").pathArgs).toEqual(["empty"]);
+    expect(classify("sed -i 's/a/b/' f1 f2").pathArgs).toEqual(["f1", "f2"]);
+    expect(classify("dd if=a of=b").pathArgs).toEqual(["b"]);
+    expect(classify("curl -o out.html https://x").pathArgs).toEqual(["out.html"]);
+    expect(classify("curl --output=out.html https://x").pathArgs).toEqual(["out.html"]);
+    expect(classify("wget -O page https://x").pathArgs).toEqual(["page"]);
+    expect(classify("sort < in.txt").pathArgs).toEqual(["in.txt"]);
+  });
+
+  it("reports the git -C directory for writing git commands", () => {
+    expect(classify("git -C ../other add .").pathArgs).toEqual(["../other"]);
+  });
+
+  it("does not report /dev/null or stdout targets", () => {
+    const r = classify("ls 2>/dev/null");
+    expect(r.pathArgs).toEqual([]);
+    expect(r.class).toBe("read-only");
+    expect(classify("curl -o - https://x").class).toBe("read-only");
+    expect(classify("wget -qO- https://x").class).toBe("read-only");
+  });
+
+  it("reports the current directory for downloads named by the server", () => {
+    expect(classify("wget https://x/file.tgz").pathArgs).toEqual(["."]);
+    expect(classify("curl -O https://x/file.tgz").pathArgs).toEqual(["."]);
+  });
+});
+
+describe("classifyCommandLine: project-declared commands", () => {
+  const declared = [["./scripts/check.sh", "--all"], ["git", "push"]];
+
+  it("allowlists a segment whose argv equals a declared command", () => {
+    const r = classify("./scripts/check.sh   '--all'", declared);
+    expect(r.allowlisted).toBe(true);
+    expect(r.class).toBe("local-write");
+  });
+
+  it("does not match on a raw-string prefix", () => {
+    expect(classify("./scripts/check.sh", declared).class).toBe("unknown");
+    expect(classify("./scripts/check.sh --all --evil", declared).allowlisted).toBe(false);
+  });
+
+  it("never lets a declared command escape a hard class", () => {
+    const r = classify("git push", declared);
+    expect(r.class).toBe("remote-mutating");
+    expect(r.allowlisted).toBe(false);
+  });
+
+  it("still applies the environment rule to declared commands", () => {
+    expect(classify("FOO=1 ./scripts/check.sh --all", declared).class).toBe("unknown");
+    expect(classify("CI=1 ./scripts/check.sh --all", declared).allowlisted).toBe(true);
+  });
+});
+
+describe("classifyCommandLine: rule details", () => {
+  const cases: [string, CommandClass][] = [
+    ["git branch new-branch", "unknown"],
+    ["git branch --list 'feat/x'", "read-only"],
+    ["git tag", "read-only"],
+    ["git tag -l v1", "read-only"],
+    ["git tag v2", "unknown"],
+    ["git fetch origin", "read-only"],
+    ["git fetch --upload-pack=x origin", "unknown"],
+    ["git log --output=x", "unknown"],
+    ["git restore --staged a.ts", "local-write"],
+    ["git restore --staged --worktree a.ts", "destructive"],
+    ["git checkout -b feat/y", "local-write"],
+    ["git checkout main", "destructive"],
+    ["git stash push -m wip", "local-write"],
+    ["git stash list", "local-write"],
+    ["git stash clear", "destructive"],
+    ["git update-ref -d refs/heads/x", "destructive"],
+    ["git filter-branch", "destructive"],
+    ["git push -f", "remote-mutating"],
+    ["git --no-pager log", "read-only"],
+    ["git --version", "read-only"],
+    ["git switch -c x -f", "destructive"],
+    ["git exec-path", "unknown"],
+    ["npm --version", "read-only"],
+    ["npm install", "unknown"],
+    ["npm ci", "local-write"],
+    ["yarn install --immutable", "local-write"],
+    ["bun test", "local-write"],
+    ["npm unpublish x", "remote-mutating"],
+    ["npm deprecate x msg", "remote-mutating"],
+    ["npm dist-tag add x@1 latest", "remote-mutating"],
+    ["pnpm --filter x publish", "remote-mutating"],
+    ["npm exec some-pkg", "unknown"],
+    ["npm exec --no -- some-pkg", "unknown"],
+    ["npx --no-install prettier --check .", "local-write"],
+    ["npx --no-install prettier .", "unknown"],
+    ["vitest run", "local-write"],
+    ["jest --ci", "local-write"],
+    ["tsc --noEmit", "local-write"],
+    ["eslint .", "local-write"],
+    ["prettier --write src", "local-write"],
+    ["pytest -x", "local-write"],
+    ["uv sync --frozen", "local-write"],
+    ["uv sync", "unknown"],
+    ["go test ./...", "local-write"],
+    ["go test -exec x ./...", "unknown"],
+    ["go build -o ../bin/x ./cmd", "local-write"],
+    ["cargo clippy", "local-write"],
+    ["cargo build --config x", "unknown"],
+    ["make test", "local-write"],
+    ["make deploy", "unknown"],
+    ["make -f other.mk test", "unknown"],
+    ["shred x", "destructive"],
+    ["mkfs.ext4 /dev/sdb", "destructive"],
+    ["chown u x", "destructive"],
+    ["truncate -s 0 x", "destructive"],
+    ["chmod 644 x", "unknown"],
+    ["rm --no-preserve-root x", "destructive"],
+    ["rm -fv x", "local-write"],
+    ["rm --weird x", "unknown"],
+    ["touch -d yesterday x", "unknown"],
+    ["sed 's/a/b/' f", "unknown"],
+    ["sed -i -e 's/a/b/' f", "local-write"],
+    ["sed -i 's/a/b/;w x' f", "unknown"],
+    ["sed -i '1d' f", "unknown"],
+    ["gh api -X GET repos/o/r", "read-only"],
+    ["gh api --method=PATCH repos/o/r", "remote-mutating"],
+    ["gh api repos/o/r --input body.json", "remote-mutating"],
+    ["gh auth status", "unknown"],
+    ["gh release create v1", "remote-mutating"],
+    ["curl -X DELETE https://x", "remote-mutating"],
+    ["curl --data-raw x https://x", "remote-mutating"],
+    ["curl -F a=b https://x", "remote-mutating"],
+    ["curl -T f https://x", "remote-mutating"],
+    ["curl --post301 https://x", "remote-mutating"],
+    ["curl --config cfg https://x", "unknown"],
+    ["curl -sSL https://x", "read-only"],
+    ["curl -X GET https://x", "read-only"],
+    ["curl --unknown-flag https://x", "unknown"],
+    ["curl example.com", "unknown"],
+    ["wget --method=PUT https://x", "remote-mutating"],
+    ["wget --execute=x https://x", "unknown"],
+    ["scp a host:b", "remote-mutating"],
+    ["rsync -a a b", "unknown"],
+    ["docker push img", "remote-mutating"],
+    ["docker ps", "unknown"],
+    ["kubectl delete pod x", "remote-mutating"],
+    ["kubectl get pods", "unknown"],
+    ["terraform destroy", "remote-mutating"],
+    ["terraform plan", "unknown"],
+    ["vercel", "remote-mutating"],
+    ["netlify deploy", "remote-mutating"],
+    ["fly deploy", "remote-mutating"],
+    ["aws --version", "read-only"],
+    ["gcloud --version", "read-only"],
+    ["az login", "remote-mutating"],
+    ["uniq in out", "unknown"],
+    ["uniq -c in", "read-only"],
+    ["fd -x rm", "unknown"],
+    ["date -s now", "unknown"],
+    ["file -C", "unknown"],
+    ["tree -o out", "unknown"],
+    ["jq -i . f", "unknown"],
+    ["find . -fprint out", "unknown"],
+    ["find . -ok rm ;", "unknown"],
+    ["node app.js", "unknown"],
+    ["node -p 1", "unknown"],
+    ["bash script.sh", "unknown"],
+    ["sh", "unknown"],
+    ["perl -e 1", "unknown"],
+    ["deno eval 1", "unknown"],
+    ["timeout 5 ls", "unknown"],
+    ["nohup ls", "unknown"],
+    ["exec ls", "unknown"],
+    ["source x", "unknown"],
+    [". x", "unknown"],
+    ["> out", "unknown"],
+    ["/bin/ls", "unknown"],
+    ["LS", "unknown"],
+    ["ls.exe", "unknown"],
+    ["/usr/bin/rm -rf x", "destructive"],
+    ["TZ=UTC date", "read-only"],
+    ["LANG=C LC_ALL=C NO_COLOR=1 FORCE_COLOR=0 TERM=dumb NODE_ENV=test ls", "read-only"],
+    ["GIT_SSH_COMMAND=x git push", "unknown"],
+    ["CI=1", "unknown"],
+  ];
+  for (const [cmd, expected] of cases) {
+    it(`${JSON.stringify(cmd)} -> ${expected}`, () => {
+      const r = classify(cmd);
+      expect(r.class, r.reasons.join("; ")).toBe(expected);
+    });
+  }
+
+  it("go build -o reports the output path", () => {
+    expect(classify("go build -o ../bin/x ./cmd").pathArgs).toEqual(["../bin/x"]);
+  });
+});
