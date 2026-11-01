@@ -264,6 +264,57 @@ describe("personal config", () => {
   });
 });
 
+describe("profile proposal (R15)", () => {
+  function tty(answer: boolean, asked: string[]): CliIO {
+    return {
+      out: (s) => void out.push(s),
+      err: (s) => void err.push(s),
+      confirm: async (q) => {
+        asked.push(q);
+        return answer;
+      },
+      isTTY: true,
+    };
+  }
+
+  it("on a terminal it shows the proposed profile and writes it once confirmed", async () => {
+    const asked: string[] = [];
+    const c = { ...ctx(new FakePi(), { claude: "absent", codex: "present" }), io: tty(true, asked) };
+    await applyRelease(c, { reason: "install" });
+    expect(out.join("\n")).toContain("Proposed profile: codex-only (logins: claude absent, codex present)");
+    expect(asked).toEqual(['Use profile "codex-only"?']);
+    expect(readJsonFile(paths.config)).toEqual({ schema: 1, profile: "codex-only" });
+  });
+
+  it("declining stops before config.json and state.json are written and names --profile", async () => {
+    const asked: string[] = [];
+    const c = { ...ctx(new FakePi(), { claude: "present", codex: "present" }), io: tty(false, asked) };
+    const e = await applyRelease(c, { reason: "install" }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(Error);
+    expect(asked).toEqual(['Use profile "claude-codex"?']);
+    expect(err.join("\n")).toMatch(/no profile was chosen.*factory install --profile <name>.*claude-codex, codex-only/);
+    expect(existsSync(paths.config)).toBe(false);
+    expect(existsSync(paths.state)).toBe(false);
+  });
+
+  it.each([
+    [{ yes: true }, "codex-only"],
+    [{ profile: "claude-codex" }, "claude-codex"],
+  ] as const)("on a terminal %j skips the question", async (extra, profile) => {
+    const asked: string[] = [];
+    const c = { ...ctx(new FakePi(), { claude: "absent", codex: "present" }), io: tty(false, asked) };
+    await applyRelease(c, { reason: "install", ...extra });
+    expect(asked).toEqual([]);
+    expect(readJsonFile(paths.config).profile).toBe(profile);
+  });
+
+  it("without a terminal the proposal is shown and applied", async () => {
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" });
+    expect(out.join("\n")).toContain("Proposed profile: codex-only");
+    expect(readJsonFile(paths.config).profile).toBe("codex-only");
+  });
+});
+
 describe("failure handling", () => {
   it("apply failure leaves previous state.json", async () => {
     await mkdir(paths.home, { recursive: true });

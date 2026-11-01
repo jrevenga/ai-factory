@@ -49,8 +49,28 @@ Commands:
 const LATER_PHASE = new Set(["runs", "eval", "radar"]);
 const COMMANDS = new Set(["version", "doctor", "install", "_apply-release", "update", "rollback", "init", "config"]);
 
+/**
+ * Runs one CLI invocation. An error that escapes a command's own handling (a corrupt release.json, an
+ * unexpected filesystem error) is printed as one line and exits 1; FACTORY_DEBUG=1 adds the stack.
+ */
 export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
+  try {
+    return await run(argv, io, deps, env);
+  } catch (e) {
+    io.err(unexpectedError(e, env));
+    return 1;
+  }
+}
+
+/** One line for an unexpected error; the stack only when FACTORY_DEBUG=1. Shared with bin/factory.mjs's wording. */
+export function unexpectedError(e: unknown, env: NodeJS.ProcessEnv): string {
+  const message = (e instanceof Error ? e.message : String(e)).replace(/\s*\n\s*/g, " ");
+  if (env.FACTORY_DEBUG === "1") return `factory: ${message}\n${e instanceof Error ? (e.stack ?? "") : ""}`;
+  return `factory: ${message} (set FACTORY_DEBUG=1 for details)`;
+}
+
+async function run(argv: string[], io: CliIO, deps: MainDeps, env: NodeJS.ProcessEnv): Promise<number> {
   const root = deps.root ?? fileURLToPath(new URL("../../", import.meta.url));
   const [cmd, ...rest] = argv;
   const usage = (problem: string): number => {
@@ -102,7 +122,7 @@ export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDe
       if (!Number.isSafeInteger(parentLockPid) || parentLockPid <= 0) return usage(`--parent-lock must be a process id, got ${flags["parent-lock"]}`);
     }
     try {
-      await applyRelease(ctx, { reason: flags.reason as ApplyReason, from: flags.from, parentLockPid, profile: flags.profile });
+      await applyRelease(ctx, { reason: flags.reason as ApplyReason, from: flags.from, parentLockPid, profile: flags.profile, yes: flags.yes === true });
       return 0;
     } catch (e) {
       if (!(e instanceof ApplyFailed)) io.err(`Install did not complete: ${(e as Error).message}`);

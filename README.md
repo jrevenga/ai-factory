@@ -31,7 +31,7 @@ npm install -g --legacy-peer-deps git+https://github.com/jrevenga/ai-factory.git
 factory install
 ```
 
-`factory install [--yes] [--profile <name>]` checks the requirements, installs the pinned Pi, the factory Pi package and, when Claude is available, `pi-claude-bridge`, writes the managed Pi settings and a guard extension, creates `~/.factory/config.json` from a profile (`claude-codex` or `codex-only`, proposed from your logins) and runs `factory doctor`.
+`factory install [--yes] [--profile <name>]` checks the requirements, installs the pinned Pi, the factory Pi package and, when Claude is available, `pi-claude-bridge`, writes the managed Pi settings and a guard extension, creates `~/.factory/config.json` from a profile (`claude-codex` or `codex-only`, proposed from your logins) and runs `factory doctor`. In a terminal it shows the proposed profile and asks before using it, unless you pass `--yes` or choose one with `--profile`. It refuses to replace an installed factory that is newer than the release it installs; use `factory rollback <version>` for that.
 
 ## Usage
 

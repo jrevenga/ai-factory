@@ -132,6 +132,8 @@ export async function makeWorld(prefix: string): Promise<World> {
           if (w.npmFails) return { code: 1, stdout: "", stderr: "npm ERR! could not clone", timedOut: false, orphans: false };
           const spec = args[args.length - 1] ?? "";
           w.installed = spec.slice(spec.lastIndexOf("#v") + 2);
+          // What npm leaves in the global root: the installed release's own release.json.
+          await writeFile(join(globalRoot, "ai-factory", "release.json"), JSON.stringify(manifestFor(w.installed), null, 2));
           return ok();
         },
         runNode: async (args) => {

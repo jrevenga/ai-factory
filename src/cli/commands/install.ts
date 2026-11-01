@@ -15,8 +15,8 @@ export interface InstallDeps {
   /** Real path of this CLI's entry file. */
   cliPath: string;
   npm: typeof npm;
-  /** Runs `node <args>` with the terminal's output and resolves to its exit code. */
-  runNode: (args: string[], env: NodeJS.ProcessEnv) => Promise<number>;
+  /** Runs `node <args>` with the terminal's output and resolves to its exit code; `interactive` also passes the terminal's stdin. */
+  runNode: (args: string[], env: NodeJS.ProcessEnv, opts?: { interactive?: boolean }) => Promise<number>;
   requirements: typeof requirementChecks;
 }
 
@@ -37,10 +37,13 @@ function ownCliPath(): string {
   return realpathSync(fileURLToPath(new URL("../../../bin/factory.mjs", import.meta.url)));
 }
 
-/** `node <args>` with stdin closed and output going straight to the terminal (no shell). */
-export function runNodeInherited(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
+/**
+ * `node <args>` with output going straight to the terminal (no shell). stdin is closed unless
+ * `interactive`, which hands the terminal to a factory CLI that has a question to ask (never to Pi).
+ */
+export function runNodeInherited(args: string[], env: NodeJS.ProcessEnv, opts: { interactive?: boolean } = {}): Promise<number> {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, { env, stdio: ["ignore", "inherit", "inherit"], windowsHide: true });
+    const child = spawn(process.execPath, args, { env, stdio: [opts.interactive === true ? "inherit" : "ignore", "inherit", "inherit"], windowsHide: true });
     child.once("error", reject);
     child.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
   });
@@ -79,7 +82,7 @@ export async function install(ctx: ApplyContext, opts: InstallOptions, overrides
   if (isNpxPath(deps.cliPath)) return bootstrap(ctx, opts, deps);
 
   try {
-    await applyRelease(ctx, { reason: "install", profile: opts.profile });
+    await applyRelease(ctx, { reason: "install", profile: opts.profile, yes: opts.yes });
     return 0;
   } catch (e) {
     if (!(e instanceof ApplyFailed)) io.err(`Install did not complete: ${msg(e)}`);
@@ -129,8 +132,10 @@ async function bootstrap(ctx: ApplyContext, opts: InstallOptions, deps: InstallD
     return 1;
   }
   const args = [globalCli, "install", ...(opts.yes ? ["--yes"] : []), ...(opts.profile === undefined ? [] : ["--profile", opts.profile])];
+  // R15: the global CLI may have to confirm the proposed profile, so it gets the terminal when one is there.
+  const interactive = io.isTTY && !opts.yes && opts.profile === undefined;
   try {
-    return await deps.runNode(args, env);
+    return await deps.runNode(args, env, { interactive });
   } catch (e) {
     io.err(`Could not start the globally installed factory CLI ${globalCli}: ${msg(e)}`);
     return 1;

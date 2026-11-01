@@ -7,6 +7,7 @@ import {
   packageRef,
   ReleaseManifest,
   effectiveSource,
+  sourceOverride,
   tagFor,
 } from "../../../src/core/release/manifest.ts";
 
@@ -24,5 +25,13 @@ describe("release manifest", () => {
     expect(effectiveSource(m, env)).toBe(env.FACTORY_SOURCE);
     expect(packageRef(m, env)).toBe(`git:${env.FACTORY_SOURCE}@v0.1.0`);
     expect(npmInstallSpec(m, env)).toBe(`git+${env.FACTORY_SOURCE}#v0.1.0`);
+  });
+  it("an empty FACTORY_SOURCE counts as unset", () => {
+    const env = { FACTORY_SOURCE: "" };
+    expect(effectiveSource(m, env)).toBe("https://github.com/jrevenga/ai-factory.git");
+    expect(packageRef(m, env)).toBe("git:https://github.com/jrevenga/ai-factory.git@v0.1.0");
+    expect(npmInstallSpec(m, env)).toBe("git+https://github.com/jrevenga/ai-factory.git#v0.1.0");
+    expect(sourceOverride(env)).toBeUndefined();
+    expect(sourceOverride({ FACTORY_SOURCE: "http://127.0.0.1:9/x.git" })).toBe("http://127.0.0.1:9/x.git");
   });
 });

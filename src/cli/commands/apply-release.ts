@@ -59,6 +59,8 @@ export interface ApplyOptions {
   parentLockPid?: number;
   /** Profile for a newly created personal config. */
   profile?: string;
+  /** Accept the proposed profile without asking (R15). */
+  yes?: boolean;
 }
 
 /** Ruling R8: an install never runs over (or clears) the journal of an unfinished update or rollback. */
@@ -157,26 +159,35 @@ function loginInstructions(logins: { claude: LoginState; codex: LoginState }, pi
   );
 }
 
-/** Creates `config.json` when it does not exist; an existing file is never touched. */
+/**
+ * Creates `config.json` when it does not exist; an existing file is never touched. Without `--profile`
+ * the proposed profile is shown and, on a terminal without `--yes`, confirmed first (R15).
+ */
 async function ensurePersonalConfig(
   paths: FactoryPaths,
   root: string,
-  requested: string | undefined,
+  io: CliIO,
+  opts: { requested: string | undefined; yes: boolean },
   logins: { claude: LoginState; codex: LoginState },
   piCli: string,
 ): Promise<void> {
   if (existsSync(paths.config)) return;
   const profiles = await loadProfiles(join(root, "profiles"));
+  const available = profiles.map((p) => p.name).join(", ");
   let name: string;
-  if (requested !== undefined) {
-    if (!profiles.some((p) => p.name === requested)) {
-      throw new Error(`Unknown profile "${requested}". Available profiles: ${profiles.map((p) => p.name).join(", ")}`);
+  if (opts.requested !== undefined) {
+    if (!profiles.some((p) => p.name === opts.requested)) {
+      throw new Error(`Unknown profile "${opts.requested}". Available profiles: ${available}`);
     }
-    name = requested;
+    name = opts.requested;
   } else {
     const proposed = proposeProfile(logins, profiles);
     if (!proposed) throw new Error(loginInstructions(logins, piCli));
     name = proposed.name;
+    io.out(`Proposed profile: ${name} (logins: claude ${logins.claude}, codex ${logins.codex}).`);
+    if (!opts.yes && io.isTTY && !(await io.confirm(`Use profile "${name}"?`))) {
+      throw new Error(`no profile was chosen. Run "factory install --profile <name>" with one of: ${available}`);
+    }
   }
   await writePersonalConfig(paths, { schema: 1, profile: name });
 }
@@ -232,7 +243,7 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
     live();
     await applyManagedPiSettings(paths, manifest.factory);
     live();
-    await ensurePersonalConfig(paths, root, opts.profile, logins, piCli);
+    await ensurePersonalConfig(paths, root, io, { requested: opts.profile, yes: opts.yes === true }, logins, piCli);
     live();
     const migratedState = await migrate(paths, manifest, deps.migrations);
     const previous = migratedState === undefined ? await readState(paths) : FactoryState.parse(migratedState);

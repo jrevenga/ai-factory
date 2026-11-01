@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { acquireLock, Locked } from "../../src/adapters/store/lock.ts";
 import { registerSession } from "../../src/adapters/store/sessions.ts";
@@ -198,6 +199,51 @@ describe("factory update", () => {
     expect(existsSync(w.paths.backups)).toBe(false);
     expect(existsSync(w.paths.txn)).toBe(false);
     expect(w.log.some((l) => l.startsWith("npm ") || l.startsWith("node "))).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a temp checkout that cannot be removed is a warning, not a failed update",
+    async () => {
+      let stuck: string | undefined;
+      const base = w.ctx();
+      const ctx = w.ctx({
+        cloneTag: async (url, tag, dest, opts) => {
+          await base.deps!.cloneTag!(url, tag, dest, opts);
+          stuck = join(dest, "locked");
+          await mkdir(stuck);
+          await writeFile(join(stuck, "file"), "x");
+          await chmod(stuck, 0o555);
+        },
+      });
+      try {
+        expect(await update(ctx, { yes: true }), w.err.join("\n")).toBe(0);
+        expect(JSON.parse(readFileSync(w.paths.state, "utf8")).version).toBe("0.2.0");
+        expect(w.err.join("\n")).toMatch(/warning: could not remove the temporary checkout/);
+      } finally {
+        if (stuck !== undefined) {
+          await chmod(stuck, 0o755);
+          await rm(join(stuck, "..", ".."), { recursive: true, force: true });
+        }
+      }
+    },
+  );
+
+  it("npm leaving a different version at the global root → exit 1 before the hand-over, with the rollback instruction", async () => {
+    const base = w.ctx();
+    const ctx = w.ctx({
+      npm: async (args, opts) => {
+        const r = await base.deps!.npm!(args, opts);
+        // A stale or concurrent global install: the CLI at the global root is still 0.1.0.
+        if (args[0] === "install") await writeFile(join(w.globalCli, "..", "..", "release.json"), JSON.stringify({ factory: "0.1.0" }));
+        return r;
+      },
+    });
+    expect(await update(ctx, { yes: true })).toBe(1);
+    const text = w.err.join("\n");
+    expect(text).toMatch(/holds factory 0\.1\.0, not 0\.2\.0/);
+    expect(text).toMatch(/Update failed\. Your previous state is in snapshot \S+\. Run "factory rollback"\./);
+    expect(w.log.some((l) => l.startsWith("node "))).toBe(false);
+    expect(existsSync(w.paths.txn)).toBe(true);
   });
 
   it("a failing child apply → exit with its code and the recovery message; journal kept", async () => {

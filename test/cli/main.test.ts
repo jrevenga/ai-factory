@@ -92,6 +92,36 @@ describe("main _apply-release", () => {
     }
   });
 
+  it.each([
+    [["install"], 1],
+    [["install", "--yes"], 0],
+    [["_apply-release", "--reason", "install"], 1],
+    [["_apply-release", "--reason", "install", "--yes"], 0],
+  ] as const)("%j on a terminal asks about the proposed profile unless --yes (R15)", async (argv, questions) => {
+    const t = await makeTmp("main-profile");
+    const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "http://127.0.0.1:1/x/ai-factory.git", PI_OFFLINE: "1" };
+    const pi = new (class extends PiRuntime {
+      override async ensurePinned(): Promise<string> {
+        return "/fake/cli.js";
+      }
+      override async installPackage(): Promise<void> {}
+    })();
+    try {
+      const asked: string[] = [];
+      const c = capture();
+      const io: CliIO = { ...c.io, isTTY: true, confirm: async (q) => (asked.push(q), true) };
+      const code = await main([...argv], io, {
+        env,
+        pi,
+        applyDeps: { detectLogins: async () => ({ claude: "absent", codex: "present" }), runDoctor: async () => [] },
+      });
+      expect(code, c.err.join("\n")).toBe(0);
+      expect(asked).toHaveLength(questions);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
   it("--reason install refuses while txn.json exists and keeps it (ruling R8)", async () => {
     const t = await makeTmp("main-apply-txn");
     const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "http://127.0.0.1:1/x/ai-factory.git", PI_OFFLINE: "1" };
@@ -149,6 +179,39 @@ describe("main update/rollback", () => {
       expect(w.log.at(-1)).toMatch(/_apply-release --reason rollback --from 0\.2\.0 --parent-lock \d+ --yes$/);
     } finally {
       await w.cleanup();
+    }
+  });
+});
+
+describe("unexpected errors (top-level catch)", () => {
+  async function brokenRoot(): Promise<{ root: string; cleanup: () => Promise<void> }> {
+    const t = await makeTmp("main-broken");
+    writeFileSync(`${t.dir}/release.json`, "{ not json");
+    return { root: t.dir, cleanup: t.cleanup };
+  }
+
+  it("an error outside a command's own handling prints one line and exits 1, without a stack", async () => {
+    const b = await brokenRoot();
+    try {
+      const c = capture();
+      expect(await main(["version"], c.io, { root: b.root, env: {} })).toBe(1);
+      expect(c.err).toHaveLength(1);
+      expect(c.err[0]).toMatch(/^factory: .*JSON/);
+      expect(c.err[0]).not.toContain("\n");
+      expect(c.err[0]).toContain("FACTORY_DEBUG=1");
+    } finally {
+      await b.cleanup();
+    }
+  });
+
+  it("FACTORY_DEBUG=1 adds the stack", async () => {
+    const b = await brokenRoot();
+    try {
+      const c = capture();
+      expect(await main(["version"], c.io, { root: b.root, env: { FACTORY_DEBUG: "1" } })).toBe(1);
+      expect(c.err.join("\n")).toMatch(/\n\s+at /);
+    } finally {
+      await b.cleanup();
     }
   });
 });

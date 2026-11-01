@@ -27,8 +27,14 @@ export type ReleaseManifest = z.infer<typeof ReleaseManifest>;
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
+/** The `FACTORY_SOURCE` override, or undefined when unset or empty (an empty value counts as unset, as for FACTORY_HOME). */
+export function sourceOverride(env: Env): string | undefined {
+  const v = env.FACTORY_SOURCE;
+  return v === undefined || v === "" ? undefined : v;
+}
+
 export function effectiveSource(m: ReleaseManifest, env: Env): string {
-  return env.FACTORY_SOURCE ?? m.source.git;
+  return sourceOverride(env) ?? m.source.git;
 }
 
 export function tagFor(version: string): string {

@@ -17,7 +17,7 @@ import { runBounded } from "../../adapters/platform/process.ts";
 import { detectLogins } from "../../adapters/providers/logins.ts";
 import { checkReachability, type Provider } from "../../adapters/providers/reachability.ts";
 import { CoreConfig } from "../../core/config/schema.ts";
-import { effectiveSource, packageRef, type ReleaseManifest } from "../../core/release/manifest.ts";
+import { effectiveSource, packageRef, sourceOverride, type ReleaseManifest } from "../../core/release/manifest.ts";
 import { compareSemver } from "../../core/release/semver.ts";
 import { DESIRED_PI_SETTINGS, ManagedRecord, planManagedSettings } from "../../core/settings/managed.ts";
 
@@ -215,11 +215,12 @@ export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
     const same = readFileSync(installed).equals(readFileSync(join(root, "guard", GUARD_FILE_NAME)));
     return same ? { status: "ok", message: "guard extension matches the shipped file" } : { status: "fail", message: `${installed} differs from the shipped guard`, fix: "factory install" };
   });
-  await add("source-override", () =>
-    env.FACTORY_SOURCE
-      ? { status: "warn", message: `FACTORY_SOURCE overrides the package source: ${env.FACTORY_SOURCE}` }
-      : { status: "ok", message: "using the release's package source" },
-  );
+  await add("source-override", () => {
+    const override = sourceOverride(env);
+    return override !== undefined
+      ? { status: "warn", message: `FACTORY_SOURCE overrides the package source: ${override}` }
+      : { status: "ok", message: "using the release's package source" };
+  });
 
   let personal: Awaited<ReturnType<typeof readPersonalConfig>>;
   let configProblem: string | undefined;

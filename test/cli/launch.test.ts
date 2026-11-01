@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
 import { acquireLock } from "../../src/adapters/store/lock.ts";
 import { writeState } from "../../src/adapters/store/state-store.ts";
-import { launch } from "../../src/cli/commands/launch.ts";
+import { registerSession as registerSessionReal } from "../../src/adapters/store/sessions.ts";
+import { launch, type LaunchContext } from "../../src/cli/commands/launch.ts";
 import type { DoctorCheck } from "../../src/cli/commands/doctor.ts";
 import type { CliIO } from "../../src/cli/io.ts";
 import { main } from "../../src/cli/main.ts";
@@ -82,6 +83,23 @@ describe("launch", () => {
     expect(l).toContain('"piPidIsMe":true');
     expect(l).toContain("telemetry 0");
     expect(readdirSync(paths.sessions)).toEqual([]);
+  });
+
+  it("a session record that cannot be removed is reported, and Pi's exit code is still returned", async () => {
+    await install();
+    env.FAKE_PI_MODE = "exit";
+    const registerSession: LaunchContext["registerSession"] = async (p) => {
+      const real = await registerSessionReal(p);
+      return {
+        ...real,
+        end: async () => {
+          await real.end();
+          throw new Error("EPERM: session record is locked");
+        },
+      };
+    };
+    expect(await launch({ paths, env, manifest, io: io(), doctor: okDoctor, registerSession }, [])).toBe(3);
+    expect(errs.join("\n")).toMatch(/Could not remove the session record .*EPERM: session record is locked/);
   });
 
   it("registration while an update holds the factory lock exits 1 and starts nothing", async () => {

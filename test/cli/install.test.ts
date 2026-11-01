@@ -168,6 +168,22 @@ describe("install", () => {
     expect(existsSync(paths.state)).toBe(false);
   });
 
+  it.each([
+    [{ yes: false }, true, true],
+    [{ yes: true }, true, false],
+    [{ yes: false, profile: "codex-only" }, true, false],
+    [{ yes: false }, false, false],
+  ] as const)("under npx %j on a terminal=%s → the global CLI install gets the terminal's stdin: %s (R15)", async (opts, isTTY, interactive) => {
+    const globalCli = join(tmp.dir, "global root", "ai-factory", "bin", "factory.mjs");
+    await mkdir(join(globalCli, ".."), { recursive: true });
+    await writeFile(globalCli, "// stand-in for the globally installed CLI\n");
+    const seen: Array<{ interactive?: boolean } | undefined> = [];
+    const c = ctx();
+    c.io = { ...c.io, isTTY };
+    await install(c, opts, deps({ cliPath: NPX_CLI, runNode: async (_args, _env, o) => (seen.push(o), 0) }));
+    expect(seen).toEqual([{ interactive }]);
+  });
+
   it("under npx, a failed global npm install → exit 1 and the global CLI is not run", async () => {
     const failing = deps({
       cliPath: NPX_CLI,

@@ -3,7 +3,7 @@
 // (`npm install -g --legacy-peer-deps <spec>`, then its `_apply-release`, which borrows our lock; R5).
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { npm } from "../../adapters/platform/npm.ts";
 import type { FactoryPaths } from "../../adapters/platform/paths.ts";
 import { acquireLock, Locked, type Lock } from "../../adapters/store/lock.ts";
@@ -146,7 +146,30 @@ export async function fetchRelease(ctx: ReleaseContext, deps: ReleaseDeps, sourc
     }
     return { manifest: parsed.data, changelog };
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    // Retries cover transient Windows locks (EBUSY/EPERM from scanners); a leftover temp dir never
+    // turns a fetched release into a failure.
+    try {
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (e) {
+      ctx.io.err(`warning: could not remove the temporary checkout ${dir}: ${msg(e)}. You can delete it.`);
+    }
+  }
+}
+
+/**
+ * The CLI at npm's global root must be the release just installed (its own release.json), or another
+ * install raced ours or npm kept a stale copy; handing over to it would apply the wrong release.
+ */
+async function expectInstalledVersion(globalCli: string, version: string): Promise<void> {
+  const file = join(dirname(dirname(globalCli)), "release.json");
+  let found: unknown;
+  try {
+    found = (JSON.parse(await readFile(file, "utf8")) as { factory?: unknown }).factory;
+  } catch (e) {
+    throw new Error(`npm reported success but ${file} is unreadable (${msg(e)}); not handing over to it.`, { cause: e });
+  }
+  if (found !== version) {
+    throw new Error(`npm reported success but the global factory CLI (${file}) holds factory ${String(found)}, not ${version}; not handing over to it.`);
   }
 }
 
@@ -171,6 +194,7 @@ export async function installAndApply(
     throw new Error(`npm install -g of ${spec} ${how}.\n${installed.stderr.trim()}`);
   }
   const globalCli = await locateGlobalCli(deps.npm, env);
+  await expectInstalledVersion(globalCli, target.factory);
   held.live();
   const args = [globalCli, "_apply-release", "--reason", apply.reason, "--from", apply.from, "--parent-lock", String(process.pid), "--yes"];
   try {

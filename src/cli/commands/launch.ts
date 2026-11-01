@@ -17,6 +17,8 @@ export interface LaunchContext {
   root?: string;
   /** Test seam: replaces the offline doctor run. */
   doctor?: () => Promise<DoctorCheck[]>;
+  /** Test seam: replaces session registration. */
+  registerSession?: typeof registerSession;
 }
 
 /** A failure in one of these checks means Pi must not start. */
@@ -48,7 +50,7 @@ export async function launch(ctx: LaunchContext, piArgs: string[]): Promise<numb
 
   let session: Session;
   try {
-    session = await registerSession(ctx.paths);
+    session = await (ctx.registerSession ?? registerSession)(ctx.paths);
   } catch (e) {
     if (e instanceof Locked) {
       io.err(`A factory update is in progress. ${e.message}`);
@@ -99,6 +101,11 @@ export async function launch(ctx: LaunchContext, piArgs: string[]): Promise<numb
   } finally {
     process.off("SIGINT", noop);
     for (const [sig, h] of handlers) process.off(sig, h);
-    await session.end();
+    // A record left behind is harmless (liveSessions drops dead pids); never let it mask Pi's exit code.
+    try {
+      await session.end();
+    } catch (e) {
+      io.err(`Could not remove the session record ${session.path}: ${(e as Error).message}. It is ignored once this process has exited.`);
+    }
   }
 }

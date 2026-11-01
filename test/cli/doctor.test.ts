@@ -57,6 +57,12 @@ describe("doctor on an empty environment", () => {
   it("warns about the source override", async () => {
     expect(byId(await runDoctor({ paths, env, offline: true, manifest }), "source-override")?.status).toBe("warn");
   });
+
+  it("an empty FACTORY_SOURCE is no override, and the package ref uses the release's source", async () => {
+    const checks = await runDoctor({ paths, env: { ...env, FACTORY_SOURCE: "" }, offline: true, manifest });
+    expect(byId(checks, "source-override")?.status).toBe("ok");
+    expect(byId(checks, "factory-package")?.message).toContain("git:https://github.com/jrevenga/ai-factory.git@v0.1.0");
+  });
 });
 
 describe("offline", () => {
