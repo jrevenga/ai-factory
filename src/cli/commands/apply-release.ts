@@ -34,6 +34,7 @@ export interface ApplyDeps {
   detectLogins: typeof detectLogins;
   runDoctor: typeof runDoctor;
   migrations: readonly Migration[];
+  clearTxn: typeof clearTxn;
 }
 
 export interface ApplyContext {
@@ -57,6 +58,16 @@ export interface ApplyOptions {
   parentLockPid?: number;
   /** Profile for a newly created personal config. */
   profile?: string;
+}
+
+/** Ruling R8: an install never runs over (or clears) the journal of an unfinished update or rollback. */
+export const TXN_PENDING_MESSAGE = 'A previous update did not finish. Run "factory rollback".';
+
+class InstallBlockedByTxn extends Error {
+  constructor() {
+    super(TXN_PENDING_MESSAGE);
+    this.name = "InstallBlockedByTxn";
+  }
 }
 
 /** Raised after the failure has been reported to the user; callers only map it to an exit code. */
@@ -138,7 +149,7 @@ async function migrate(paths: FactoryPaths, manifest: ReleaseManifest, registry:
 export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promise<void> {
   const { paths, env, manifest, io, pi } = ctx;
   const root = ctx.root ?? PACKAGE_ROOT;
-  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, ...ctx.deps };
+  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, clearTxn, ...ctx.deps };
   const now = ctx.now();
 
   let lock: Lock | undefined;
@@ -147,9 +158,12 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
     if (lock?.compromised) throw lock.compromised;
   };
   let failure: unknown;
+  /** True once state.json is written: the release is installed even if a later step fails. */
+  let committed = false;
   try {
     lock = await acquireLock(paths, { ownerPid: opts.parentLockPid });
     live();
+    if (opts.reason === "install" && existsSync(paths.txn)) throw new InstallBlockedByTxn();
     await installGuard(root, paths);
     live();
     const piCli = await pi.ensurePinned(paths, manifest.pi.version, { env });
@@ -174,12 +188,20 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
       ...previous,
       schema: 1,
       version: manifest.factory,
-      installedAt: now.toISOString(),
+      // Ruling R9: the first-install time; later applies only append history.
+      installedAt: previous?.installedAt ?? now.toISOString(),
       source: effectiveSource(manifest, env),
       piVersion: manifest.pi.version,
       piCli,
       history: [...(previous?.history ?? []), entry],
     });
+    committed = true;
+    // The journal belongs to the update/rollback that holds (or lent us) the lock: remove it while the
+    // lock is still ours, never after release (another transaction may own the journal by then).
+    if (opts.reason !== "install") {
+      live();
+      await deps.clearTxn(paths);
+    }
   } catch (e) {
     failure = e;
   }
@@ -191,19 +213,22 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
   } catch (e) {
     releaseError = e;
   }
+  const releaseNote = releaseError === undefined || releaseError === failure ? "" : ` (and the factory lock could not be released: ${msg(releaseError)})`;
 
-  if (failure !== undefined) {
-    const extra = releaseError === undefined || releaseError === failure ? "" : ` (and the factory lock could not be released: ${msg(releaseError)})`;
-    io.err(`Install did not complete: ${stripPeriod(msg(failure))}${extra}. Previous state kept. Run "factory doctor"; after an update run "factory rollback".`);
+  if (failure instanceof InstallBlockedByTxn) {
+    io.err(`${TXN_PENDING_MESSAGE}${releaseNote}`);
     throw new ApplyFailed(msg(failure), { cause: failure });
   }
-
-  // state.json is written: the transaction is complete. What follows only tidies up and reports.
-  try {
-    await clearTxn(paths);
-  } catch (e) {
-    io.err(`factory ${manifest.factory} is installed, but the journal ${paths.txn} could not be removed: ${msg(e)}. Remove it, then run "factory doctor".`);
-    throw new ApplyFailed(msg(e), { cause: e });
+  if (failure !== undefined && !committed) {
+    io.err(`Install did not complete: ${stripPeriod(msg(failure))}${releaseNote}. Previous state kept. Run "factory doctor"; after an update run "factory rollback".`);
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (failure !== undefined) {
+    io.err(
+      `factory ${manifest.factory} is installed, but the journal ${paths.txn} could not be removed: ${stripPeriod(msg(failure))}${releaseNote}. ` +
+        `Make sure no other factory command is running, remove it, then run "factory doctor".`,
+    );
+    throw new ApplyFailed(msg(failure), { cause: failure });
   }
   if (releaseError !== undefined) {
     io.err(`factory ${manifest.factory} is installed, but the factory lock could not be released cleanly: ${msg(releaseError)}. Run "factory doctor".`);

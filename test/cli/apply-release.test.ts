@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GUARD_FILE_NAME } from "../../guard/factory-guard.ts";
@@ -20,6 +20,7 @@ const FACTORY_REF = `git:${SOURCE}@v0.1.0`;
 const BRIDGE_REF = "npm:pi-claude-bridge@0.9.3";
 const FAKE_CLI = "/fake/pi/cli.js";
 
+const TXN = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
 const PREVIOUS_STATE = `{"schema":1,"version":"0.0.9","installedAt":"2026-10-01T00:00:00.000Z","source":"x","piVersion":"1.4.0","piCli":"/old/cli.js","history":[{"version":"0.0.9","at":"2026-10-01T00:00:00.000Z","reason":"install"}]}`;
 
 let tmp: Tmp;
@@ -125,11 +126,43 @@ describe("applyRelease happy path", () => {
     expect(history[1]).toEqual({ version: "0.1.0", at: "2026-11-01T10:00:00.000Z", reason: "update", from: "0.0.9" });
   });
 
-  it("removes the transaction journal after writing state", async () => {
+  it.each(["update", "rollback"] as const)("--reason %s removes the journal after writing state, while still holding the lock", async (reason) => {
     await mkdir(paths.home, { recursive: true });
-    await writeFile(paths.txn, JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" }));
-    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9" });
+    await writeFile(paths.txn, TXN);
+    const clearTxnSpy: ApplyDeps["clearTxn"] = async (p) => {
+      const holder = await readLockHolder(p);
+      log.push(`clearTxn state=${existsSync(p.state)} locked=${holder?.pid === process.pid}`);
+      await rm(p.txn, { force: true });
+    };
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }, { clearTxn: clearTxnSpy }), { reason, from: "0.0.9" });
+    expect(log).toContain("clearTxn state=true locked=true");
     expect(existsSync(paths.txn)).toBe(false);
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("a second apply keeps the first installedAt and appends history", async () => {
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" });
+    const later = { ...ctx(new FakePi(), { claude: "absent", codex: "present" }), now: () => new Date("2026-11-05T08:00:00.000Z") };
+    await applyRelease(later, { reason: "update", from: "0.0.9" });
+    const state = readJsonFile(paths.state);
+    expect(state.installedAt).toBe("2026-11-01T10:00:00.000Z");
+    expect((state.history as Array<{ at: string }>).map((h) => h.at)).toEqual(["2026-11-01T10:00:00.000Z", "2026-11-05T08:00:00.000Z"]);
+  });
+});
+
+describe("unfinished transaction (ruling R8)", () => {
+  it("--reason install refuses while txn.json exists and touches nothing", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, PREVIOUS_STATE);
+    await writeFile(paths.txn, TXN);
+    const e = await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(Error);
+    expect(err.join("\n")).toBe('A previous update did not finish. Run "factory rollback".');
+    expect(readFileSync(paths.txn, "utf8")).toBe(TXN);
+    expect(readFileSync(paths.state, "utf8")).toBe(PREVIOUS_STATE);
+    expect(existsSync(guardPath())).toBe(false);
+    expect(log).toEqual([]);
+    expect(await readLockHolder(paths)).toBeUndefined();
   });
 });
 

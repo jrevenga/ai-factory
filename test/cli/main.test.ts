@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { factoryPaths } from "../../src/adapters/platform/paths.ts";
 import { PiRuntime } from "../../src/adapters/pi/runtime.ts";
@@ -88,6 +88,27 @@ describe("main _apply-release", () => {
       expect(JSON.parse(readFileSync(paths.config, "utf8"))).toEqual({ schema: 1, profile: "codex-only" });
     } finally {
       await held.release();
+      await t.cleanup();
+    }
+  });
+
+  it("--reason install refuses while txn.json exists and keeps it (ruling R8)", async () => {
+    const t = await makeTmp("main-apply-txn");
+    const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "http://127.0.0.1:1/x/ai-factory.git", PI_OFFLINE: "1" };
+    const paths = factoryPaths(env);
+    const pi = new (class extends PiRuntime {
+      override async ensurePinned(): Promise<string> {
+        throw new Error("must not run");
+      }
+    })();
+    try {
+      mkdirSync(paths.home, { recursive: true });
+      writeFileSync(paths.txn, "{}");
+      const c = capture();
+      expect(await main(["_apply-release", "--reason", "install", "--yes"], c.io, { env, pi })).toBe(1);
+      expect(c.err.join("\n")).toBe('A previous update did not finish. Run "factory rollback".');
+      expect(readFileSync(paths.txn, "utf8")).toBe("{}");
+    } finally {
       await t.cleanup();
     }
   });

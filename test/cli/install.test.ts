@@ -113,6 +113,17 @@ describe("install", () => {
     expect(state.history[0]?.reason).toBe("install");
   });
 
+  it.each([GLOBAL_CLI, NPX_CLI])("refuses while txn.json exists (ruling R8), from %s", async (cliPath) => {
+    await mkdir(paths.home, { recursive: true });
+    const txn = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
+    await writeFile(paths.txn, txn);
+    expect(await install(ctx(), { yes: true }, deps({ cliPath }))).toBe(1);
+    expect(err.join("\n")).toBe('A previous update did not finish. Run "factory rollback".');
+    expect(readFileSync(paths.txn, "utf8")).toBe(txn);
+    expect(log).toEqual([]);
+    expect(existsSync(paths.state)).toBe(false);
+  });
+
   it("outside npx, a failed apply → exit 1", async () => {
     const c = ctx();
     c.pi = new (class extends FakePi {

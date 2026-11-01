@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { npm } from "../../adapters/platform/npm.ts";
 import { npmInstallSpec } from "../../core/release/manifest.ts";
-import { applyRelease, ApplyFailed, type ApplyContext } from "./apply-release.ts";
+import { applyRelease, ApplyFailed, TXN_PENDING_MESSAGE, type ApplyContext } from "./apply-release.ts";
 import { requirementChecks } from "./doctor.ts";
 
 /** Seams for tests; production uses the real implementations. */
@@ -48,6 +48,12 @@ function runNodeInherited(args: string[], env: NodeJS.ProcessEnv): Promise<numbe
 export async function install(ctx: ApplyContext, opts: InstallOptions, overrides: Partial<InstallDeps> = {}): Promise<number> {
   const deps: InstallDeps = { cliPath: overrides.cliPath ?? ownCliPath(), npm, runNode: runNodeInherited, requirements: requirementChecks, ...overrides };
   const { io, env, manifest } = ctx;
+
+  // Ruling R8: never install over an unfinished update/rollback; checked before the npx bootstrap too.
+  if (existsSync(ctx.paths.txn)) {
+    io.err(TXN_PENDING_MESSAGE);
+    return 1;
+  }
 
   const failed = (await deps.requirements({ env, manifest })).filter((c) => c.status === "fail");
   if (failed.length > 0) {
