@@ -1,0 +1,45 @@
+name: e2e
+# Phase 1 acceptance: npx bootstrap install, then update -> rollback round-trip, against a local
+# smart-HTTP git server serving releases built from this commit. Pi comes from the public npm registry;
+# no secrets are needed.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  roundtrip:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ["22.19.0", "24"]
+    env:
+      # Windows legs check out into a directory whose name contains a space (as in a typical user profile path).
+      CHECKOUT_DIR: ${{ matrix.os == 'windows-latest' && 'ai factory' || '.' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ env.CHECKOUT_DIR }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Versions
+        run: |
+          node --version
+          npm --version
+          git --version
+      - name: Install
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        run: npm ci
+      - name: Round-trip (e2e)
+        working-directory: ${{ env.CHECKOUT_DIR }}
+        run: npx vitest run test/e2e/roundtrip.e2e.test.ts
