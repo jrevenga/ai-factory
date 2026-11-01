@@ -31,6 +31,11 @@ const STEP_TIMEOUT_MS = 15 * 60_000;
 const BOOTSTRAP_BUDGET_S = 600;
 /** Doctor checks allowed to be non-ok: CI has no provider logins, and FACTORY_SOURCE is set on purpose. */
 const ALLOWED_NON_OK = ["logins", "source-override"];
+/**
+ * Advisory checks allowed to `warn` (never `fail`), ruling R12: `parallelism` depends on the machine's
+ * memory (GitHub runners have ~7 GB, so the suggested maximum 1 is below the default 3).
+ */
+const ALLOWED_WARN = ["parallelism"];
 
 // Fixed identity, no signing, no line-ending conversion: the fixture holds exactly HEAD's bytes.
 const GIT_CONFIG = [
@@ -128,7 +133,9 @@ async function expectDoctorHealthy(): Promise<void> {
   } catch {
     throw new Error(`doctor printed no JSON: ${describeRun(r)}`);
   }
-  const unexpected = checks.filter((c) => c.status !== "ok" && !ALLOWED_NON_OK.includes(c.id));
+  const unexpected = checks.filter(
+    (c) => c.status !== "ok" && !ALLOWED_NON_OK.includes(c.id) && !(c.status === "warn" && ALLOWED_WARN.includes(c.id)),
+  );
   expect(unexpected, JSON.stringify(checks, null, 2)).toEqual([]);
   expect(checks.find((c) => c.id === "state")?.status).toBe("ok");
 }
@@ -164,6 +171,8 @@ beforeAll(async () => {
   paths = factoryPaths(env);
   userCwd = join(tmp.dir, "user cwd");
   await mkdir(userCwd, { recursive: true });
+  // Every location a command may write lies under the temp root, never the real homes or global prefix.
+  for (const dir of [paths.home, paths.piAgentDir, prefix, env.npm_config_cache as string]) expect(dir.startsWith(tmp.dir)).toBe(true);
   expect(existsSync(paths.home)).toBe(false);
   expect(existsSync(paths.piAgentDir)).toBe(false);
 }, 300_000);
@@ -218,6 +227,7 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
     "factory update --to v0.2.0 installs v0.2.0 and keeps an immutable 0.1.0-to-0.2.0 snapshot",
     async () => {
       await expectFactoryOk(["update", "--to", "v0.2.0", "--yes"]);
+      expect((await expectFactoryOk(["version"])).stdout.trim()).toBe("0.2.0");
 
       expect(stateVersion()).toBe("0.2.0");
       const snapshots = snapshotIds().filter((id) => id.endsWith("-0.1.0-to-0.2.0"));

@@ -29,7 +29,8 @@ export async function makeTmp(prefix: string): Promise<Tmp> {
       if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
         throw new Error(`refusing to remove a path outside ${tmpdir()}: ${dir} -> ${real}`);
       }
-      await rm(dir, { recursive: true, force: true });
+      // Retries absorb transient EBUSY/EPERM on Windows (virus scanners, handles released late).
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     },
   };
 }
