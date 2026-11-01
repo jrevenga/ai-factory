@@ -1,6 +1,6 @@
 # ai-factory
 
-An AI software factory for the [Pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent): a Pi package plus the `factory` command line tool that installs, checks, updates and rolls back a pinned, reproducible setup.
+An AI software factory for the [Pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent): a Pi package plus the `factory` command line tool that installs, checks, updates and rolls back a pinned setup.
 
 ## Requirements
 
@@ -49,7 +49,7 @@ Update and rollback refuse to run while a factory-launched Pi session is open. E
 
 ## Known limitations
 
-- The global `factory` CLI pins its direct dependencies exactly, but npm does not apply a git dependency's lockfile (or `npm-shrinkwrap.json`) on `npm install -g`, so the CLI's transitive dependencies may resolve to newer versions within their declared ranges. Pi, `pi-claude-bridge` and the factory's Pi package install (npm install in Pi's checkout, which uses `package-lock.json`) are pinned.
+- The global `factory` CLI pins its direct dependencies exactly, but npm does not apply a git dependency's lockfile (or `npm-shrinkwrap.json`) on `npm install -g`, so the CLI's transitive dependencies may resolve to newer versions within their declared ranges. Pi and `pi-claude-bridge` are pinned to exact versions, but their transitive dependencies are also resolved at install time; only the factory's Pi package install (in Pi's checkout) follows `package-lock.json`.
 
 ## Development
 

@@ -85,11 +85,17 @@ export class ApplyRefused extends Error {
  * Checks that need no change and must pass before the first one (I2): an install never downgrades a
  * newer installation (that is a rollback, which snapshots first), and every present document has a
  * migration path to this release's schema. Throws ApplyRefused naming the file and the fix.
+ *
+ * Only an install can say "Nothing was changed": an update/rollback child runs after its parent took the
+ * snapshot, wrote the journal and replaced the CLI, and the parent prints the recovery instruction.
  */
 export async function applyPreflight(paths: FactoryPaths, manifest: ReleaseManifest, migrations: readonly Migration[], reason: ApplyReason): Promise<void> {
+  const install = reason === "install";
+  const refuse = (problem: string, fix: string): ApplyRefused =>
+    new ApplyRefused(install ? `${problem} Nothing was changed.\n  fix: ${fix}` : `${problem} factory ${manifest.factory} cannot be applied over it.`);
   const unreadable = (e: MalformedJson): ApplyRefused =>
-    new ApplyRefused(`${e.path} is unreadable: ${stripPeriod(msg(e.cause))}. Nothing was changed.\n  fix: Fix or remove ${e.path} (a removed file is recreated by "factory install"), then retry.`);
-  if (reason === "install") {
+    refuse(`${e.path} is unreadable: ${stripPeriod(msg(e.cause))}.`, `Fix or remove ${e.path} (a removed file is recreated by "factory install"), then retry.`);
+  if (install) {
     let raw: unknown;
     try {
       raw = await readJson(paths.state);
@@ -99,9 +105,9 @@ export async function applyPreflight(paths: FactoryPaths, manifest: ReleaseManif
     }
     const installed = typeof raw === "object" && raw !== null ? (raw as { version?: unknown }).version : undefined;
     if (typeof installed === "string" && /^\d+\.\d+\.\d+$/.test(installed) && compareSemver(installed, manifest.factory) > 0) {
-      throw new ApplyRefused(
-        `Installed factory ${installed} is newer than this release (${manifest.factory}). Nothing was changed.\n` +
-          `  fix: To go back to ${manifest.factory}, use "factory rollback ${manifest.factory}" (it snapshots your state first).`,
+      throw refuse(
+        `Installed factory ${installed} is newer than this release (${manifest.factory}).`,
+        `To go back to ${manifest.factory}, use "factory rollback ${manifest.factory}" (it snapshots your state first).`,
       );
     }
   }
@@ -120,7 +126,7 @@ export async function applyPreflight(paths: FactoryPaths, manifest: ReleaseManif
       e.from > e.to
         ? `It was written by a newer factory; use "factory rollback ${manifest.factory}" to return to this release.`
         : `Install a factory release that can migrate it ("factory update").`;
-    throw new ApplyRefused(`${e.message} Nothing was changed.\n  fix: ${hint}`);
+    throw refuse(e.message, hint);
   }
 }
 

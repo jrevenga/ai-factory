@@ -213,6 +213,37 @@ describe("preflight before any change (I2)", () => {
   });
 });
 
+describe("preflight inside an update/rollback child (I2)", () => {
+  it.each(["update", "rollback"] as const)(
+    "--reason %s: a document it cannot migrate is refused without claiming nothing changed or suggesting a rollback to itself",
+    async (reason) => {
+      await mkdir(paths.home, { recursive: true });
+      await writeFile(paths.state, PREVIOUS_STATE);
+      await writeFile(paths.config, JSON.stringify({ schema: 2, profile: "codex-only" }));
+      const e = await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason, from: "0.0.9" }).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(Error);
+      const text = err.join("\n");
+      expect(text).toContain("No migration path for config.json from schema 2 to schema 1.");
+      expect(text).toContain("factory 0.1.0 cannot be applied over it");
+      expect(text).not.toContain("Nothing was changed");
+      expect(text).not.toContain("factory rollback 0.1.0");
+      expect(existsSync(guardPath())).toBe(false);
+      expect(log).toEqual([]);
+    },
+  );
+
+  it("--reason update: an unreadable document is refused without claiming nothing changed", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.config, "{ broken");
+    const e = await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9" }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(Error);
+    const text = err.join("\n");
+    expect(text).toContain(`${paths.config} is unreadable`);
+    expect(text).not.toContain("Nothing was changed");
+    expect(log).toEqual([]);
+  });
+});
+
 describe("after state is written", () => {
   it("a doctor that throws does not turn a completed install into a failure", async () => {
     const throwing: Partial<ApplyDeps> = {
