@@ -47,6 +47,10 @@ factory install
 
 Update and rollback refuse to run while a factory-launched Pi session is open. Every update and rollback keeps an immutable snapshot under `~/.factory/backups/`.
 
+## Known limitations
+
+- The global `factory` CLI pins its direct dependencies exactly, but npm does not apply a git dependency's lockfile (or `npm-shrinkwrap.json`) on `npm install -g`, so the CLI's transitive dependencies may resolve to newer versions within their declared ranges. Pi, `pi-claude-bridge` and the factory's Pi package install (npm install in Pi's checkout, which uses `package-lock.json`) are pinned.
+
 ## Development
 
 ```sh
