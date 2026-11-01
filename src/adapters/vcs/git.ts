@@ -43,13 +43,29 @@ export function classifyGitError(stderr: string): GitErrorKind {
   return "unknown";
 }
 
+/**
+ * Environment for any git process the factory starts directly or through Pi: never prompt for
+ * credentials, and never convert line endings (`core.autocrlf=false` as command-scope config via
+ * GIT_CONFIG_COUNT, appended to any the caller set) so checkouts are byte-identical to the repository
+ * even on hosts with `core.autocrlf=true` (Windows default) — release hashes depend on it.
+ */
+export function gitEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
+  const parsed = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+  const n = Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
+  env[`GIT_CONFIG_KEY_${n}`] = "core.autocrlf";
+  env[`GIT_CONFIG_VALUE_${n}`] = "false";
+  env.GIT_CONFIG_COUNT = String(n + 1);
+  return env;
+}
+
 /** Runs git non-interactively; rejects with GitError on a non-zero exit or timeout. */
 export async function git(args: string[], opts: GitOptions = {}): Promise<RunResult> {
   let result: RunResult;
   try {
     result = await runBounded("git", args, {
       cwd: opts.cwd,
-      env: { ...(opts.env ?? process.env), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
+      env: gitEnv(opts.env ?? process.env),
       timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     });
   } catch (e) {
@@ -80,7 +96,10 @@ export async function resolveRef(url: string, tag: string, opts: GitOptions = {}
   return stdout.split(/\r?\n/).some((line) => line.split("\t")[1] === `refs/tags/${tag}`);
 }
 
-/** Shallow clone of one tag (needs a smart-protocol remote). */
+/**
+ * Shallow clone of one tag (needs a smart-protocol remote). Files are checked out byte-identical to
+ * the repository whatever the host's core.autocrlf, and the clone keeps `core.autocrlf=false`.
+ */
 export async function cloneTag(url: string, tag: string, dest: string, opts: GitOptions = {}): Promise<void> {
-  await git(["clone", "--quiet", "--depth", "1", "--branch", tag, "--", url, dest], opts);
+  await git(["-c", "core.autocrlf=false", "clone", "--quiet", "--config", "core.autocrlf=false", "--depth", "1", "--branch", tag, "--", url, dest], opts);
 }

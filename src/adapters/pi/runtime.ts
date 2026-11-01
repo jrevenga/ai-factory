@@ -3,12 +3,12 @@
 // `pi` on PATH is never used, replaced or shadowed.
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, rename, rm } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { npm as runNpm } from "../platform/npm.ts";
 import type { FactoryPaths } from "../platform/paths.ts";
 import { runBounded, type RunResult } from "../platform/process.ts";
-import { GitError, resolveRef as gitResolveRef, type GitErrorKind } from "../vcs/git.ts";
+import { gitEnv, GitError, resolveRef as gitResolveRef, type GitErrorKind } from "../vcs/git.ts";
 
 const PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const PACKAGE_DIR = ["node_modules", "@earendil-works", "pi-coding-agent"];
@@ -35,8 +35,8 @@ export type UnresolvableRefKind = GitErrorKind | "invalid-ref";
 export class UnresolvableRef extends Error {
   readonly ref: string;
   readonly kind: UnresolvableRefKind;
-  constructor(ref: string, kind: UnresolvableRefKind, detail: string) {
-    super(`Cannot resolve package ref ${ref} (${kind}): ${detail}. Pi settings were not changed.`);
+  constructor(ref: string, kind: UnresolvableRefKind, detail: string, options?: { cause?: unknown }) {
+    super(`Cannot resolve package ref ${ref} (${kind}): ${detail}. Pi settings were not changed.`, options);
     this.name = "UnresolvableRef";
     this.ref = ref;
     this.kind = kind;
@@ -134,6 +134,11 @@ export class PiRuntime {
    * Returns the `cli.js` of Pi `version` under `<piPrefixes>/<version>`, installing it from npm first
    * unless that prefix already holds exactly this version. The install goes to a staging prefix that is
    * moved into place only when complete, so an interrupted install never leaves a half prefix.
+   *
+   * No path travels as an npm argument (ruling 15: the Windows `.cmd` fallback rejects `&`, `%`, `!`…):
+   * the staging dir gets a private `package.json` and is npm's working directory, which makes it npm's
+   * local prefix. `npm_config_prefix` is not usable for this — npm reads it only as the *global* prefix
+   * (`npm prefix` ignores it), which would need `-g` and a platform-dependent layout.
    */
   async ensurePinned(paths: FactoryPaths, version: string, opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}): Promise<string> {
     if (!PLAIN_SEMVER.test(version)) throw new PiInstallFailed(`Invalid Pi version ${JSON.stringify(version)}: expected an exact semver such as 1.4.0.`);
@@ -144,8 +149,10 @@ export class PiRuntime {
     await mkdir(paths.piPrefixes, { recursive: true });
     const staging = join(paths.piPrefixes, `.staging-${version}-${process.pid}-${randomBytes(4).toString("hex")}`);
     try {
-      const args = ["install", "--prefix", staging, "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error", `${PI_PACKAGE}@${version}`];
-      const r = await this.deps.npm(args, { env: opts.env, cwd: paths.piPrefixes, timeoutMs: opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS });
+      await mkdir(staging);
+      await writeFile(join(staging, "package.json"), `${JSON.stringify({ name: "factory-pi-runtime", private: true }, null, 2)}\n`);
+      const args = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error", `${PI_PACKAGE}@${version}`];
+      const r = await this.deps.npm(args, { env: opts.env, cwd: staging, timeoutMs: opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS });
       if (r.code !== 0) {
         const how = r.timedOut ? "timed out" : `failed with exit ${r.code}`;
         throw new PiInstallFailed(`npm install of ${PI_PACKAGE}@${version} ${how}. Check network access to the npm registry and retry.\n${r.stderr.trim()}`);
@@ -182,7 +189,8 @@ export class PiRuntime {
    */
   async installPackage(cli: string, ref: string, opts: PiRunOptions = {}): Promise<void> {
     if (ref.trim().startsWith("git:")) await this.assertResolvable(ref, opts);
-    const env = { ...(opts.env ?? process.env), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
+    // Pi clones with git: no prompts, and a byte-identical checkout regardless of host autocrlf.
+    const env = gitEnv(opts.env ?? process.env);
     const r = await this.run(cli, ["install", ref], { ...opts, env, timeoutMs: opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS });
     if (r.code !== 0) throw new PiCommandFailed(`install ${ref}`, r);
   }
@@ -194,8 +202,9 @@ export class PiRuntime {
     try {
       found = await this.deps.resolveRef(parsed.url, parsed.ref, { env: opts.env, cwd: opts.cwd });
     } catch (e) {
-      if (e instanceof GitError) throw new UnresolvableRef(ref, e.kind, e.message);
-      throw e;
+      // GitError carries its classification; anything else (git missing, teardown failure) is unknown.
+      const kind = e instanceof GitError ? e.kind : "unknown";
+      throw new UnresolvableRef(ref, kind, e instanceof Error ? e.message : String(e), { cause: e });
     }
     if (!found) throw new UnresolvableRef(ref, "not-found", `tag ${parsed.ref} does not exist at ${parsed.url}`);
   }

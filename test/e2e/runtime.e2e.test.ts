@@ -1,5 +1,5 @@
 // Real pinned Pi: installs Pi 1.4.0 from the public npm registry into a temp FACTORY_HOME.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -85,9 +85,15 @@ describe("PiRuntime (e2e, real Pi 1.4.0)", () => {
 
   it("installPackage of an existing tag writes the ref into Pi settings packages", async () => {
     const ref = `git:${server.url("fixture/ai-factory.git")}@v0.0.1-test`;
-    await new PiRuntime().installPackage(cli, ref, { env, cwd: tmp.dir });
+    // Simulate a Windows runner's core.autocrlf=true: Pi's checkout must still be byte-identical.
+    const gitconfig = join(tmp.dir, "autocrlf gitconfig");
+    await writeFile(gitconfig, "[core]\n\tautocrlf = true\n");
+    await new PiRuntime().installPackage(cli, ref, { env: { ...env, GIT_CONFIG_GLOBAL: gitconfig }, cwd: tmp.dir });
     const settings = JSON.parse(readFileSync(join(paths.piAgentDir, "settings.json"), "utf8")) as { packages?: unknown[] };
     expect(settings.packages).toContain(ref);
+    const prompt = readdirSync(join(paths.piAgentDir, "git"), { recursive: true, encoding: "utf8" }).find((p) => p.replace(/\\/g, "/").endsWith("prompts/hello.md"));
+    expect(prompt).toBeDefined();
+    expect(readFileSync(join(paths.piAgentDir, "git", prompt as string), "utf8")).toBe("Say hello.\n");
   }, 180_000);
 
   it("detectLogins with the pinned Pi and an empty agent dir → codex absent", async () => {

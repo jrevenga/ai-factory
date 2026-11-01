@@ -7,17 +7,37 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, join, resolve } from "node:path";
-import { runBounded } from "../../src/adapters/platform/process.ts";
+import { killProcessTree, runBounded } from "../../src/adapters/platform/process.ts";
 
 export interface GitServer {
   /** `http://127.0.0.1:<port>/<repoRelPath>` (forward slashes). */
   url(repoRelPath: string): string;
-  /** Stops listening, drops open connections and kills running http-backend children. */
+  /** Stops listening, drops open connections and tears down running CGI workers (bounded). */
   close(): Promise<void>;
 }
 
+export interface GitServerOptions {
+  /** Per-request CGI worker deadline; the worker tree is killed and the request answered 504. Default 60 s. */
+  requestTimeoutMs?: number;
+  /** Test seam: the CGI program (default `git http-backend`). */
+  backend?: { cmd: string; args: string[] };
+}
+
 const GIT_ENV = { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
-const IDENTITY = ["-c", "user.name=factory-test", "-c", "user.email=factory-test@example.invalid", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"];
+// Fixed identity, no signing, and no line-ending conversion regardless of the host (Windows runners
+// default to core.autocrlf=true), so fixture repos hold exactly the bytes written.
+const IDENTITY = [
+  "-c",
+  "user.name=factory-test",
+  "-c",
+  "user.email=factory-test@example.invalid",
+  "-c",
+  "commit.gpgsign=false",
+  "-c",
+  "tag.gpgsign=false",
+  "-c",
+  "core.autocrlf=false",
+];
 
 /** Runs git for fixture setup; throws with stderr on failure. */
 async function gitOk(args: string[], cwd?: string): Promise<string> {
@@ -62,12 +82,14 @@ function splitCgiHeaders(buf: Buffer): { head: string; body: Buffer } | undefine
   return { head: buf.subarray(0, end).toString("latin1"), body: buf.subarray(end + (useCrlf ? 4 : 2)) };
 }
 
-function respondCgi(child: ChildProcess, res: ServerResponse): void {
+/** Streams the CGI response; once `abandoned()` is true (deadline hit) the caller owns the answer. */
+function respondCgi(child: ChildProcess, res: ServerResponse, abandoned: () => boolean): void {
   let pending: Buffer = Buffer.alloc(0);
   let headersSent = false;
   let stderr = "";
   child.stderr?.setEncoding("utf8").on("data", (d: string) => (stderr += d));
   child.stdout?.on("data", (chunk: Buffer) => {
+    if (abandoned() || res.writableEnded || res.destroyed) return; // deadline hit or client gone
     if (headersSent) {
       res.write(chunk);
       return;
@@ -89,10 +111,12 @@ function respondCgi(child: ChildProcess, res: ServerResponse): void {
     if (parsed.body.length > 0) res.write(parsed.body);
   });
   child.on("error", (e) => {
+    if (abandoned() || res.writableEnded) return;
     if (!res.headersSent) res.writeHead(500, { "Content-Type": "text/plain" });
     res.end(`git http-backend could not start: ${e.message}\n`);
   });
   child.on("close", (code) => {
+    if (abandoned() || res.writableEnded) return;
     if (!headersSent && !res.headersSent) {
       res.writeHead(500, { "Content-Type": "text/plain" });
       res.end(`git http-backend exited with ${code} before sending headers\n${stderr}`);
@@ -108,9 +132,21 @@ function header(req: IncomingMessage, name: string): string | undefined {
 }
 
 /** Starts a smart-HTTP git server for the repositories under `projectRoot` on 127.0.0.1 (random port). */
-export async function startGitServer(projectRoot: string): Promise<GitServer> {
+export async function startGitServer(projectRoot: string, opts: GitServerOptions = {}): Promise<GitServer> {
   const root = resolve(projectRoot);
+  const backend = opts.backend ?? { cmd: "git", args: ["http-backend"] };
+  const requestTimeoutMs = opts.requestTimeoutMs ?? 60_000;
   const children = new Set<ChildProcess>();
+  // One bounded teardown per worker, shared by the timeout, a dropped client and close().
+  const teardowns = new Map<ChildProcess, Promise<void>>();
+  const teardown = (child: ChildProcess): Promise<void> => {
+    let t = teardowns.get(child);
+    if (!t) {
+      t = child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : killProcessTree(child).catch(() => {});
+      teardowns.set(child, t);
+    }
+    return t;
+  };
 
   const server = createServer((req, res) => {
     const u = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -137,14 +173,38 @@ export async function startGitServer(projectRoot: string): Promise<GitServer> {
     const protocol = header(req, "git-protocol");
     if (protocol !== undefined) env.HTTP_GIT_PROTOCOL = protocol;
 
-    const child = spawn("git", ["http-backend"], { env, stdio: ["pipe", "pipe", "pipe"], shell: false, windowsHide: true });
+    // POSIX: the worker leads its own process group so killProcessTree reaches upload-pack too.
+    const child = spawn(backend.cmd, backend.args, {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+      windowsHide: true,
+      detached: process.platform !== "win32",
+    });
     children.add(child);
-    child.on("close", () => children.delete(child));
+    // Deadline: tear the worker tree down first, then answer 504 (or cut a response already started).
+    let expired = false;
+    const timer = setTimeout(() => {
+      expired = true;
+      void teardown(child).then(() => {
+        if (res.writableEnded || res.destroyed) return;
+        if (res.headersSent) {
+          res.destroy();
+          return;
+        }
+        res.writeHead(504, { "Content-Type": "text/plain" });
+        res.end(`CGI worker exceeded ${requestTimeoutMs} ms\n`);
+      });
+    }, requestTimeoutMs);
+    child.on("close", () => {
+      clearTimeout(timer);
+      children.delete(child);
+    });
     child.stdin?.on("error", () => {});
     req.pipe(child.stdin!);
-    respondCgi(child, res);
+    respondCgi(child, res, () => expired);
     res.on("close", () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
+      if (child.exitCode === null && child.signalCode === null) void teardown(child);
     });
   });
 
@@ -162,15 +222,7 @@ export async function startGitServer(projectRoot: string): Promise<GitServer> {
     async close() {
       const closed = new Promise<void>((r) => server.close(() => r()));
       server.closeAllConnections();
-      const exits = [...children].map(
-        (c) =>
-          new Promise<void>((r) => {
-            if (c.exitCode !== null || c.signalCode !== null) return r();
-            c.once("close", () => r());
-            c.kill();
-          }),
-      );
-      await Promise.all([closed, ...exits]);
+      await Promise.all([closed, ...[...children].map(teardown)]);
     },
   };
 }

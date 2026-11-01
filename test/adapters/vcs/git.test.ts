@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runBounded } from "../../../src/adapters/platform/process.ts";
@@ -66,8 +66,19 @@ describe("git adapter against a local smart-HTTP server", () => {
     const dest = join(tmp.dir, "clone dest");
     await cloneTag(url, "v0.0.1-test", dest);
     expect(await readFile(join(dest, "README.md"), "utf8")).toBe("second\n");
-    const count = await runBounded("git", ["-C", dest, "rev-list", "--count", "HEAD"], { timeoutMs: 30_000 });
+    const count = await runBounded("git", ["-C", dest, "rev-list", "--count", "HEAD"], {
+      timeoutMs: 30_000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
+    });
     expect(count.stdout.trim()).toBe("1");
+  });
+
+  it("clones byte-identical files even when the host has core.autocrlf=true (Windows runners)", async () => {
+    const gitconfig = join(tmp.dir, "autocrlf gitconfig");
+    await writeFile(gitconfig, "[core]\n\tautocrlf = true\n");
+    const dest = join(tmp.dir, "clone autocrlf");
+    await cloneTag(url, "v0.0.1-test", dest, { env: { ...process.env, GIT_CONFIG_GLOBAL: gitconfig } });
+    expect(await readFile(join(dest, "README.md"), "utf8")).toBe("second\n");
   });
 
   it("classifies a missing repository as not-found", async () => {

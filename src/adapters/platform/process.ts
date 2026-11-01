@@ -148,6 +148,16 @@ async function terminateTree(child: ChildProcess, deps: ProcessDeps): Promise<vo
   }, GRACE_MS).unref();
 }
 
+/**
+ * Bounded whole-tree teardown for a child the caller spawned itself (for streaming I/O runBounded does
+ * not offer). On POSIX the child must lead its own process group (`detached: true`). Same semantics as
+ * runBounded's cancellation: SIGTERM → SIGKILL after a grace period (POSIX) or an awaited, bounded
+ * taskkill (Windows); rejects with ProcessTeardownFailed when the tree cannot be torn down.
+ */
+export function killProcessTree(child: ChildProcess, deps: Partial<ProcessDeps> = {}): Promise<void> {
+  return terminateTree(child, { ...DEFAULT_DEPS, ...deps });
+}
+
 // Children currently running. Each has ONE cancellation path (timeout, abort and parent signals all go
 // through it). Parent SIGINT/SIGTERM handlers exist only while this set is non-empty.
 interface ActiveChild {
