@@ -93,22 +93,13 @@ async function sqliteFts5(): Promise<Omit<DoctorCheck, "id">> {
   }
 }
 
-export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
-  const { paths, env, manifest } = ctx;
-  const root = ctx.root ?? PACKAGE_ROOT;
-  const source = effectiveSource(manifest, env);
+/** The minimum requirements (Node, SQLite FTS5, git, npm, writable npm prefix): the first doctor checks, also run by `factory install`. */
+export async function requirementChecks(ctx: { env: NodeJS.ProcessEnv; manifest: ReleaseManifest }): Promise<DoctorCheck[]> {
+  const { env, manifest } = ctx;
   const checks: DoctorCheck[] = [];
   const add = async (id: string, run: () => Promise<Omit<DoctorCheck, "id">> | Omit<DoctorCheck, "id">) => {
     checks.push(await check(id, run));
   };
-  let piSettings: Record<string, unknown> | undefined;
-  let piSettingsError: string | undefined;
-  try {
-    piSettings = await readPiSettings(paths.piSettings);
-  } catch (e) {
-    piSettingsError = msg(e);
-  }
-
   await add("node-version", () =>
     compareSemver(process.versions.node, manifest.node.min) >= 0
       ? { status: "ok", message: `Node.js ${process.versions.node}` }
@@ -145,6 +136,26 @@ export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
       ? { status: "ok", message: `npm global prefix ${prefix} is writable` }
       : { status: "fail", message: `npm global prefix ${prefix} is not writable`, fix: "Point npm at a user-owned prefix: `npm config set prefix <a directory you own>` and add its bin directory to PATH." };
   });
+  return checks;
+}
+
+export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
+  const { paths, env, manifest } = ctx;
+  const root = ctx.root ?? PACKAGE_ROOT;
+  const source = effectiveSource(manifest, env);
+  const checks: DoctorCheck[] = [];
+  const add = async (id: string, run: () => Promise<Omit<DoctorCheck, "id">> | Omit<DoctorCheck, "id">) => {
+    checks.push(await check(id, run));
+  };
+  let piSettings: Record<string, unknown> | undefined;
+  let piSettingsError: string | undefined;
+  try {
+    piSettings = await readPiSettings(paths.piSettings);
+  } catch (e) {
+    piSettingsError = msg(e);
+  }
+
+  checks.push(...(await requirementChecks({ env, manifest })));
   await add("factory-home-writable", () =>
     writableDir(paths.home)
       ? { status: "ok", message: `${paths.home} is writable` }
