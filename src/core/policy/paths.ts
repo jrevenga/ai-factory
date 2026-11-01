@@ -30,31 +30,82 @@ export interface PathClassification {
 export interface SecretContext {
   home: string;
   piAgentDir: string;
-  /** Defaults to win32 when the path looks like a Windows path, otherwise posix. */
-  platform?: PathPlatform;
+  platform: PathPlatform;
 }
 
-const GIT_BASH_DRIVE = /^\/([A-Za-z])(?:\/|$)/;
-const WINDOWS_LIKE = /^[A-Za-z]:[\\/]|^\\\\/;
 const ENV_EXCLUDED = new Set([".env.example", ".env.sample", ".env.template"]);
+const WIN_DRIVE_ROOT = /^[A-Za-z]:[\\/]/;
+const WIN_UNC_ROOT = /^\\\\[^\\/]+\\[^\\/]+/;
 
 function api(platform: PathPlatform): path.PlatformPath {
   return platform === "win32" ? path.win32 : path.posix;
 }
 
-/** Normalizes without touching the filesystem. Git Bash `/c/x` becomes `C:\x` on win32. */
-function normalize(p: string, platform: PathPlatform): string {
-  if (platform === "win32") {
-    const m = GIT_BASH_DRIVE.exec(p);
-    const converted = m ? `${m[1]!.toUpperCase()}:${p.slice(2) || "\\"}` : p;
-    return path.win32.normalize(converted);
+/**
+ * Mirrors Pi's normalizeWindowsShellPath (pi-coding-agent dist/utils/paths.js) exactly:
+ * `/c/x`, `/mnt/c/x` and `/cygdrive/c/x` become `C:\x`, but only for a path that starts with
+ * `/`, does not start with `//` and contains no backslash.
+ */
+function normalizeWindowsShellPath(p: string): string {
+  if (!p.startsWith("/") || p.startsWith("//") || p.includes("\\")) return p;
+  const match = p.match(/^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i);
+  if (!match) return p;
+  const suffix = match[2]?.replaceAll("/", "\\");
+  return `${match[1]!.toUpperCase()}:\\${suffix ?? ""}`;
+}
+
+interface Canonical {
+  path: string;
+  /** True when a `.` or `..` segment was present and collapsed lexically. */
+  dots: boolean;
+}
+
+/**
+ * Lexical canonical form, or undefined when the path is not a usable absolute path
+ * (callers fail closed). Never touches the filesystem.
+ */
+function canon(raw: string, platform: PathPlatform): Canonical | undefined {
+  if (raw === "" || raw.includes("\0")) return undefined;
+  if (platform === "posix") {
+    if (!raw.startsWith("/")) return undefined;
+    const dots = raw.split("/").some((seg) => seg === "." || seg === "..");
+    return { path: path.posix.normalize(raw), dots };
   }
-  return path.posix.normalize(p);
+  let p = normalizeWindowsShellPath(raw);
+  if (/^\\\\[?.]\\UNC\\/i.test(p)) p = `\\\\${p.slice(8)}`;
+  else if (/^\\\\[?.]\\/.test(p)) p = p.slice(4);
+  let root: string;
+  if (WIN_DRIVE_ROOT.test(p)) root = `${p.slice(0, 2).toUpperCase()}\\`;
+  else if (WIN_UNC_ROOT.test(p)) {
+    const m = /^\\\\([^\\/]+)[\\/]+([^\\/]+)/.exec(p.replaceAll("/", "\\"))!;
+    root = `\\\\${m[1]}\\${m[2]}\\`;
+    p = root + p.slice(m[0].length);
+  } else return undefined;
+  const rest = p.slice(root.length);
+  if (rest.includes(":")) return undefined; // alternate data streams, device names
+  if (root.startsWith("\\\\") && root.slice(2).includes(":")) return undefined;
+  let dots = false;
+  const segs: string[] = [];
+  for (const seg of rest.split(/[\\/]+/)) {
+    const t = seg.replace(/ +$/, "");
+    if (t === "." || t === "..") dots = true;
+    const trimmed = seg.replace(/[. ]+$/, "");
+    if (t === "." || t === "..") segs.push(t);
+    else if (trimmed !== "") segs.push(trimmed);
+  }
+  return { path: path.win32.normalize(root + segs.join("\\")), dots };
 }
 
 function stripTrailingSep(p: string, platform: PathPlatform): string {
   const a = api(platform);
-  return p.length > a.parse(p).root.length ? p.replace(/[\\/]+$/, "") : p;
+  if (p.length <= a.parse(p).root.length) return p;
+  return p.replace(platform === "win32" ? /[\\/]+$/ : /\/+$/, "");
+}
+
+function requireAbsolute(value: string, name: string, platform: PathPlatform): string {
+  const c = canon(value, platform);
+  if (!c) throw new Error(`${name} must be an absolute path, got ${JSON.stringify(value)}`);
+  return stripTrailingSep(c.path, platform);
 }
 
 function contains(root: string, target: string, platform: PathPlatform): string | undefined {
@@ -70,29 +121,29 @@ function segmentsOf(rel: string, platform: PathPlatform): string[] {
   return platform === "win32" ? parts.map((s) => s.toLowerCase()) : parts;
 }
 
-export function isSecretPath(resolved: string, ctx: SecretContext): boolean {
-  const platform = ctx.platform ?? (WINDOWS_LIKE.test(resolved) || WINDOWS_LIKE.test(ctx.home) ? "win32" : "posix");
-  const target = stripTrailingSep(normalize(resolved, platform), platform);
+function secretOfCanonical(target: string, ctx: SecretContext): boolean {
+  const { platform } = ctx;
   const lc = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
+  const home = requireAbsolute(ctx.home, "home", platform);
+  const agentDir = requireAbsolute(ctx.piAgentDir, "piAgentDir", platform);
 
   const base = lc(api(platform).basename(target));
   if (base === ".env" || (base.startsWith(".env.") && !ENV_EXCLUDED.has(base))) return true;
   if (base === ".npmrc" || base === ".pypirc") return true;
   if (base.endsWith(".pem") || base.startsWith("id_rsa") || base.startsWith("id_ed25519")) return true;
 
-  const agentDir = stripTrailingSep(normalize(ctx.piAgentDir, platform), platform);
   const agentRel = contains(agentDir, target, platform);
   if (agentRel !== undefined && lc(agentRel) === "auth.json") return true;
 
-  const home = stripTrailingSep(normalize(ctx.home, platform), platform);
   const rel = contains(home, target, platform);
   if (rel === undefined || rel === "") return false;
   const seg = segmentsOf(rel, platform);
   const first = seg[0]!;
   const joined = seg.join("/");
-  if (first.startsWith(".claude")) return true; // ~/.claude*/** and ~/.claude.json
+  // Intentional superset of ~/.claude*/** and ~/.claude.json: any home entry starting with .claude.
+  if (first.startsWith(".claude")) return true;
   if (first === ".ssh" || first === ".gnupg" || first === ".azure") return true;
-  if (seg[0] === ".config" && seg[1] === "gcloud" && seg.length > 1) return true;
+  if (seg[0] === ".config" && seg[1] === "gcloud") return true;
   return [
     ".pi/agent/auth.json",
     ".codex/auth.json",
@@ -105,17 +156,39 @@ export function isSecretPath(resolved: string, ctx: SecretContext): boolean {
   ].includes(joined);
 }
 
+/**
+ * True for secret files. A path that is not a usable absolute path is treated as secret (fail closed).
+ * Throws when `home` or `piAgentDir` is not absolute (configuration error).
+ */
+export function isSecretPath(resolved: string, ctx: SecretContext): boolean {
+  requireAbsolute(ctx.home, "home", ctx.platform);
+  requireAbsolute(ctx.piAgentDir, "piAgentDir", ctx.platform);
+  const c = canon(resolved, ctx.platform);
+  if (!c) return true;
+  return secretOfCanonical(stripTrailingSep(c.path, ctx.platform), ctx);
+}
+
 export function classifyPath(p: PathFacts, ctx: PathContext): PathClassification {
-  const target = stripTrailingSep(normalize(p.resolved, p.platform), p.platform);
+  const sctx: SecretContext = { home: ctx.home, piAgentDir: ctx.piAgentDir, platform: p.platform };
+  requireAbsolute(ctx.home, "home", p.platform);
+  requireAbsolute(ctx.piAgentDir, "piAgentDir", p.platform);
+
+  const c = canon(p.resolved, p.platform);
+  if (!c) return { secret: true, within: "outside" };
+  const target = stripTrailingSep(c.path, p.platform);
+
+  const inputCanon = canon(p.input, p.platform);
   const secret =
-    isSecretPath(p.resolved, { home: ctx.home, piAgentDir: ctx.piAgentDir, platform: p.platform }) ||
-    (path.isAbsolute(p.input) || GIT_BASH_DRIVE.test(p.input)
-      ? isSecretPath(p.input, { home: ctx.home, piAgentDir: ctx.piAgentDir, platform: p.platform })
-      : false);
+    secretOfCanonical(target, sctx) ||
+    (inputCanon !== undefined && secretOfCanonical(stripTrailingSep(inputCanon.path, p.platform), sctx));
+  // A leftover `.`/`..` means the caller did not canonicalize: never grant containment.
+  if (c.dots) return { secret, within: "outside" };
 
   const find = (roots: string[]) => {
     for (const root of roots) {
-      const rel = contains(stripTrailingSep(normalize(root, p.platform), p.platform), target, p.platform);
+      const rc = canon(root, p.platform);
+      if (!rc) continue; // empty / relative roots grant nothing
+      const rel = contains(stripTrailingSep(rc.path, p.platform), target, p.platform);
       if (rel !== undefined) return { root, relative: rel };
     }
     return undefined;
