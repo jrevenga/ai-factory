@@ -124,17 +124,24 @@ export const GIT_PUSH_FORCE: readonly string[] = ["--force", "--force-with-lease
 // --- package managers and runners (ruling 18) ---
 
 export const PACKAGE_MANAGERS: ReadonlySet<string> = new Set(["npm", "pnpm", "yarn", "bun"]);
-/** Exact argument vectors after the package manager that are allowlisted. */
+/** Exact argument vectors after any package manager that are allowlisted (project scripts). */
 export const PACKAGE_MANAGER_ALLOWLIST: readonly (readonly string[])[] = [
   ["test"],
   ["run", "test"],
   ["run", "build"],
   ["run", "lint"],
   ["run", "typecheck"],
-  ["ci"],
-  ["install", "--frozen-lockfile"],
-  ["install", "--immutable"],
 ];
+/**
+ * Frozen installs, per manager (controller ruling R22): only flags the manager honours.
+ * npm ignores `--frozen-lockfile`/`--immutable` and would run a full install, so npm gets `ci` only.
+ */
+export const PACKAGE_MANAGER_FROZEN_INSTALL: Readonly<Record<string, readonly (readonly string[])[]>> = {
+  npm: [["ci"]],
+  pnpm: [["install", "--frozen-lockfile"]],
+  yarn: [["install", "--frozen-lockfile"], ["install", "--immutable"]],
+  bun: [["install", "--frozen-lockfile"]],
+};
 /** Any of these arguments makes a package-manager invocation remote-mutating. */
 export const PACKAGE_MANAGER_REMOTE: Readonly<Record<string, readonly string[]>> = {
   npm: ["publish", "unpublish", "deprecate", "dist-tag"],

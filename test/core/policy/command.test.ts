@@ -44,6 +44,14 @@ describe("classifyCommandLine: allowlisted", () => {
     expect(classify("a $(b)").allowlisted).toBe(false);
   });
 
+  it("allowlists frozen installs per package manager (R22)", () => {
+    expect(classify("npm ci").allowlisted).toBe(true);
+    expect(classify("pnpm install --frozen-lockfile").allowlisted).toBe(true);
+    expect(classify("yarn install --immutable").allowlisted).toBe(true);
+    expect(classify("npm install --frozen-lockfile").allowlisted).toBe(false);
+    expect(classify("npm install --immutable").allowlisted).toBe(false);
+  });
+
   it("reports per-segment classes", () => {
     expect(classify("ls && git push").segments).toEqual([
       { argv: ["ls"], class: "read-only", allowlisted: true },

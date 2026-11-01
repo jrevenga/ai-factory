@@ -318,7 +318,10 @@ function classifyPackageManager(name: string, args: readonly string[]): Verdict 
     if (args[1] === "--no" && args[2] === "--" && bin !== undefined && R.NPX_BINS.has(bin)) return classifyBin(bin, args.slice(4));
     return unknown("npm exec may download and run code; only `npm exec --no -- <bin>` for known runners is allowed");
   }
-  if (R.PACKAGE_MANAGER_ALLOWLIST.some((t) => argvEqual(t, args))) return localWrite(`${name} ${args.join(" ")} is allowlisted`);
+  const frozen = lookup(R.PACKAGE_MANAGER_FROZEN_INSTALL, name) ?? [];
+  if ([...R.PACKAGE_MANAGER_ALLOWLIST, ...frozen].some((t) => argvEqual(t, args))) {
+    return localWrite(`${name} ${args.join(" ")} is allowlisted`);
+  }
   return unknown(`${name} ${args.join(" ")} is not an allowlisted runner`);
 }
 
