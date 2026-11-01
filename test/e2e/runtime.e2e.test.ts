@@ -40,9 +40,17 @@ beforeAll(async () => {
   server = await startGitServer(root);
 }, 600_000);
 
+// Two hooks on purpose. The git server's close is bounded (killProcessTree deadlines) and keeps the
+// default hook timeout, so a real hang still fails here. Removing the temp dir is slow on Windows: it
+// holds the installed Pi tree and the isolated npm cache (~18k files), so it gets a generous timeout.
+let closing: Promise<void> | undefined;
+const closeServer = () => (closing ??= server?.close() ?? Promise.resolve());
 afterAll(async () => {
-  await server?.close();
+  await closeServer();
   await tmp?.cleanup();
+}, 120_000);
+afterAll(async () => {
+  await closeServer();
 });
 
 describe("PiRuntime (e2e, real Pi 1.4.0)", () => {
