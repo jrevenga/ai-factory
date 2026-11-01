@@ -10,6 +10,10 @@
 //   v0.1.0 = HEAD's tree
 //   v0.2.0 = v0.1.0 + `factory`/`version` 0.2.0 in release.json/package.json and a `## [0.2.0]` changelog
 //            section (additive release: same stateSchemas, same lockfile, so lockfileSha256 stays valid)
+//
+// After the install, the update and the rollback, the pinned Pi runs with the faux provider and only the
+// test extensions on its command line: the factory package must load from Pi's settings (the checkout Pi
+// installed), handshake and let the guard allow a write (I4).
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -23,9 +27,12 @@ import { locateGlobalCli } from "../../src/cli/commands/install.ts";
 import { startGitServer, type GitServer } from "../helpers/git-server.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { tree } from "../helpers/release-world.ts";
+import { runPiPrint } from "../helpers/pi-harness.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const FAUX = join(ROOT, "test", "fixtures", "faux-provider.ts");
+const OBSERVER = join(ROOT, "test", "fixtures", "observer.ts");
 const isWindows = process.platform === "win32";
 const STEP_TIMEOUT_MS = 15 * 60_000;
 const BOOTSTRAP_BUDGET_S = 600;
@@ -157,6 +164,44 @@ function snapshotIds(): string[] {
   return existsSync(paths.backups) ? readdirSync(paths.backups) : [];
 }
 
+function observed(file: string): Array<{ event: string; data?: unknown }> {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => JSON.parse(l) as { event: string; data?: unknown });
+}
+
+/**
+ * Runs the installed pinned Pi (state.piCli) in print mode with the faux provider scripting one write.
+ * Only the test extensions (faux provider, observer) are passed with -e; the factory package comes from
+ * Pi's settings and the guard from Pi's extensions dir, exactly as a user's session loads them.
+ */
+async function piWrite(label: string, extraEnv: NodeJS.ProcessEnv = {}): Promise<{ run: RunResult; written: boolean; handshakes: unknown[] }> {
+  const work = join(tmp.dir, "pi work", label);
+  await mkdir(work, { recursive: true });
+  const target = join(work, "written.txt");
+  const log = join(work, "observed.jsonl");
+  const run = await runPiPrint({
+    cli: readJsonFile(paths.state).piCli as string,
+    agentDir: paths.piAgentDir,
+    cwd: work,
+    extensions: [FAUX, OBSERVER],
+    env: { ...env, ...extraEnv, FAUX_SCRIPT: JSON.stringify([{ tool: "write", args: { path: target, content: label } }]), OBSERVE_FILE: log },
+    timeoutMs: 120_000,
+  });
+  const handshakes = observed(log).filter((o) => o.event === "handshake").map((o) => o.data);
+  return { run, written: existsSync(target), handshakes };
+}
+
+/** I4: the installed factory package loads from Pi settings, handshakes at `version` and the write is allowed. */
+async function expectInstalledPackageAllowsWrites(label: string, version: string): Promise<void> {
+  const { run, written, handshakes } = await piWrite(label);
+  expect(run.code, describeRun(run)).toBe(0);
+  expect(handshakes, describeRun(run)).toEqual([{ ok: true, version, policy: "none", reasons: [] }]);
+  expect(written, describeRun(run)).toBe(true);
+}
+
 beforeAll(async () => {
   tmp = await makeTmp("roundtrip-e2e");
   server = await buildFixture(tmp.dir);
@@ -219,6 +264,16 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       expect(existsSync(join(paths.piExtensions, GUARD_FILE_NAME))).toBe(true);
       expect(readJsonFile(paths.config).profile).toBe("codex-only");
       await expectDoctorHealthy();
+
+      await expectInstalledPackageAllowsWrites("after install", "0.1.0");
+      // Negative control: the same run against an uninstalled factory home is blocked by the installed
+      // package's own handshake report, which proves the package (not only the guard) was loaded.
+      const emptyHome = join(tmp.dir, "empty factory home");
+      await mkdir(emptyHome, { recursive: true });
+      const blocked = await piWrite("not installed", { FACTORY_HOME: emptyHome });
+      expect(blocked.written, describeRun(blocked.run)).toBe(false);
+      expect(blocked.run.stderr).toContain("factory handshake failed: not-installed");
+      expect(blocked.handshakes).toEqual([{ ok: false, version: "0.1.0", policy: "none", reasons: ["not-installed"] }]);
     },
     STEP_TIMEOUT_MS + 60_000,
   );
@@ -239,6 +294,7 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       expect(piPackages()).not.toContain(`git:${source}@v0.1.0`);
       expect(existsSync(paths.txn)).toBe(false);
       await expectDoctorHealthy();
+      await expectInstalledPackageAllowsWrites("after update", "0.2.0");
     },
     STEP_TIMEOUT_MS,
   );
@@ -263,6 +319,7 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       expect(tree(join(paths.backups, updateSnapshot as string))).toEqual(updateSnapshotTree);
       expect(snapshotIds().filter((id) => id.endsWith("-0.2.0-to-0.1.0"))).toHaveLength(1);
       await expectDoctorHealthy();
+      await expectInstalledPackageAllowsWrites("after rollback", "0.1.0");
     },
     STEP_TIMEOUT_MS,
   );
