@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { GUARD_FILE_NAME } from "../../../guard/factory-guard.ts";
 import { loadProfiles, readPersonalConfig, readState } from "../../adapters/store/state-store.ts";
 import { readTxn } from "../../adapters/store/transaction.ts";
-import { classifyGitError, lsRemoteTags, type GitErrorKind } from "../../adapters/vcs/git.ts";
+import { classifyGitError, gitEnv, lsRemoteTags, type GitErrorKind } from "../../adapters/vcs/git.ts";
 import { PiRuntime, pinnedCliPath } from "../../adapters/pi/runtime.ts";
 import { readPiSettings } from "../../adapters/pi/settings-file.ts";
 import { readJson } from "../../adapters/platform/json-file.ts";
@@ -123,7 +123,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
   );
   await add("git", async () => {
     try {
-      const r = await runBounded("git", ["--version"], { env, timeoutMs: 10_000 });
+      const r = await runBounded("git", ["--version"], { env: gitEnv(env), timeoutMs: 10_000 });
       if (r.code === 0) return { status: "ok", message: r.stdout.trim() };
       return { status: "fail", message: `git --version exited with ${r.code}`, fix: "Reinstall Git (https://git-scm.com/downloads)." };
     } catch (e) {
@@ -210,7 +210,31 @@ export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
       : { status: "ok", message: "using the release's package source" },
   );
 
-  const personal = await readPersonalConfig(paths).catch(() => undefined);
+  let personal: Awaited<ReturnType<typeof readPersonalConfig>>;
+  let configProblem: string | undefined;
+  await add("config", async () => {
+    try {
+      personal = await readPersonalConfig(paths);
+    } catch (e) {
+      configProblem = msg(e);
+      return { status: "fail", message: configProblem.includes(paths.config) ? configProblem : `${paths.config}: ${configProblem}`, fix: `Fix or remove ${paths.config}, then run \`factory install\`.` };
+    }
+    return personal
+      ? { status: "ok", message: `${paths.config} parses (profile ${personal.profile})` }
+      : { status: "warn", message: `no ${paths.config}: defaults are in use`, fix: "factory install" };
+  });
+  let profiles: Awaited<ReturnType<typeof loadProfiles>> = [];
+  let profilesProblem: string | undefined;
+  await add("profiles", async () => {
+    try {
+      profiles = await loadProfiles(join(root, "profiles"));
+    } catch (e) {
+      profilesProblem = msg(e);
+      return { status: "fail", message: profilesProblem, fix: "factory install (reinstalls the shipped profiles); if it persists, report this message." };
+    }
+    return { status: "ok", message: `${profiles.length} profiles load` };
+  });
+
   const piCli = pinnedCliPath(join(paths.piPrefixes, manifest.pi.version));
   const logins = await detectLogins({ piCli: existsSync(piCli) ? piCli : undefined, env });
   await add("logins", () => {
@@ -232,11 +256,12 @@ export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
       }
     });
     await add("provider-reachability", async () => {
-      let required: Provider[] = ["claude", "codex"];
-      if (personal) {
-        const profile = (await loadProfiles(join(root, "profiles")).catch(() => [])).find((p) => p.name === personal.profile);
-        if (profile) required = profile.requires;
+      if (configProblem || profilesProblem) {
+        return { status: "warn", message: "skipped: the required providers depend on a config or profiles failure reported above", fix: "Fix the config/profiles failure, then re-run `factory doctor`." };
       }
+      let required: Provider[] = ["claude", "codex"];
+      const profile = profiles.find((p) => p.name === personal?.profile);
+      if (profile) required = profile.requires;
       const result = await checkReachability(required, ctx.fetchFn ?? fetch);
       const down = Object.entries(result).filter(([, v]) => v === "unreachable").map(([k]) => k);
       return down.length === 0
@@ -246,6 +271,7 @@ export async function runDoctor(ctx: DoctorContext): Promise<DoctorCheck[]> {
   }
 
   await add("parallelism", async () => {
+    if (configProblem) return { status: "warn", message: "skipped: personal config is invalid (see the config check)", fix: `Fix ${paths.config} first.` };
     const core = CoreConfig.parse(await readJson(join(root, "defaults", "config.json")));
     const configured = personal?.parallelism ?? core.parallelism;
     const max = Math.max(1, Math.min(8, Math.floor(totalmem() / 1024 ** 3 / 4)));

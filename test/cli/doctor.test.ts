@@ -1,7 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { delimiter, join } from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { installWarningFilter } from "../../bin/warning-filter.mjs";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
 import { runDoctor, type DoctorCheck } from "../../src/cli/commands/doctor.ts";
 import { main } from "../../src/cli/main.ts";
@@ -10,6 +11,16 @@ import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
 
 const manifest = ReleaseManifest.parse(JSON.parse(readFileSync("release.json", "utf8")));
+// The first node:sqlite import prints an ExperimentalWarning; the CLI entry hides it, so do the same here.
+let restoreEmit: typeof process.emitWarning;
+beforeAll(() => {
+  restoreEmit = process.emitWarning;
+  installWarningFilter(process);
+});
+afterAll(() => {
+  process.emitWarning = restoreEmit;
+});
+
 let tmp: Tmp;
 let env: NodeJS.ProcessEnv;
 let paths: FactoryPaths;
@@ -123,5 +134,70 @@ describe("bin", () => {
     expect(r.stdout.trim()).toBe("0.1.0");
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
+  });
+});
+
+describe("configuration diagnostics", () => {
+  const fakeRoot = (profiles: Record<string, string>): string => {
+    const root = join(tmp.dir, "root");
+    mkdirSync(join(root, "defaults"), { recursive: true });
+    mkdirSync(join(root, "profiles"), { recursive: true });
+    copyFileSync("defaults/config.json", join(root, "defaults", "config.json"));
+    for (const [name, text] of Object.entries(profiles)) writeFileSync(join(root, "profiles", name), text);
+    return root;
+  };
+
+  it("missing personal config warns and points to factory install", async () => {
+    const c = byId(await runDoctor({ paths, env, offline: true, manifest }), "config");
+    expect(c?.status).toBe("warn");
+    expect(c?.message + (c?.fix ?? "")).toMatch(/factory install/);
+  });
+
+  it("malformed personal config fails with its path and skips dependent checks", async () => {
+    mkdirSync(paths.home, { recursive: true });
+    writeFileSync(paths.config, "{ not json");
+    const checks = await runDoctor({ paths, env, offline: false, manifest, fetchFn: async () => new Response(null) });
+    const c = byId(checks, "config");
+    expect(c?.status).toBe("fail");
+    expect(c?.message).toContain(paths.config);
+    expect(c?.fix).toBeTruthy();
+    for (const id of ["parallelism", "provider-reachability"]) {
+      expect(byId(checks, id)?.status, id).toBe("warn");
+      expect(byId(checks, id)?.message, id).toMatch(/config/);
+    }
+  });
+
+  it("schema-invalid personal config fails", async () => {
+    mkdirSync(paths.home, { recursive: true });
+    writeFileSync(paths.config, JSON.stringify({ schema: 1 }));
+    expect(byId(await runDoctor({ paths, env, offline: true, manifest }), "config")?.status).toBe("fail");
+  });
+
+  it("a malformed profile file fails profiles with its path", async () => {
+    const root = fakeRoot({ "bad.json": "{ nope" });
+    const checks = await runDoctor({ paths, env, offline: true, manifest, root });
+    const p = byId(checks, "profiles");
+    expect(p?.status).toBe("fail");
+    expect(p?.message).toContain("bad.json");
+    expect(p?.fix).toBeTruthy();
+  });
+
+  it("valid profiles pass", async () => {
+    const root = fakeRoot({ "claude-codex.json": readFileSync("profiles/claude-codex.json", "utf8") });
+    expect(byId(await runDoctor({ paths, env, offline: true, manifest, root }), "profiles")?.status).toBe("ok");
+  });
+});
+
+describe("git child environment", () => {
+  it.skipIf(process.platform === "win32")("the git version probe runs non-interactively", async () => {
+    const bin = join(tmp.dir, "fake bin");
+    mkdirSync(bin, { recursive: true });
+    const dump = join(tmp.dir, "git-env.txt");
+    const script = join(bin, "git");
+    writeFileSync(script, `#!/bin/sh\n[ -e "${dump}" ] || env > "${dump}"\necho "git version 0.0.0"\n`, { mode: 0o755 });
+    await runDoctor({ paths, env: { ...env, PATH: `${bin}${delimiter}${env.PATH ?? ""}` }, offline: true, manifest });
+    const dumped = readFileSync(dump, "utf8");
+    expect(dumped).toMatch(/^GIT_TERMINAL_PROMPT=0$/m);
+    expect(dumped).toMatch(/^GCM_INTERACTIVE=never$/m);
   });
 });
