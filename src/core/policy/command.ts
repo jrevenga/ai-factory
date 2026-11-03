@@ -46,8 +46,10 @@ export interface CommandClassification {
   segments: SegmentClassification[];
   hardClass?: HardClass;
   reasons: string[];
-  /** Paths written (or redirected from) by the line, for the gate's path checks. */
+  /** Paths written by the line (write arguments and output redirection targets), for the gate's path checks. */
   pathArgs: string[];
+  /** Input redirection (`<`) sources: reads, checked by the gate for secrets only. */
+  inputPaths: string[];
   allowlisted: boolean;
 }
 
@@ -170,8 +172,9 @@ function parseWithSpec(args: readonly string[], spec: R.OptionSpec): ParseResult
 // --- per-command rules ---
 
 function classifyReadOnly(name: string, args: readonly string[], rule: R.ReadOnlyRule): Verdict {
-  if (rule.denyLong && hasLong(args, rule.denyLong)) return unknown(`${name} with this option can write or run code`);
-  if (rule.denyShort && hasShort(args, rule.denyShort)) return unknown(`${name} with this option can write or run code`);
+  const why = `${name} with this option ${rule.denyReason ?? "can write or run code"}`;
+  if (rule.denyLong && hasLong(args, rule.denyLong)) return unknown(why);
+  if (rule.denyShort && hasShort(args, rule.denyShort)) return unknown(why);
   if (rule.maxPositionals !== undefined && positionals(args).length > rule.maxPositionals) {
     return unknown(`${name} with an output file argument`);
   }
@@ -302,8 +305,9 @@ function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
 function classifyBin(bin: string, rest: readonly string[]): Verdict {
   if (R.ANY_ARGS_RUNNERS.has(bin)) return localWrite(`${bin} is an allowlisted runner`);
   if (bin === "prettier") {
+    if (rest.some((a) => R.PRETTIER_WRITE.includes(a))) return localWrite("prettier --write is allowlisted", positionals(rest));
     return rest.some((a) => R.PRETTIER_REQUIRED.includes(a))
-      ? localWrite("prettier --check/--write is allowlisted")
+      ? localWrite("prettier --check is allowlisted")
       : unknown("prettier without --check or --write");
   }
   return unknown(`${bin} is not an allowlisted runner`);
@@ -498,6 +502,7 @@ function classifyByName(name: string, args: readonly string[]): Verdict {
   if (probes?.some((p) => argvEqual(p, args))) return readOnly(`${name} version probe`);
   if (R.ALWAYS_UNKNOWN.has(name)) return unknown(`${name} runs or alters another command`);
 
+  if (R.RECURSIVE_READERS.has(name)) return unknown(`${name} searches directories recursively and can read secrets (R23)`);
   const rule = lookup(R.READ_ONLY_COMMANDS, name);
   if (rule) return classifyReadOnly(name, args, rule);
   if (R.PACKAGE_MANAGERS.has(name)) return classifyPackageManager(name, args);
@@ -574,7 +579,7 @@ function commandName(argv0: string): string | undefined {
   return base === "" ? undefined : base;
 }
 
-function classifySegment(seg: Segment, ctx: CommandContext): Verdict {
+function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPaths: string[] } {
   const argv0 = seg.argv[0];
   let v: Verdict;
   if (argv0 === undefined) {
@@ -598,10 +603,11 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict {
   }
   let cls = v.class;
   const pathArgs = [...v.pathArgs];
+  const inputPaths: string[] = [];
   const reasons = [...v.reasons];
   for (const r of seg.redirections) {
     if (r.op === "2>&1" || R.NULL_TARGETS.has(r.target)) continue;
-    pathArgs.push(r.target);
+    (r.op === "<" ? inputPaths : pathArgs).push(r.target);
     if (R.NETWORK_TARGET_PREFIXES.some((p) => r.target.startsWith(p))) {
       cls = maxClass(cls, "remote-mutating");
       reasons.push(`redirection to ${r.target} opens a network connection`);
@@ -609,13 +615,13 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict {
     if (r.op !== "<") cls = maxClass(cls, "local-write");
   }
   const allowlisted = v.allowlisted && (cls === "read-only" || cls === "local-write");
-  return { class: cls, allowlisted, reasons, pathArgs };
+  return { class: cls, allowlisted, reasons, pathArgs, inputPaths };
 }
 
 export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandClassification {
   const tok = tokenizeCommandLine(cmd);
   if (!tok.ok) {
-    return { class: "unknown", segments: [], reasons: [`not classifiable: ${tok.reason}`], pathArgs: [], allowlisted: false };
+    return { class: "unknown", segments: [], reasons: [`not classifiable: ${tok.reason}`], pathArgs: [], inputPaths: [], allowlisted: false };
   }
   let cls: CommandClass = "read-only";
   let hard: HardClass | undefined;
@@ -623,6 +629,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
   const segments: SegmentClassification[] = [];
   const reasons: string[] = [];
   const pathArgs: string[] = [];
+  const inputPaths: string[] = [];
   tok.segments.forEach((seg, i) => {
     const v = classifySegment(seg, ctx);
     segments.push({ argv: seg.argv, class: v.class, allowlisted: v.allowlisted });
@@ -632,8 +639,9 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
     const label = seg.argv[0] ?? "(none)";
     for (const r of v.reasons) reasons.push(`segment ${i + 1} (${label}): ${r}`);
     for (const p of v.pathArgs) if (!pathArgs.includes(p)) pathArgs.push(p);
+    for (const p of v.inputPaths) if (!inputPaths.includes(p)) inputPaths.push(p);
   });
-  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, allowlisted };
+  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, allowlisted };
   if (hard !== undefined) result.hardClass = hard;
   return result;
 }

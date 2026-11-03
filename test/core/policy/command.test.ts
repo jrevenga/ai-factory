@@ -84,6 +84,35 @@ describe("classifyCommandLine: tokenizer failures", () => {
   });
 });
 
+describe("classifyCommandLine: inputPaths", () => {
+  it("reports input redirections separately from written paths", () => {
+    expect(classify("sort < in.txt").inputPaths).toEqual(["in.txt"]);
+    const r = classify("sort < a > b");
+    expect(r.pathArgs).toEqual(["b"]);
+    expect(r.inputPaths).toEqual(["a"]);
+    expect(classify("ls").inputPaths).toEqual([]);
+    expect(classify("echo $(x)").inputPaths).toEqual([]);
+  });
+
+  it("keeps a path that is both read and written in pathArgs", () => {
+    const r = classify("sed -i s/a/b/ f < f");
+    expect(r.pathArgs).toEqual(["f"]);
+    expect(r.inputPaths).toEqual(["f"]);
+  });
+});
+
+describe("classifyCommandLine: prettier --write paths (review M2)", () => {
+  it("reports the files prettier --write rewrites", () => {
+    expect(classify("prettier --write src a.ts").pathArgs).toEqual(["src", "a.ts"]);
+    expect(classify("npx --no-install prettier --write .factory/config.json").pathArgs).toEqual([".factory/config.json"]);
+    expect(classify("prettier -w x.ts").pathArgs).toEqual(["x.ts"]);
+  });
+
+  it("prettier --check writes nothing", () => {
+    expect(classify("prettier --check src").pathArgs).toEqual([]);
+  });
+});
+
 describe("classifyCommandLine: pathArgs", () => {
   it("reports write paths and redirection targets", () => {
     expect(classify("tee ../outside.txt").pathArgs).toEqual(["../outside.txt"]);
@@ -99,7 +128,7 @@ describe("classifyCommandLine: pathArgs", () => {
     expect(classify("curl -o out.html https://x").pathArgs).toEqual(["out.html"]);
     expect(classify("curl --output=out.html https://x").pathArgs).toEqual(["out.html"]);
     expect(classify("wget -O page https://x").pathArgs).toEqual(["page"]);
-    expect(classify("sort < in.txt").pathArgs).toEqual(["in.txt"]);
+    expect(classify("sort < in.txt").pathArgs).toEqual([]);
   });
 
   it("reports the git -C directory for writing git commands", () => {

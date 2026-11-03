@@ -27,7 +27,11 @@ export interface ReadOnlyRule {
   denyShort?: string;
   /** Maximum number of non-option arguments (`uniq in out` writes `out`). */
   maxPositionals?: number;
+  /** Why a disqualifying option is rejected; defaults to "can write or run code". */
+  denyReason?: string;
 }
+
+const RECURSIVE_READ = "reads every file under a directory, including secrets (R23)";
 
 export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   ls: {},
@@ -39,8 +43,8 @@ export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   uniq: { maxPositionals: 1 },
   cut: {},
   tr: {},
-  grep: {},
-  rg: { denyLong: ["--pre", "--pre-glob"] },
+  // `-d ACTION` / `--directories=ACTION` is rejected whatever the action (`recurse` reads recursively).
+  grep: { denyShort: "rRd", denyLong: ["--recursive", "--dereference-recursive", "--directories"], denyReason: RECURSIVE_READ },
   fd: { denyShort: "xX", denyLong: ["--exec", "--exec-batch"] },
   tree: { denyShort: "oR" },
   pwd: {},
@@ -62,10 +66,13 @@ export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   readlink: {},
   date: { denyShort: "s", denyLong: ["--set"] },
   sleep: {},
-  diff: {},
+  diff: { denyShort: "r", denyLong: ["--recursive"], denyReason: RECURSIVE_READ },
   cmp: {},
   jq: { denyShort: "i", denyLong: ["--in-place"] },
 };
+
+/** Content searchers that recurse by default (`unknown`, R23): the grep read tool is the supported path. */
+export const RECURSIVE_READERS: ReadonlySet<string> = new Set(["rg"]);
 
 /** `find` predicates that execute or write (`unknown`) or delete (`destructive`). */
 export const FIND_UNKNOWN_PREDICATES: ReadonlySet<string> = new Set([
@@ -155,6 +162,8 @@ export const NPX_BINS: ReadonlySet<string> = new Set(["vitest", "jest", "tsc", "
 export const ANY_ARGS_RUNNERS: ReadonlySet<string> = new Set(["vitest", "jest", "tsc", "eslint", "pytest"]);
 /** prettier is allowlisted only with one of these options. */
 export const PRETTIER_REQUIRED: readonly string[] = ["--check", "-c", "--write", "-w"];
+/** `prettier --write` rewrites its positional arguments in place: they are reported as pathArgs. */
+export const PRETTIER_WRITE: readonly string[] = ["--write", "-w"];
 export const UV_ALLOWLIST_PREFIX: readonly string[] = ["run", "pytest"];
 export const UV_ALLOWLIST_EXACT: readonly (readonly string[])[] = [["sync", "--frozen"]];
 export const GO_SUBCOMMANDS: ReadonlySet<string> = new Set(["test", "build", "vet"]);
