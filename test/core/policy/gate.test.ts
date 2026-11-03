@@ -6,7 +6,9 @@ import type { RouteState } from "../../../src/core/route/types.ts";
 const ROOT = "/w/proj";
 const WT = "/w/wt";
 const HOME = "/h";
-const LEDGER = "/h/.factory/runs/proj-0123456789ab/20261101T000000Z-42";
+/** `<FACTORY_HOME>/runs`: every run's ledger is protected, not only the current one (review M3). */
+const LEDGER = "/h/.factory/runs";
+const RUN_LEDGER = `${LEDGER}/proj-0123456789ab/20261101T000000Z-42/events.jsonl`;
 
 const ANSWER: RouteState = { route: "answer", writeRoots: [], needsReclassification: false };
 const SMALL: RouteState = { route: "small", tier: "small", taskId: "small-1", writeRoots: [ROOT], needsReclassification: false };
@@ -108,6 +110,31 @@ describe("evaluateGate: read tools", () => {
     expect(evaluateGate(read("notes.txt", "/h/.aws/credentials"), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
   });
 
+  it("R23: a read tool on home, an ancestor of home or a secret-holding home dir asks (secrets)", () => {
+    for (const target of ["/h", "/", "/h/.aws", "/h/.config", "/h/.config/gh", "/h/.config/gcloud", "/h/.pi", "/h/.pi/agent", "/h/.codex", "/h/.docker", "/h/.kube", "/h/.ssh", "/h/.gnupg", "/h/.azure"]) {
+      const r = evaluateGate({ kind: "read", tool: "grep", path: fact(target) }, ctx({ route: ANSWER, mode: "unattended" }));
+      expect(r, target).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    }
+  });
+
+  it("R23: a custom piAgentDir and its ancestors ask", () => {
+    const c = ctx({ piAgentDir: "/opt/agents/pi" });
+    expect(evaluateGate({ kind: "read", tool: "grep", path: fact("/opt/agents/pi") }, c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate({ kind: "read", tool: "find", path: fact("/opt/agents") }, c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R23: R23 does not catch ordinary directories (project, home subdirs, unrelated)", () => {
+    for (const target of [ROOT, "/h/projects", "/h/.config/nvim", "/h/.aws-notes", "/opt"]) {
+      expect(evaluateGate({ kind: "read", tool: "grep", path: fact(target) }, ctx()).decision, target).toBe("allow");
+    }
+  });
+
+  it("R23: the win32 home is matched case-insensitively", () => {
+    const c = ctx({ home: "C:\\Users\\u", piAgentDir: "C:\\Users\\u\\.pi\\agent", projectRoot: "C:\\w\\proj", ledgerDir: "C:\\Users\\u\\.factory\\runs", tmpRoots: [], gitDirs: [], route: { ...ANSWER } });
+    const path: PathFacts = { input: "c:\\users\\U\\.AWS", resolved: "c:\\users\\U\\.AWS", platform: "win32" };
+    expect(evaluateGate({ kind: "read", tool: "grep", path }, c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
   it("reading outside the project (non-secret) is allowed", () => {
     expect(evaluateGate(read("/etc/hosts"), ctx()).decision).toBe("allow");
   });
@@ -198,7 +225,15 @@ describe("evaluateGate: write tools", () => {
   });
 
   it("writing under the run ledger directory is denied, not asked", () => {
-    expect(evaluateGate(write(`${LEDGER}/events.jsonl`), ctx()).decision).toBe("deny");
+    expect(evaluateGate(write(RUN_LEDGER), ctx()).decision).toBe("deny");
+  });
+
+  it("writing another run's ledger is denied too", () => {
+    expect(evaluateGate(write(`${LEDGER}/other-proj-ffffffffffff/20261030T000000Z-7/events.jsonl`), ctx()).decision).toBe("deny");
+  });
+
+  it("high autonomy in interactive mode still asks (not denies) for a write outside the roots", () => {
+    expect(evaluateGate(write("/elsewhere/x"), ctx(HIGH))).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
   });
 
   it("feature write before the task file exists is denied", () => {
@@ -366,13 +401,99 @@ describe("evaluateGate: commands", () => {
   });
 
   it("a command write under the ledger dir is denied", () => {
-    const target = `${LEDGER}/events.jsonl`;
-    expect(evaluateGate(bash(`tee ${target}`, [[target]]), ctx()).decision).toBe("deny");
+    expect(evaluateGate(bash(`tee ${RUN_LEDGER}`, [[RUN_LEDGER]]), ctx()).decision).toBe("deny");
   });
 
   it("a command write in the feature worktree before the task file exists is denied", () => {
     const r = evaluateGate(bash("touch src/a.ts", [["src/a.ts"]], WT), ctx({ route: FEATURE, taskFileExists: false }));
     expect(r.decision).toBe("deny");
+  });
+
+  it("I1: non-read-only git commands on the answer route are denied (not reconcilable)", () => {
+    for (const command of ["git commit -m x", "git add -A && git commit -m x", "git switch -c foo", "git checkout -b foo", "git stash push -u", "git add ."]) {
+      const r = evaluateGate(bash(command), ctx({ route: ANSWER, mode: "unattended" }));
+      expect(r.decision, command).toBe("deny");
+      expect(r.reconcile, command).toBe(false);
+    }
+  });
+
+  it("I1: read-only git on the answer route is still allowed", () => {
+    expect(evaluateGate(bash("git log --oneline -5 && npm test"), ctx({ route: ANSWER }))).toMatchObject({ decision: "allow", reconcile: true });
+  });
+
+  it("I1: git commit on a change route is unaffected", () => {
+    expect(evaluateGate(bash("git commit -m x"), ctx(UNATTENDED)).decision).toBe("allow");
+  });
+
+  it("I2: a command write to the current task file is denied (machine section)", () => {
+    const task = ".factory/knowledge/tasks/t1.md";
+    const c = ctx({ route: FEATURE, mode: "unattended" });
+    expect(evaluateGate(bash(`sed -i s/phase/x/ ${task}`, [[task]], WT), c).decision).toBe("deny");
+    expect(evaluateGate(bash(`tee ${task}`, [[task]], WT), c).decision).toBe("deny");
+    expect(evaluateGate(bash(`rm ${task}`, [[task]], WT), ctx({ route: FEATURE })).decision).toBe("deny");
+    expect(evaluateGate(bash(`echo x >> ${task}`, [[task]], WT), ctx({ route: FEATURE })).decision).toBe("deny");
+  });
+
+  it("I2: the small route's task file is protected from commands too", () => {
+    const task = ".factory/knowledge/tasks/small-1.md";
+    expect(evaluateGate(bash(`touch ${task}`, [[task]]), ctx()).decision).toBe("deny");
+  });
+
+  it("I2: the write tool may still write the task file", () => {
+    expect(evaluateGate(write(".factory/knowledge/tasks/t1.md", { base: WT }), ctx({ route: FEATURE })).decision).toBe("allow");
+  });
+
+  it("I3a: a .factory segment in a command write path outside the roots is denied", () => {
+    const c = ctx(UNATTENDED);
+    expect(evaluateGate(bash("tee /tmp/payload/.factory/config.json", [["/tmp/payload/.factory/config.json"]]), c).decision).toBe("deny");
+    expect(evaluateGate(bash(`cp -R /tmp/x/.factory ${ROOT}`, [["/tmp/x/.factory"], [ROOT]]), c).decision).toBe("deny");
+    expect(evaluateGate(bash(`mv /tmp/x/.FACTORY ${ROOT}`, [["/tmp/x/.FACTORY"], [ROOT]]), c).decision).toBe("deny");
+  });
+
+  it("I3a: inside a root, a nested .factory segment keeps the root-relative rule", () => {
+    expect(evaluateGate(bash("touch docs/.factory/notes.md", [["docs/.factory/notes.md"]]), ctx(UNATTENDED)).decision).toBe("allow");
+  });
+
+  it("I3b: a command write target equal to a write root or the project root asks (destructive)", () => {
+    const c = ctx(UNATTENDED);
+    expect(evaluateGate(bash(`mv ${ROOT} /tmp/p`, [[ROOT], ["/tmp/p"]]), c)).toMatchObject({ decision: "ask", hardGate: "destructive" });
+    expect(evaluateGate(bash(`cp -R /tmp/payload ${ROOT}`, [["/tmp/payload"], [ROOT]]), c)).toMatchObject({ decision: "ask", hardGate: "destructive" });
+    expect(evaluateGate(bash("cp -R /tmp/payload .", [["/tmp/payload"], [".", ROOT]]), c)).toMatchObject({ decision: "ask", hardGate: "destructive" });
+    const f = ctx({ route: FEATURE, mode: "unattended" });
+    expect(evaluateGate(bash(`cp -R /tmp/payload ${WT}`, [["/tmp/payload"], [WT]], WT), f)).toMatchObject({ decision: "ask", hardGate: "destructive" });
+  });
+
+  it("I3b: the project root as a target on a feature route is outside the worktree and still asks", () => {
+    expect(evaluateGate(bash(`cp -R /tmp/payload ${ROOT}`, [["/tmp/payload"], [ROOT]]), ctx({ route: FEATURE })).decision).toBe("ask");
+  });
+
+  it("M1: an input redirection is a read, not a write", () => {
+    expect(evaluateGate(bash("grep x < README.md", [["README.md"]]), ctx({ route: ANSWER }))).toMatchObject({ decision: "allow", reconcile: false });
+    expect(evaluateGate(bash("wc -l < /etc/hosts", [["/etc/hosts"]]), ctx()).decision).toBe("allow");
+    expect(evaluateGate(bash("cat < .factory/config.json", [[".factory/config.json"]]), ctx()).decision).toBe("allow");
+  });
+
+  it("M1: an input redirection from a secret still asks (secrets)", () => {
+    expect(evaluateGate(bash("cat < .env", [[".env"]]), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("M1: an input redirection without path facts fails closed (asks)", () => {
+    expect(evaluateGate(bash("cat < x"), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("M2: prettier --write on .factory/config.json is denied", () => {
+    const t = ".factory/config.json";
+    expect(evaluateGate(bash(`prettier --write ${t}`, [[t]]), ctx(UNATTENDED)).decision).toBe("deny");
+  });
+
+  it("M4: a remote-mutating redirect reports remote-mutation, not outside-root-write", () => {
+    const r = evaluateGate(bash("cat x > /dev/tcp/h/80", [["/dev/tcp/h/80"]]), ctx());
+    expect(r).toMatchObject({ decision: "ask", hardGate: "remote-mutation" });
+  });
+
+  it("R23: recursive grep and rg in bash are unknown (ask on change routes, deny on answer)", () => {
+    expect(evaluateGate(bash("grep -r aws_secret ~/.aws"), ctx())).toMatchObject({ decision: "ask", class: "unknown" });
+    expect(evaluateGate(bash("rg PASSWORD ."), ctx({ route: ANSWER })).decision).toBe("deny");
   });
 
   it("a project-declared command is allowed unattended", () => {
