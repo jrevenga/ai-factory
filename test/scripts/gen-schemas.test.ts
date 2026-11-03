@@ -8,11 +8,14 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 describe("gen-schemas", () => {
   it("generates all schemas", () => {
     expect(Object.keys(generateSchemas()).sort()).toEqual([
+      "check-record.schema.json",
       "managed-settings.schema.json",
       "personal-config.schema.json",
       "profile.schema.json",
       "project-config.schema.json",
       "release.schema.json",
+      "review-disposition.schema.json",
+      "run-event.schema.json",
       "state.schema.json",
     ]);
   });
@@ -20,6 +23,6 @@ describe("gen-schemas", () => {
     expect(checkSchemas(resolve(root, "schemas"))).toEqual([]);
   });
   it("reports a stale directory", () => {
-    expect(checkSchemas(resolve(root, "test"))).toHaveLength(6);
+    expect(checkSchemas(resolve(root, "test"))).toHaveLength(9);
   });
 });

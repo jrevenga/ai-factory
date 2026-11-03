@@ -1,0 +1,563 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "run_start"
+        },
+        "pid": {
+          "type": "number"
+        },
+        "projectId": {
+          "type": "string"
+        },
+        "projectRoot": {
+          "type": "string"
+        },
+        "factoryVersion": {
+          "type": "string"
+        },
+        "piSession": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "pid",
+        "projectId",
+        "projectRoot",
+        "factoryVersion"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "run_end"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "reason"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "run_interrupted"
+        },
+        "detectedBy": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "detectedBy"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "gate"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        },
+        "decision": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "allow",
+                "ask",
+                "deny"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "class": {
+          "type": "string"
+        },
+        "hardGate": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "tool",
+        "toolCallId",
+        "decision",
+        "reason",
+        "summary"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "route"
+        },
+        "state": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "state"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "decision"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "soft-gate-skipped",
+                "soft-gate-resolved",
+                "ruling"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "gate": {
+          "type": "string"
+        },
+        "justification": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "kind",
+        "justification"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "progress"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string"
+        },
+        "item": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "taskId"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "checkpoint"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "commit",
+            "undo-ref"
+          ]
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "taskId",
+        "sha",
+        "kind"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "check"
+        },
+        "record": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "exitCode": {
+              "type": "number"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "fingerprintAfter": {
+              "type": "string"
+            },
+            "mutated": {
+              "type": "boolean"
+            },
+            "durationMs": {
+              "type": "number"
+            },
+            "logPath": {
+              "type": "string"
+            },
+            "at": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "command",
+            "exitCode",
+            "cwd",
+            "fingerprint",
+            "fingerprintAfter",
+            "mutated",
+            "durationMs",
+            "logPath",
+            "at"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "record"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "reconciled"
+        },
+        "toolCallId": {
+          "type": "string"
+        },
+        "reverted": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "moved": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "backupDir": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "toolCallId",
+        "reverted",
+        "moved",
+        "backupDir"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "review"
+        },
+        "disposition": {
+          "type": "object",
+          "properties": {
+            "taskId": {
+              "type": "string"
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "disposition": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "approved",
+                    "approved_with_rulings",
+                    "escalated"
+                  ]
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "reviewer": {
+              "type": "string"
+            },
+            "findingsSummary": {
+              "type": "string"
+            },
+            "at": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "taskId",
+            "fingerprint",
+            "disposition",
+            "reviewer",
+            "findingsSummary",
+            "at"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "disposition"
+      ],
+      "additionalProperties": {}
+    },
+    {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "ts": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "const": "error"
+        },
+        "where": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "v",
+        "ts",
+        "runId",
+        "type",
+        "where",
+        "message"
+      ],
+      "additionalProperties": {}
+    }
+  ]
+}

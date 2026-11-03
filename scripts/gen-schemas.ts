@@ -4,6 +4,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { PersonalConfig, ProjectConfig } from "../src/core/config/schema.ts";
+import { CheckRecord, ReviewDisposition } from "../src/core/evidence/records.ts";
+import { RunEvent } from "../src/core/ledger/events.ts";
 import { Profile } from "../src/core/profiles/schema.ts";
 import { ReleaseManifest } from "../src/core/release/manifest.ts";
 import { ManagedRecord } from "../src/core/settings/managed.ts";
@@ -16,6 +18,9 @@ const SOURCES: Record<string, z.ZodType> = {
   "release.schema.json": ReleaseManifest,
   "managed-settings.schema.json": ManagedRecord,
   "state.schema.json": FactoryState,
+  "run-event.schema.json": RunEvent,
+  "check-record.schema.json": CheckRecord,
+  "review-disposition.schema.json": ReviewDisposition,
 };
 
 export function generateSchemas(): Record<string, string> {

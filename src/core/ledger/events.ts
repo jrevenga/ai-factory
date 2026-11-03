@@ -1,0 +1,60 @@
+// Run ledger events (Phase 2 ruling 9). Loose objects: readers accept fields added by newer versions.
+import { z } from "zod";
+import { CheckRecord, ReviewDisposition } from "../evidence/records.ts";
+
+const base = { v: z.literal(1), ts: z.string(), runId: z.string() };
+const open = <T extends readonly [string, ...string[]]>(values: T) => z.union([z.enum(values), z.string()]);
+const ev = <T extends string, S extends z.ZodRawShape>(type: T, shape: S) =>
+  z.looseObject({ ...base, type: z.literal(type), ...shape });
+
+export const RunEvent = z.discriminatedUnion("type", [
+  ev("run_start", {
+    pid: z.number(),
+    projectId: z.string(),
+    projectRoot: z.string(),
+    factoryVersion: z.string(),
+    piSession: z.string().optional(),
+  }),
+  ev("run_end", { reason: z.string() }),
+  ev("run_interrupted", { detectedBy: z.string() }),
+  ev("gate", {
+    tool: z.string(),
+    toolCallId: z.string(),
+    decision: open(["allow", "ask", "deny"] as const),
+    class: z.string().optional(),
+    hardGate: z.boolean().optional(),
+    reason: z.string(),
+    summary: z.string(),
+  }),
+  ev("route", { state: z.record(z.string(), z.unknown()) }),
+  ev("decision", {
+    kind: open(["soft-gate-skipped", "soft-gate-resolved", "ruling"] as const),
+    gate: z.string().optional(),
+    justification: z.string(),
+  }),
+  ev("progress", { taskId: z.string(), phase: z.string().optional(), item: z.string().optional() }),
+  ev("checkpoint", { taskId: z.string(), sha: z.string(), kind: z.enum(["commit", "undo-ref"]) }),
+  ev("check", { record: CheckRecord }),
+  ev("reconciled", {
+    toolCallId: z.string(),
+    reverted: z.array(z.string()),
+    moved: z.array(z.string()),
+    backupDir: z.string(),
+  }),
+  ev("review", { disposition: ReviewDisposition }),
+  ev("error", { where: z.string(), message: z.string() }),
+]);
+export type RunEvent = z.infer<typeof RunEvent>;
+
+/** `<sanitized basename>-<first 12 hex of sha256(realpath)>`; the hash function is injected to keep core pure. */
+export function projectIdFor(repoRootReal: string, sha256hex: (s: string) => string): string {
+  const parts = repoRootReal.split(/[\\/]+/).filter((p) => p.length > 0);
+  const name = (parts[parts.length - 1] ?? "").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40) || "project";
+  return `${name}-${sha256hex(repoRootReal).slice(0, 12)}`;
+}
+
+/** `<UTC yyyymmddThhmmssZ>-<pid>`. */
+export function runIdFor(now: Date, pid: number): string {
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  return `${stamp}-${pid}`;
+}
