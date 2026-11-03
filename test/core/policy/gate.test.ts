@@ -338,7 +338,8 @@ describe("evaluateGate: commands", () => {
   });
 
   it("sed -i with a plain substitution is allowlisted (Task 2 table): allowed unattended", () => {
-    expect(evaluateGate(bash("sed -i s/a/b/ file", [["file"]]), ctx(UNATTENDED)).decision).toBe("allow");
+    // R25: the script is path-like, so the extension supplies a (non-secret) fact for it too.
+    expect(evaluateGate(bash("sed -i s/a/b/ file", [["file"], ["s/a/b/"]]), ctx(UNATTENDED)).decision).toBe("allow");
   });
 
   it("sed -i with a non-substitution script is unknown: asks in both modes", () => {
@@ -523,14 +524,17 @@ describe("evaluateGate: commands", () => {
 
   it("R24: the find | sort --files0-from bypass is closed", () => {
     const action = bash("find ~/.aws -type f -print0 | sort --files0-from=-", [["~/.aws"]]);
-    expect(evaluateGate(action, ctx({ route: ANSWER, mode: "unattended" }))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    // Change route: the secret-dir guard asks. Answer route: the unknown segment is denied before any ask.
+    expect(evaluateGate(action, ctx({ mode: "unattended" }))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(action, ctx({ route: ANSWER, mode: "unattended" })).decision).toBe("deny");
     expect(evaluateGate(bash("find ~/.aws -type f -print0 | sort --files0-from=-"), ctx({ route: ANSWER })).decision).toBe("deny");
   });
 
   it("R24: the git diff --no-index bypass is closed", () => {
     const facts: [string, string?][] = [["~/.aws"], ["/tmp/empty"]];
     const c = ctx({ route: ANSWER, mode: "unattended" });
-    expect(evaluateGate(bash("git diff --no-index ~/.aws /tmp/empty", facts), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("git diff --no-index ~/.aws /tmp/empty", facts), ctx(UNATTENDED))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("git diff --no-index ~/.aws /tmp/empty", facts), c).decision).toBe("deny");
     expect(evaluateGate(bash("git diff --no-index ~/.aws /tmp/empty"), c).decision).toBe("deny");
     expect(evaluateGate(bash("git diff --no-index /h /tmp/empty"), c).decision).toBe("deny");
   });
@@ -547,6 +551,58 @@ describe("evaluateGate: commands", () => {
 
   it("R24: a write target on a secret-holding directory is not a read (root target and outside rules apply instead)", () => {
     expect(evaluateGate(bash("mkdir /tmp/h", [["/tmp/h"]]), ctx(UNATTENDED)).decision).toBe("allow");
+  });
+
+  it("R25: a path-like read argument whose fact is a secret asks, whatever option names it", () => {
+    // `head -n` takes a count; the classification is read-only, so only readArgs can catch the file.
+    const c = ctx({ route: ANSWER, mode: "unattended" });
+    expect(evaluateGate(bash("head -n ~/.aws/credentials x", [["~/.aws/credentials"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("sort -k1 --field-separator=/h/.aws/credentials x", [["/h/.aws/credentials"]]), c)).toMatchObject({
+      decision: "ask",
+      hardGate: "secrets",
+    });
+    expect(evaluateGate(bash("cut -d/h/.ssh/id_rsa x", [["/h/.ssh/id_rsa"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R25: a path-like read argument without a fact asks (secrets), on the answer route too", () => {
+    expect(evaluateGate(bash("head -n ~/.aws/credentials x"), ctx({ route: ANSWER }))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("cat ./notes.txt"), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R25: a path-like read argument with a non-secret fact is allowed", () => {
+    expect(evaluateGate(bash("cat ./notes.txt", [["./notes.txt"]]), ctx({ route: ANSWER, mode: "unattended" })).decision).toBe("allow");
+  });
+
+  it("R25: the leak commands ask secrets with a secret fact (denylist plus fact check)", () => {
+    const secret = "~/.aws/credentials";
+    for (const command of [
+      `date -f ${secret}`,
+      `date --file=${secret}`,
+      `file -m ${secret} x`,
+      `git blame --contents ${secret} README.md`,
+      `git blame -S ${secret} README.md`,
+      `git blame --ignore-revs-file=${secret} README.md`,
+    ]) {
+      const r = evaluateGate(bash(command, [[secret]]), ctx({ mode: "unattended" }));
+      expect(r, command).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    }
+  });
+
+  it("R25: a non-path-like word without a fact is not a file; with a secret fact it is checked", () => {
+    expect(evaluateGate(bash("cat notes.txt"), ctx({ route: ANSWER })).decision).toBe("allow");
+    expect(evaluateGate(bash("cat notes.txt", [["notes.txt", "/h/.aws/credentials"]]), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R25: URLs are not path-like", () => {
+    expect(evaluateGate(bash("curl https://example.com/a/b"), ctx({ route: ANSWER })).decision).toBe("allow");
+  });
+
+  it("N-1: unknown git on the answer route keeps the generic reason", () => {
+    const unknownGit = evaluateGate(bash("git grep x"), ctx({ route: ANSWER }));
+    expect(unknownGit.decision).toBe("deny");
+    expect(unknownGit.reason).not.toMatch(/cannot be reconciled/);
+    expect(unknownGit.reason).toMatch(/change route/);
+    expect(evaluateGate(bash("git commit -m x"), ctx({ route: ANSWER })).reason).toMatch(/cannot be reconciled/);
   });
 
   it("a project-declared command is allowed unattended", () => {

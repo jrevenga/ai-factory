@@ -9,7 +9,7 @@ import path from "node:path";
 import type { HardGateId } from "../config/schema.ts";
 import type { RouteState } from "../route/types.ts";
 import type { AutonomyLevel } from "./autonomy.ts";
-import { classifyCommandLine, type CommandClass, type CommandClassification } from "./command.ts";
+import { classifyCommandLine, isPathLikeArg, type CommandClass, type CommandClassification } from "./command.ts";
 import { classifyPath, isSecretPath, type PathClassification, type PathContext, type PathFacts, type PathPlatform } from "./paths.ts";
 
 export type ToolAction =
@@ -27,9 +27,14 @@ export type ToolAction =
       tool: "bash" | "powershell";
       command: string;
       /**
-       * Facts for every `classifyCommandLine().pathArgs` and `.inputPaths` entry and for read-command file arguments.
+       * Contract for Tasks 6/7: one fact for every `classifyCommandLine()` entry of
+       * - `pathArgs` (write targets),
+       * - `inputPaths` (`<` sources, `git -C` dirs),
+       * - `readArgs` that is path-like (`isPathLikeArg`) OR exists relative to the command's cwd (R25).
        * `input` must equal the argument string exactly (a leading `~/` included). A fact whose `input` equals a pathArg
-       * is a write target; the others are only checked for secrets.
+       * is a write target; every other fact is checked for secrets and the secret-dir guard. A missing pathArg fact
+       * asks `outside-root-write`; a missing inputPath or path-like readArg fact asks `secrets`. A non-path-like readArg
+       * without a fact is treated as a word, not a file — so the extension must supply facts for existing files.
        */
       pathFacts: PathFacts[];
     }
@@ -238,6 +243,23 @@ function summary(c: CommandClassification): string {
   return c.reasons.length > 0 ? c.reasons.join("; ") : c.class;
 }
 
+/**
+ * Route rule for the answer route and for a route needing reclassification: the deny reason, or undefined when the
+ * command may run (read-only, or an allowlisted runner on the answer route that Task 11 reconciles).
+ */
+function answerRouteDeny(c: CommandClassification, ctx: GateContext): string | undefined {
+  const reason = ctx.route.needsReclassification ? RECLASSIFY : DECLARE;
+  if (c.class === "read-only") return undefined;
+  if (ctx.route.needsReclassification) return `${summary(c)}: ${reason}`;
+  // Ruling 5: only what Task 11 can reconcile (tracked files, index, new untracked files) runs on the answer
+  // route. Local-write git moves HEAD, refs, branches or the stash, which reconciliation does not restore.
+  // Unknown git is not allowlisted and gets the generic reason (N-1).
+  const git = c.segments.find((seg) => seg.class === "local-write" && seg.argv[0] === "git");
+  if (git) return `\`${git.argv.join(" ")}\` changes git state that cannot be reconciled on the answer route: ${DECLARE}`;
+  if (c.allowlisted) return undefined;
+  return `${summary(c)}: ${reason}`;
+}
+
 function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): GateResult {
   if (action.tool === "powershell") {
     return result("ask", "PowerShell commands are not classified in Phase 2 (ruling 3)", { class: "unknown" });
@@ -252,7 +274,11 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
     .filter((f) => writeInputs.has(f.input))
     .map((f) => ({ fact: f, ...analyzeWrite(f, ctx, undefined, "command") }));
   const missing = c.pathArgs.filter((p) => !action.pathFacts.some((f) => f.input === p));
-  const missingInputs = c.inputPaths.filter((p) => !action.pathFacts.some((f) => f.input === p));
+  const hasFact = (p: string) => action.pathFacts.some((f) => f.input === p);
+  const missingInputs = [
+    ...c.inputPaths.filter((p) => !hasFact(p)),
+    ...c.readArgs.filter((a) => isPathLikeArg(a) && !writeInputs.has(a) && !hasFact(a) && !c.inputPaths.includes(a)),
+  ];
 
   // Denies first.
   const denied = writes.find((w) => w.deny !== undefined);
@@ -261,6 +287,10 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
     const targets = [...missing, ...writes.filter((w) => w.cls.within !== "tmp").map((w) => w.fact.input)];
     return result("deny", `the command writes ${targets.join(", ")}: ${noRootsReason}`, base);
   }
+
+  // A route deny that no fact can change is decided before any ask (deny > ask). Hard classes still ask (ruling 5).
+  const routeDeny = noRoots && c.hardClass === undefined ? answerRouteDeny(c, ctx) : undefined;
+  if (routeDeny !== undefined) return result("deny", routeDeny, base);
 
   // Hard gates ask (every fact, read or write, is checked for secrets).
   const secret = action.pathFacts.find((f) => classifyPath(f, pathContext(ctx, ctx.route.writeRoots, ctx.tmpRoots)).secret);
@@ -271,7 +301,7 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
     return result("ask", `the command reads a directory that contains secret files: ${secretDir.input}`, { ...base, hardGate: "secrets" });
   }
   if (missingInputs.length > 0) {
-    return result("ask", `input paths could not be checked for secrets: ${missingInputs.join(", ")}`, { ...base, hardGate: "secrets" });
+    return result("ask", `read paths could not be checked for secrets: ${missingInputs.join(", ")}`, { ...base, hardGate: "secrets" });
   }
   if (c.hardClass === "remote-mutating") return result("ask", `remote-mutating command: ${summary(c)}`, { ...base, hardGate: "remote-mutation" });
   if (missing.length > 0) {
@@ -297,17 +327,9 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   // Route rules.
   if (noRoots) {
     if (c.class === "read-only") return result("allow", "read-only command", base);
-    if (ctx.route.needsReclassification) return result("deny", `${summary(c)}: ${noRootsReason}`, base);
-    // Ruling 5: only what Task 11 can reconcile (tracked files, index, new untracked files) runs on the answer
-    // route. Non-read-only git moves HEAD, refs, branches or the stash, which reconciliation does not restore.
-    const git = c.segments.find((seg) => seg.class !== "read-only" && seg.argv[0] === "git");
-    if (git) {
-      return result("deny", `\`${git.argv.join(" ")}\` changes git state that cannot be reconciled on the answer route: ${DECLARE}`, base);
-    }
-    if (c.allowlisted) {
-      return result("allow", "allowlisted runner on the answer route: tracked files are reconciled afterwards", { ...base, reconcile: true });
-    }
-    return result("deny", `${summary(c)}: ${noRootsReason}`, base);
+    const deny = answerRouteDeny(c, ctx);
+    if (deny !== undefined) return result("deny", deny, base);
+    return result("allow", "allowlisted runner on the answer route: tracked files are reconciled afterwards", { ...base, reconcile: true });
   }
   if (c.allowlisted) return result("allow", "every segment is read-only or allowlisted", base);
   if (effectiveCommandMode(ctx) === "unattended") {
