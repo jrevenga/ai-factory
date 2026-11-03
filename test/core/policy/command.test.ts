@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyCommandLine, severity, type CommandClass } from "../../../src/core/policy/command.ts";
+import { classifyCommandLine, extractReadArgs, isPathLikeArg, severity, type CommandClass } from "../../../src/core/policy/command.ts";
 import { GATE_CORPUS } from "../../fixtures/gate-corpus.ts";
 
 const NO_PROJECT = { projectCommands: [] as string[][] };
@@ -81,6 +81,59 @@ describe("classifyCommandLine: tokenizer failures", () => {
     expect(r.segments).toEqual([]);
     expect(r.pathArgs).toEqual([]);
     expect(r.reasons.length).toBeGreaterThan(0);
+  });
+});
+
+describe("extractReadArgs (R25)", () => {
+  it("returns non-flag words, --opt=value values and attached short values", () => {
+    expect(extractReadArgs(["-la", "src"])).toEqual(["a", "src"]);
+    expect(extractReadArgs(["--file=/h/x", "y"])).toEqual(["/h/x", "y"]);
+    expect(extractReadArgs(["-f/h/.aws/credentials"])).toEqual(["/h/.aws/credentials"]);
+    expect(extractReadArgs(["-rf/x"])).toEqual(["f/x", "/x"]);
+    expect(extractReadArgs(["-m./magic"])).toEqual(["./magic"]);
+    expect(extractReadArgs(["-", "--", "-weird", "--x=y"])).toEqual(["-weird", "--x=y"]);
+    expect(extractReadArgs(["--flag", "--empty="])).toEqual([]);
+  });
+
+  it("exposes the option-named file of every R25 leak command, independent of the denylist", () => {
+    const secret = "~/.aws/credentials";
+    const cases: string[][] = [
+      ["-f", secret],
+      [`--file=${secret}`],
+      ["-m", secret, "x"],
+      [`--magic-file=${secret}`, "x"],
+      ["blame", "--contents", secret, "README.md"],
+      ["blame", "-S", secret, "README.md"],
+      ["blame", `-S${secret}`, "README.md"],
+      ["blame", `--ignore-revs-file=${secret}`, "README.md"],
+    ];
+    for (const args of cases) expect(extractReadArgs(args), args.join(" ")).toContain(secret);
+  });
+});
+
+describe("isPathLikeArg (R25)", () => {
+  it("treats slashes, backslashes, a leading ~ or . as path-like", () => {
+    for (const w of ["a/b", "C:\\x", "~/x", ".env", ".", "..", "/etc/hosts", "s/a/b/"]) expect(isPathLikeArg(w), w).toBe(true);
+  });
+
+  it("does not treat plain words or URLs as path-like", () => {
+    for (const w of ["test", "README.md", "2.weeks", "https://example.com/x", "git+ssh://h/r", ""]) expect(isPathLikeArg(w), w).toBe(false);
+  });
+});
+
+describe("classifyCommandLine: readArgs (R25)", () => {
+  it("covers read-only and local-write segments only", () => {
+    expect(classify("cat ~/.aws/credentials").readArgs).toEqual(["~/.aws/credentials"]);
+    expect(classify("head -n ~/.aws/credentials x").readArgs).toEqual(["~/.aws/credentials", "x"]);
+    expect(classify("npm test").readArgs).toEqual(["test"]);
+    expect(classify("ls src > /tmp/o").readArgs).toEqual(["src"]);
+    expect(classify("foo ./bar").readArgs).toEqual([]);
+    expect(classify("git push origin a/b").readArgs).toEqual([]);
+    expect(classify("echo $(x)").readArgs).toEqual([]);
+  });
+
+  it("deduplicates across segments", () => {
+    expect(classify("cat a/b && wc -l a/b").readArgs).toEqual(["a/b"]);
   });
 });
 

@@ -50,6 +50,11 @@ export interface CommandClassification {
   pathArgs: string[];
   /** Paths read that are not file arguments (`<` sources, `git -C` dirs of read-only git): checked for secrets only. */
   inputPaths: string[];
+  /**
+   * R25: candidate file words of every read-only or local-write segment (`extractReadArgs`). Any of them may name a
+   * file whose content the program prints, whatever option introduces it; the gate secret-checks them.
+   */
+  readArgs: string[];
   allowlisted: boolean;
 }
 
@@ -194,6 +199,43 @@ function mayLeaveWorkTree(p: string): boolean {
   return p.startsWith("/") || p.startsWith("~/") || p === ".." || p.startsWith("../") || /^[A-Za-z]:/.test(p);
 }
 
+const URL_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+
+/** R25: a word that may name a file: contains `/` or `\`, or starts with `~` or `.`; URLs are not path-like. */
+export function isPathLikeArg(w: string): boolean {
+  if (w === "" || URL_SCHEME.test(w)) return false;
+  return w.includes("/") || w.includes("\\") || w.startsWith("~") || w.startsWith(".");
+}
+
+/**
+ * R25: every word that may name a file read by the command: non-flag words, every word after `--`, the value of
+ * `--opt=value`, and for a short cluster `-xVALUE` both the text after the first letter and, when a path character
+ * (`/`, `\`, `~`, `.`) appears later in the cluster, the text from it (`-rf/x` → `f/x`, `/x`). Over-reporting is
+ * intended: a word that is not a file costs only a fact.
+ */
+export function extractReadArgs(args: readonly string[]): string[] {
+  const out: string[] = [];
+  const push = (w: string) => {
+    if (w !== "" && !out.includes(w)) out.push(w);
+  };
+  let operands = false;
+  for (const a of args) {
+    if (operands) push(a);
+    else if (a === "--") operands = true;
+    else if (a === "-") continue;
+    else if (!a.startsWith("-")) push(a);
+    else if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq > 0) push(a.slice(eq + 1));
+    } else {
+      push(a.slice(2));
+      const i = a.slice(2).search(/[/\\~.]/);
+      if (i > 0) push(a.slice(2 + i));
+    }
+  }
+  return out;
+}
+
 function classifyGit(args: readonly string[]): Verdict {
   if (hasLong(args, R.GIT_INJECTION_LONG)) return unknown("git option injects configuration or redirects the repository");
   if (hasLong(args, R.GIT_FILE_LIST_LONG)) return unknown("git reads a pathspec list from a file or stdin (R24)");
@@ -228,7 +270,10 @@ function classifyGit(args: readonly string[]): Verdict {
 function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
   const readDeny = lookup(R.GIT_READ_ONLY, sub);
   if (readDeny) {
-    if (readDeny.length > 0 && hasLong(rest, readDeny)) return unknown(`git ${sub} with an option that writes, runs code or leaves the repository`);
+    const shortDeny = lookup(R.GIT_READ_ONLY_SHORT, sub);
+    if ((readDeny.length > 0 && hasLong(rest, readDeny)) || (shortDeny !== undefined && hasShort(rest, shortDeny))) {
+      return unknown(`git ${sub} with an option that writes, runs code, reads a named file or leaves the repository`);
+    }
     // git diff falls back to --no-index on its own when a path lies outside the work tree.
     if (sub === "diff" && positionals(rest).some(mayLeaveWorkTree)) {
       return unknown("git diff with a path that may lie outside the work tree compares arbitrary files (implicit --no-index)");
@@ -638,7 +683,15 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
 export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandClassification {
   const tok = tokenizeCommandLine(cmd);
   if (!tok.ok) {
-    return { class: "unknown", segments: [], reasons: [`not classifiable: ${tok.reason}`], pathArgs: [], inputPaths: [], allowlisted: false };
+    return {
+      class: "unknown",
+      segments: [],
+      reasons: [`not classifiable: ${tok.reason}`],
+      pathArgs: [],
+      inputPaths: [],
+      readArgs: [],
+      allowlisted: false,
+    };
   }
   let cls: CommandClass = "read-only";
   let hard: HardClass | undefined;
@@ -647,6 +700,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
   const reasons: string[] = [];
   const pathArgs: string[] = [];
   const inputPaths: string[] = [];
+  const readArgs: string[] = [];
   tok.segments.forEach((seg, i) => {
     const v = classifySegment(seg, ctx);
     segments.push({ argv: seg.argv, class: v.class, allowlisted: v.allowlisted });
@@ -657,8 +711,11 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
     for (const r of v.reasons) reasons.push(`segment ${i + 1} (${label}): ${r}`);
     for (const p of v.pathArgs) if (!pathArgs.includes(p)) pathArgs.push(p);
     for (const p of v.inputPaths) if (!inputPaths.includes(p)) inputPaths.push(p);
+    if (v.class === "read-only" || v.class === "local-write") {
+      for (const w of extractReadArgs(seg.argv.slice(1))) if (!readArgs.includes(w)) readArgs.push(w);
+    }
   });
-  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, allowlisted };
+  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, readArgs, allowlisted };
   if (hard !== undefined) result.hardClass = hard;
   return result;
 }

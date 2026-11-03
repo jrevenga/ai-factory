@@ -55,7 +55,8 @@ export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   which: {},
   whereis: {},
   type: {},
-  file: { denyShort: "Cf", denyLong: ["--compile", "--files-from"] },
+  // `-m/--magic-file` echoes the named file in warnings (R25).
+  file: { denyShort: "Cfm", denyLong: ["--compile", "--files-from", "--magic-file"] },
   stat: {},
   du: { denyLong: ["--files0-from"] },
   df: {},
@@ -68,7 +69,8 @@ export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   dirname: {},
   realpath: {},
   readlink: {},
-  date: { denyShort: "s", denyLong: ["--set"] },
+  // `-f/--file` echoes every line of the named file in "invalid date" errors (R25).
+  date: { denyShort: "sf", denyLong: ["--set", "--file"] },
   sleep: {},
   diff: { denyShort: "r", denyLong: ["--recursive", "--from-file", "--to-file"], denyReason: INDIRECT_READ },
   cmp: {},
@@ -115,10 +117,13 @@ export const GIT_READ_ONLY: Readonly<Record<string, readonly string[]>> = {
   show: ["--output", "--ext-diff"],
   "rev-parse": [],
   "ls-files": [],
-  blame: [],
+  // `--contents` prints the named file; `--ignore-revs-file` echoes it in errors (R25).
+  blame: ["--contents", "--ignore-revs-file"],
   describe: [],
   fetch: ["--upload-pack"],
 };
+/** Short options that disqualify a read-only git subcommand (`git blame -S <file>` echoes the graft file, R25). */
+export const GIT_READ_ONLY_SHORT: Readonly<Record<string, string>> = { blame: "S" };
 export const GIT_BRANCH_LIST_FLAGS: ReadonlySet<string> = new Set([
   "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "-l", "--list", "--no-color", "--color",
 ]);
