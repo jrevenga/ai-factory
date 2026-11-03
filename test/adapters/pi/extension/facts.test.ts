@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   canonicalDir,
   commandCandidates,
@@ -104,6 +104,18 @@ describe("pathFacts (tool paths, Pi resolveToCwd semantics)", () => {
     mkdirSync(join(t, "real home", ".aws"), { recursive: true });
     linkDir(join(t, "real home"), join(t, "home link"));
     expect(pathFacts("~/.aws/credentials", t, join(t, "home link")).resolved).toBe(join(t, "real home", ".aws", "credentials"));
+  });
+
+  it("expands ~ with the home exactly as given (like Pi), so ~/.. under a symlinked home is the lexical parent", async () => {
+    const t = await tmp();
+    mkdirSync(join(t, "data", "me"), { recursive: true });
+    mkdirSync(join(t, "data", "proj"));
+    mkdirSync(join(t, "users", "proj"), { recursive: true });
+    linkDir(join(t, "data", "me"), join(t, "users", "me"));
+    // Pi writes <t>/users/me/../proj/file = <t>/users/proj/file (lexical), not <t>/data/proj/file.
+    expect(pathFacts("~/../proj/file", t, join(t, "users", "me")).resolved).toBe(join(t, "users", "proj", "file"));
+    // bash resolves .. physically after the home symlink.
+    expect(commandPathFacts("~/../proj/file", t, join(t, "users", "me"))[0]!.resolved).toBe(join(t, "data", "proj", "file"));
   });
 
   it("collapses .. lexically before the filesystem, as Pi's tools do", async () => {
@@ -214,6 +226,15 @@ describe("canonicalDir", () => {
 });
 
 describe("git facts", () => {
+  // The code under test inherits the process env: keep the developer's git config out of it.
+  beforeAll(() => {
+    vi.stubEnv("GIT_CONFIG_GLOBAL", isWin ? "NUL" : "/dev/null");
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+  });
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("repoRoot returns the realpathed toplevel from a subdirectory, undefined outside a repository", async () => {
     const t = await tmp();
     const r = repo(join(t, "proj"));

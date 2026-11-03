@@ -102,6 +102,33 @@ describe("RunLedger", () => {
   });
 });
 
+describe("RunLedger review fixes", () => {
+  it("an unterminated final line that parses is kept (terminated), not dropped, before the next append", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    const first = new RunLedger(dir, "r1");
+    first.append(start("r1", 1));
+    appendFileSync(first.file, JSON.stringify({ v: 1, ts: TS, runId: "r1", type: "checkpoint", taskId: "t1", sha: "abc", kind: "commit" }));
+    expect(RunLedger.read(first.file).map((e) => e.type)).toEqual(["run_start", "checkpoint"]);
+    new RunLedger(dir, "r1").append({ v: 1, ts: TS, runId: "r1", type: "run_end", reason: "x" });
+    expect(RunLedger.read(first.file).map((e) => e.type)).toEqual(["run_start", "checkpoint", "run_end"]);
+  });
+
+  it("masks string values whose key names a secret, at any depth", async () => {
+    const home = await factoryHome();
+    const ledger = new RunLedger(ledgerDirFor(home, PROJECT), "r1");
+    ledger.append({ v: 1, ts: TS, runId: "r1", type: "route", state: { token: "abc123", nested: { apiKey: "zzz9", DB_PASSWORD: "hunter2" }, reason: "ok" } });
+    const text = readFileSync(ledger.file, "utf8");
+    for (const v of ["abc123", "zzz9", "hunter2"]) expect(text).not.toContain(v);
+    expect(text).toContain('"reason":"ok"');
+  });
+
+  it("ledgerDirFor requires projectId to be a single path component", () => {
+    expect(() => ledgerDirFor("/h", "../x")).toThrow(/projectId/);
+    expect(() => ledgerDirFor("/h", "")).toThrow(/projectId/);
+  });
+});
+
 describe("reconcile", () => {
   it("finds a run with a dead pid and no run_end, returns its last progress/checkpoint/route, and reports it once", async () => {
     const home = await factoryHome();
@@ -160,6 +187,21 @@ describe("reconcile", () => {
     });
     expect(found).toEqual([{ runId: `20261103T090000Z-${dead}` }]);
     expect(seen).toEqual([dead]);
+  });
+
+  it("a run already claimed by another reconciler (interrupted.claim) is skipped and not marked twice", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    const r = new RunLedger(dir, "r-1");
+    r.append(start("r-1", 1));
+    writeFileSync(join(dir, "r-1", "interrupted.claim"), "other\n");
+    expect(reconcile(home, PROJECT, "self-9", () => false)).toEqual([]);
+    expect(readFileSync(r.file, "utf8")).not.toContain("run_interrupted");
+    // An unclaimed run gets the claim written by the reconciler that marks it.
+    const q = new RunLedger(dir, "r-2");
+    q.append(start("r-2", 1));
+    expect(reconcile(home, PROJECT, "self-9", () => false)).toEqual([{ runId: "r-2" }]);
+    expect(readFileSync(join(dir, "r-2", "interrupted.claim"), "utf8")).toContain("self-9");
   });
 
   it("an invalid route state in the ledger is not restored", async () => {

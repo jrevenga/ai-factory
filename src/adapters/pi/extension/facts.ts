@@ -17,8 +17,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PathFacts, PathPlatform } from "../../../core/policy/paths.ts";
 
-const UNICODE_SPACES = /[  -   　]/g;
-const NARROW_NO_BREAK_SPACE = " ";
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+const NARROW_NO_BREAK_SPACE = "\u202F";
 const MAX_SYMLINK_HOPS = 40;
 const GIT_TIMEOUT_MS = 10_000;
 /** Inherited location variables would point git at another repository than the cwd's. */
@@ -56,17 +56,25 @@ function piNormalize(input: string, home: string, platform: PathPlatform, tool: 
 }
 
 /**
- * Pi's `resolveToCwd(input, cwd)` as a pure function of `platform`. One divergence: Pi resolves a rooted
- * win32 path without a drive (`\x`) against `process.cwd()`'s drive, this against `cwd`'s drive (the same
- * drive whenever the tool cwd is the process cwd). Throws on an invalid `file://` URL, as Pi does.
+ * Pi's `resolveToCwd(input, cwd)`. On the host platform it is Pi's code path exactly (`isAbsolute ? resolve(n) :
+ * resolve(base, n)`, so a drive-less rooted win32 path takes `process.cwd()`'s drive as in Pi). For the other
+ * platform (cross-platform tests) a rooted path takes `cwd`'s drive. `home` must be the value Pi expands `~`
+ * with (`os.homedir()`), unmodified: `~/..` is collapsed lexically against it before any symlink is followed.
+ * Throws on an invalid `file://` URL, as Pi does.
  */
 export function resolveToolPath(input: string, cwd: string, home: string, platform: PathPlatform = hostPlatform()): string {
-  const a = api(platform);
-  return a.resolve(piNormalize(cwd, home, platform, false), piNormalize(input, home, platform, true));
+  const base = piNormalize(cwd, home, platform, false);
+  const n = piNormalize(input, home, platform, true);
+  if (platform === hostPlatform()) return path.isAbsolute(n) ? path.resolve(n) : path.resolve(base, n);
+  return api(platform).resolve(base, n);
 }
 
+/**
+ * win32 and darwin: the native realpath returns the on-disk spelling (8.3 names, junctions, case on
+ * case-insensitive volumes); JS `realpathSync` keeps the input's case there.
+ */
 function realpathNative(p: string): string {
-  return process.platform === "win32" ? realpathSync.native(p) : realpathSync(p);
+  return process.platform === "win32" || process.platform === "darwin" ? realpathSync.native(p) : realpathSync(p);
 }
 
 function exists(p: string): boolean {
@@ -154,8 +162,8 @@ function readVariant(resolved: string): string {
   if (exists(resolved)) return resolved;
   const amPm = resolved.replace(/ (AM|PM)\./gi, `${NARROW_NO_BREAK_SPACE}$1.`);
   const nfd = resolved.normalize("NFD");
-  const curly = resolved.replace(/'/g, "’");
-  const nfdCurly = nfd.replace(/'/g, "’");
+  const curly = resolved.replace(/'/g, "\u2019");
+  const nfdCurly = nfd.replace(/'/g, "\u2019");
   for (const v of [amPm, nfd, curly, nfdCurly]) if (v !== resolved && exists(v)) return v;
   return resolved;
 }
@@ -166,14 +174,16 @@ export interface PathFactsOptions {
 }
 
 /**
- * Facts for a tool path argument. `home` is the home directory Pi expands `~` with (`os.homedir()`); it is
- * realpathed here. An unresolvable path (invalid file URL, symlink loop) yields `resolved: ""`, which core
+ * Facts for a tool path argument. `home` must be exactly the value Pi expands `~` with (`os.homedir()`), NOT
+ * realpathed: Pi collapses `~/..` lexically against it, and only then does the filesystem follow symlinks.
+ * An unresolvable path (invalid file URL, symlink loop, non-absolute home) yields `resolved: ""`, which core
  * treats as secret and outside (fail closed).
  */
 export function pathFacts(p: string, cwd: string, home: string, opts: PathFactsOptions = {}): PathFacts {
   const platform = hostPlatform();
+  if (!path.isAbsolute(home)) return unresolvable(p, platform);
   try {
-    let lexical = resolveToolPath(p, cwd, canonicalDir(home), platform);
+    let lexical = resolveToolPath(p, cwd, home, platform);
     if (opts.read) lexical = readVariant(lexical);
     return { input: p, resolved: realTarget(lexical), platform };
   } catch {
@@ -263,18 +273,30 @@ function isDir(p: string): boolean {
   }
 }
 
-/** Realpathed `git rev-parse --show-toplevel` of `cwd`, or undefined outside a work tree. */
-export function repoRoot(cwd: string): string | undefined {
-  if (!isDir(cwd)) return undefined;
-  const top = gitOut(cwd, ["rev-parse", "--show-toplevel"]);
-  if (top === undefined || top === "") return undefined;
-  return safeRealpath(path.resolve(cwd, top));
+/** Realpath, or undefined on any error (including a symlink loop). */
+function realOrUndefined(p: string): string | undefined {
+  try {
+    return realpathNative(p);
+  } catch {
+    return undefined;
+  }
 }
 
-function gitPath(cwd: string, flag: "--git-dir" | "--git-common-dir"): string | undefined {
-  const out = gitOut(cwd, ["rev-parse", flag]);
+/**
+ * `git rev-parse --path-format=absolute <flag>` (git >= 2.31), else the plain form resolved against `cwd`. An
+ * older git echoes the unknown option as an extra line instead of failing, hence the single-line check.
+ */
+function gitPath(cwd: string, flag: "--show-toplevel" | "--git-dir" | "--git-common-dir"): string | undefined {
+  let out = gitOut(cwd, ["rev-parse", "--path-format=absolute", flag]);
+  if (out === undefined || out.includes("\n") || out.startsWith("-")) out = gitOut(cwd, ["rev-parse", flag]);
   if (out === undefined || out === "") return undefined;
-  return safeRealpath(path.resolve(cwd, out));
+  return realOrUndefined(path.resolve(cwd, out));
+}
+
+/** Realpathed `git rev-parse --show-toplevel` of `cwd`, or undefined outside a work tree. Never throws. */
+export function repoRoot(cwd: string): string | undefined {
+  if (!isDir(cwd)) return undefined;
+  return gitPath(cwd, "--show-toplevel");
 }
 
 /**
@@ -301,7 +323,7 @@ export interface WorktreeFacts {
 /** Facts `validateSetRoute` needs for a feature/project worktree (ruling 6). */
 export function worktreeFacts(p: string, projectRoot: string): WorktreeFacts {
   if (!path.isAbsolute(p) || !isDir(p)) return { exists: false, sameRepo: false };
-  const real = safeRealpath(p);
+  const real = realOrUndefined(p);
   const top = repoRoot(p);
   const common = gitPath(p, "--git-common-dir");
   const projectCommon = isDir(projectRoot) ? gitPath(projectRoot, "--git-common-dir") : undefined;
