@@ -120,7 +120,24 @@ describe("evaluateGate: read tools", () => {
   it("R23: a custom piAgentDir and its ancestors ask", () => {
     const c = ctx({ piAgentDir: "/opt/agents/pi" });
     expect(evaluateGate({ kind: "read", tool: "grep", path: fact("/opt/agents/pi") }, c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
-    expect(evaluateGate({ kind: "read", tool: "find", path: fact("/opt/agents") }, c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate({ kind: "read", tool: "grep", path: fact("/opt/agents") }, c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R24: the Pi ls and find tools (names only) are exempt from the secret-dir guard", () => {
+    for (const tool of ["ls", "find"]) {
+      for (const target of ["/h", "/h/.aws", "/h/.pi/agent"]) {
+        expect(evaluateGate({ kind: "read", tool, path: fact(target) }, ctx({ route: ANSWER })).decision, `${tool} ${target}`).toBe("allow");
+      }
+    }
+  });
+
+  it("R24: ls/find tools still ask for a secret path itself", () => {
+    expect(evaluateGate({ kind: "read", tool: "ls", path: fact("/h/.ssh") }, ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R24: any other read tool name keeps the guard", () => {
+    expect(evaluateGate({ kind: "read", tool: "read", path: fact("/h") }, ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate({ kind: "read", tool: "LS", path: fact("/h") }, ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
   });
 
   it("R23: R23 does not catch ordinary directories (project, home subdirs, unrelated)", () => {
@@ -494,6 +511,42 @@ describe("evaluateGate: commands", () => {
   it("R23: recursive grep and rg in bash are unknown (ask on change routes, deny on answer)", () => {
     expect(evaluateGate(bash("grep -r aws_secret ~/.aws"), ctx())).toMatchObject({ decision: "ask", class: "unknown" });
     expect(evaluateGate(bash("rg PASSWORD ."), ctx({ route: ANSWER })).decision).toBe("deny");
+  });
+
+  it("R24: bash read arguments on secret-holding directories ask (pipelines turn names into contents)", () => {
+    const c = ctx({ route: ANSWER, mode: "unattended" });
+    expect(evaluateGate(bash("ls ~/", [["~/", "/h"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("find ~/.aws -type f", [["~/.aws"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("du -sh ~/.config", [["~/.config"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("ls src", [["src"]]), c).decision).toBe("allow");
+  });
+
+  it("R24: the find | sort --files0-from bypass is closed", () => {
+    const action = bash("find ~/.aws -type f -print0 | sort --files0-from=-", [["~/.aws"]]);
+    expect(evaluateGate(action, ctx({ route: ANSWER, mode: "unattended" }))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("find ~/.aws -type f -print0 | sort --files0-from=-"), ctx({ route: ANSWER })).decision).toBe("deny");
+  });
+
+  it("R24: the git diff --no-index bypass is closed", () => {
+    const facts: [string, string?][] = [["~/.aws"], ["/tmp/empty"]];
+    const c = ctx({ route: ANSWER, mode: "unattended" });
+    expect(evaluateGate(bash("git diff --no-index ~/.aws /tmp/empty", facts), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("git diff --no-index ~/.aws /tmp/empty"), c).decision).toBe("deny");
+    expect(evaluateGate(bash("git diff --no-index /h /tmp/empty"), c).decision).toBe("deny");
+  });
+
+  it("R24: a git -C directory is a read fact checked for secrets", () => {
+    expect(evaluateGate(bash("git -C ~/ status", [["~/", "/h"]]), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("git -C ~/ status"), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("git -C ../other status", [["../other", "/w/other"]]), ctx({ route: ANSWER })).decision).toBe("allow");
+  });
+
+  it("R24: git stash list is read-only and runs on the answer route", () => {
+    expect(evaluateGate(bash("git stash list"), ctx({ route: ANSWER }))).toMatchObject({ decision: "allow", reconcile: false });
+  });
+
+  it("R24: a write target on a secret-holding directory is not a read (root target and outside rules apply instead)", () => {
+    expect(evaluateGate(bash("mkdir /tmp/h", [["/tmp/h"]]), ctx(UNATTENDED)).decision).toBe("allow");
   });
 
   it("a project-declared command is allowed unattended", () => {

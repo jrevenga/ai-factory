@@ -202,11 +202,17 @@ function analyzeWrite(fact: PathFacts, ctx: GateContext, targetExists: boolean |
   return a;
 }
 
-function evaluateRead(fact: PathFacts | undefined, ctx: GateContext): GateResult {
+/**
+ * R24: Pi's `ls` and `find` tools return names only and their output cannot be piped into a reader, so a
+ * secret-holding directory is not a content read for them. Every other read tool name keeps the guard.
+ */
+const NAME_ONLY_READ_TOOLS: ReadonlySet<string> = new Set(["ls", "find"]);
+
+function evaluateRead(tool: string, fact: PathFacts | undefined, ctx: GateContext): GateResult {
   if (fact === undefined) return result("allow", "read tool without a path");
   const cls = classifyPath(fact, pathContext(ctx, ctx.route.writeRoots, ctx.tmpRoots));
   if (cls.secret) return result("ask", `reading a secret path: ${fact.input}`, { hardGate: "secrets" });
-  if (guardsSecretDir(fact, ctx)) {
+  if (!NAME_ONLY_READ_TOOLS.has(tool) && guardsSecretDir(fact, ctx)) {
     return result("ask", `the target contains secret files (home, Pi agent dir or a credentials dir): ${fact.input}`, { hardGate: "secrets" });
   }
   return result("allow", "read of a non-secret path");
@@ -259,6 +265,11 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   // Hard gates ask (every fact, read or write, is checked for secrets).
   const secret = action.pathFacts.find((f) => classifyPath(f, pathContext(ctx, ctx.route.writeRoots, ctx.tmpRoots)).secret);
   if (secret) return result("ask", `the command touches a secret path: ${secret.input}`, { ...base, hardGate: "secrets" });
+  // R24: in bash a pipeline turns names into contents, so every read fact (not write targets) gets the guard.
+  const secretDir = action.pathFacts.find((f) => !writeInputs.has(f.input) && guardsSecretDir(f, ctx));
+  if (secretDir) {
+    return result("ask", `the command reads a directory that contains secret files: ${secretDir.input}`, { ...base, hardGate: "secrets" });
+  }
   if (missingInputs.length > 0) {
     return result("ask", `input paths could not be checked for secrets: ${missingInputs.join(", ")}`, { ...base, hardGate: "secrets" });
   }
@@ -313,7 +324,7 @@ export function evaluateGate(action: ToolAction, ctx: GateContext): GateResult {
       case "factory":
         return result("allow", `factory tool ${action.tool} validates its own input`);
       case "read":
-        return evaluateRead(action.path, ctx);
+        return evaluateRead(action.tool, action.path, ctx);
       case "write":
         return evaluateWrite(action, ctx);
       case "command":
