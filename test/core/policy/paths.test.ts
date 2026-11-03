@@ -89,6 +89,23 @@ describe("isSecretPath", () => {
     expect(s("/home/u/.config/other/x")).toBe(false);
     expect(s("/other/.ssh/x")).toBe(false);
   });
+  it("matches secrets case-insensitively on posix too (R27: case-insensitive volumes such as APFS)", () => {
+    expect(s("/home/u/.AWS/credentials")).toBe(true);
+    expect(s("/home/u/.SSH/config")).toBe(true);
+    expect(s("/HOME/U/.ssh/id_x")).toBe(true);
+    expect(s("/home/u/.Config/GH/hosts.YML")).toBe(true);
+    expect(s("/home/u/.Claude.json")).toBe(true);
+    expect(s("/proj/.ENV")).toBe(true);
+    expect(s("/proj/.Env.Local")).toBe(true);
+    expect(s("/proj/.ENV.EXAMPLE")).toBe(false);
+    expect(s("/proj/Server.PEM")).toBe(true);
+    expect(s("/proj/ID_RSA")).toBe(true);
+    expect(isSecretPath("/DATA/Pi/Auth.json", { home: "/home/u", piAgentDir: "/data/pi", platform: "posix" })).toBe(true);
+    expect(s("/home/u/.AWS/config")).toBe(false);
+  });
+  it("R27 changes secret matching only: posix containment stays case-sensitive", () => {
+    expect(classifyPath(posix("/work/ROOT/.Env"), posixCtx)).toMatchObject({ secret: true, within: "outside" });
+  });
   it("honours a custom Pi agent dir", () => {
     const ctx = { home: "/home/u", piAgentDir: "/data/pi", platform: "posix" as const };
     expect(isSecretPath("/data/pi/auth.json", ctx)).toBe(true);

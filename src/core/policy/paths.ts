@@ -138,23 +138,27 @@ function contains(root: string, target: string, platform: PathPlatform): string 
 }
 
 function segmentsOf(rel: string, platform: PathPlatform): string[] {
-  const parts = rel.split(platform === "win32" ? /[\\/]+/ : "/").filter((s) => s !== "");
-  return platform === "win32" ? parts.map((s) => s.toLowerCase()) : parts;
+  return rel.split(platform === "win32" ? /[\\/]+/ : "/").filter((s) => s !== "");
 }
 
-function secretOfCanonical(target: string, ctx: SecretContext): boolean {
+/**
+ * Ruling R27: secret matching folds case on every platform (case-insensitive volumes such as APFS open
+ * `~/.SSH/config` as `~/.ssh/config`; over-detection only asks). Root containment stays case-sensitive on posix.
+ */
+function secretOfCanonical(rawTarget: string, ctx: SecretContext): boolean {
   const { platform } = ctx;
-  const lc = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
-  const home = requireAbsolute(ctx.home, "home", platform);
-  const agentDir = requireAbsolute(ctx.piAgentDir, "piAgentDir", platform);
+  const lc = (s: string) => s.toLowerCase();
+  const target = lc(rawTarget);
+  const home = lc(requireAbsolute(ctx.home, "home", platform));
+  const agentDir = lc(requireAbsolute(ctx.piAgentDir, "piAgentDir", platform));
 
-  const base = lc(api(platform).basename(target));
+  const base = api(platform).basename(target);
   if (base === ".env" || (base.startsWith(".env.") && !ENV_EXCLUDED.has(base))) return true;
   if (base === ".npmrc" || base === ".pypirc") return true;
   if (base.endsWith(".pem") || base.startsWith("id_rsa") || base.startsWith("id_ed25519")) return true;
 
   const agentRel = contains(agentDir, target, platform);
-  if (agentRel !== undefined && lc(agentRel) === "auth.json") return true;
+  if (agentRel !== undefined && agentRel === "auth.json") return true;
 
   const rel = contains(home, target, platform);
   if (rel === undefined || rel === "") return false;
