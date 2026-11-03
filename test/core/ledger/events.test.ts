@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { projectIdFor, RunEvent, runIdFor } from "../../../src/core/ledger/events.ts";
+import { parseRunEvent, projectIdFor, RunEvent, runIdFor } from "../../../src/core/ledger/events.ts";
 
 const hdr = { v: 1, ts: "2026-11-03T00:00:00.000Z", runId: "r" };
 const check = {
@@ -36,6 +36,25 @@ describe("RunEvent", () => {
     expect(RunEvent.safeParse({ ...hdr, v: 2, type: "run_end", reason: "x" }).success).toBe(false);
     expect(RunEvent.safeParse({ ...hdr, type: "checkpoint", taskId: "t", sha: "s", kind: "other" }).success).toBe(false);
     expect(RunEvent.safeParse({ ...hdr, type: "run_end" }).success).toBe(false);
+  });
+});
+
+describe("parseRunEvent", () => {
+  it("returns known events", () => {
+    const r = parseRunEvent({ ...hdr, type: "run_end", reason: "x" });
+    expect(r).toMatchObject({ known: true });
+  });
+  it("tolerates unknown types and passes the raw value through", () => {
+    const raw = { ...hdr, type: "from_the_future", extra: 1 };
+    expect(parseRunEvent(raw)).toEqual({ known: false, raw });
+  });
+  it("still throws for a known type with a bad shape and for non-events", () => {
+    expect(() => parseRunEvent({ ...hdr, type: "run_end" })).toThrow();
+    expect(() => parseRunEvent("nope")).toThrow();
+  });
+  it("accepts run_start.resumedFrom", () => {
+    const e = RunEvent.parse({ ...hdr, type: "run_start", pid: 1, projectId: "p", projectRoot: "/p", factoryVersion: "1", resumedFrom: ["a"] });
+    expect((e as { resumedFrom?: string[] }).resumedFrom).toEqual(["a"]);
   });
 });
 

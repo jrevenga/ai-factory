@@ -32,6 +32,12 @@
         },
         "piSession": {
           "type": "string"
+        },
+        "resumedFrom": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "required": [

@@ -14,6 +14,8 @@ export const RunEvent = z.discriminatedUnion("type", [
     projectRoot: z.string(),
     factoryVersion: z.string(),
     piSession: z.string().optional(),
+    /** Run ids this run resumed after an interruption. */
+    resumedFrom: z.array(z.string()).optional(),
   }),
   ev("run_end", { reason: z.string() }),
   ev("run_interrupted", { detectedBy: z.string() }),
@@ -45,6 +47,19 @@ export const RunEvent = z.discriminatedUnion("type", [
   ev("error", { where: z.string(), message: z.string() }),
 ]);
 export type RunEvent = z.infer<typeof RunEvent>;
+
+export const RUN_EVENT_TYPES: readonly string[] = RunEvent.options.map((o) => o.shape.type.value);
+
+/**
+ * Reader entry point: an event whose `type` this release does not know (written by a newer version)
+ * comes back as `{ known: false, raw }` instead of failing. A known type with a bad shape, or a value
+ * that is not an object with a string `type`, throws.
+ */
+export function parseRunEvent(raw: unknown): { known: true; event: RunEvent } | { known: false; raw: unknown } {
+  const type = typeof raw === "object" && raw !== null ? (raw as { type?: unknown }).type : undefined;
+  if (typeof type === "string" && !RUN_EVENT_TYPES.includes(type)) return { known: false, raw };
+  return { known: true, event: RunEvent.parse(raw) };
+}
 
 /** `<sanitized basename>-<first 12 hex of sha256(realpath)>`; the hash function is injected to keep core pure. */
 export function projectIdFor(repoRootReal: string, sha256hex: (s: string) => string): string {

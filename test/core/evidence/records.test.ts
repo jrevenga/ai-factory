@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isKnownDisposition,
   type CheckRecord,
   type ReviewDisposition,
   validateDelivery,
@@ -27,7 +28,7 @@ const review = (over: Partial<ReviewDisposition> = {}): ReviewDisposition => ({
   at: "2026-11-03T00:00:00.000Z",
   ...over,
 });
-const base = { tier: "feature" as const, fingerprint: "fp1", checks: [check()], dispositions: [review()], requiredCheckIds: ["c-1"] };
+const base = { taskId: "t1", tier: "feature" as const, fingerprint: "fp1", checks: [check()], dispositions: [review()], requiredCheckIds: ["c-1"] };
 
 describe("validateDelivery", () => {
   it("accepts a feature with passing check and approved disposition", () => {
@@ -64,5 +65,26 @@ describe("validateDelivery", () => {
   it("reports every reason", () => {
     const r = validateDelivery({ ...base, checks: [check({ exitCode: 2 })], dispositions: [] });
     expect(r.ok === false && r.reasons.length).toBe(2);
+  });
+  it("last disposition per fingerprint wins", () => {
+    const d = [review(), review({ disposition: "escalated" })];
+    expect(validateDelivery({ ...base, dispositions: d }).ok).toBe(false);
+    const e = [review({ disposition: "escalated" }), review()];
+    expect(validateDelivery({ ...base, dispositions: e }).ok).toBe(true);
+  });
+  it("ignores dispositions of another task", () => {
+    expect(validateDelivery({ ...base, dispositions: [review({ taskId: "other" })] }).ok).toBe(false);
+  });
+  it("requires required checks for feature/project but not small", () => {
+    expect(validateDelivery({ ...base, requiredCheckIds: [] }).ok).toBe(false);
+    expect(validateDelivery({ ...base, tier: "small", dispositions: [], requiredCheckIds: [] }).ok).toBe(true);
+  });
+  it("duplicate check ids: the last record wins", () => {
+    const checks = [check(), check({ exitCode: 1 })];
+    expect(validateDelivery({ ...base, checks }).ok).toBe(false);
+  });
+  it("isKnownDisposition guards the open string", () => {
+    expect(isKnownDisposition("approved")).toBe(true);
+    expect(isKnownDisposition("maybe")).toBe(false);
   });
 });

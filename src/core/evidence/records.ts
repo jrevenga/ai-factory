@@ -31,7 +31,13 @@ export type ReviewDisposition = Omit<z.infer<typeof ReviewDisposition>, "disposi
   disposition: (typeof REVIEW_DISPOSITIONS)[number];
 };
 
+/** The persisted `disposition` is an open string (R13); use this guard before narrowing. */
+export function isKnownDisposition(d: string): d is ReviewDisposition["disposition"] {
+  return (REVIEW_DISPOSITIONS as readonly string[]).includes(d);
+}
+
 export interface DeliveryInput {
+  taskId: string;
   tier: Route;
   fingerprint: string;
   checks: CheckRecord[];
@@ -41,6 +47,8 @@ export interface DeliveryInput {
 
 export function validateDelivery(input: DeliveryInput): { ok: true } | { ok: false; reasons: string[] } {
   const reasons: string[] = [];
+  const gated = input.tier === "feature" || input.tier === "project";
+  if (gated && input.requiredCheckIds.length === 0) reasons.push("no required checks were declared");
   for (const id of input.requiredCheckIds) {
     const matches = input.checks.filter((c) => c.id === id);
     const rec = matches[matches.length - 1];
@@ -54,11 +62,12 @@ export function validateDelivery(input: DeliveryInput): { ok: true } | { ok: fal
       reasons.push(`check ${id} ran against a different fingerprint than the current tree`);
     }
   }
-  if (input.tier === "feature" || input.tier === "project") {
-    const approved = input.dispositions.some(
-      (d) => d.fingerprint === input.fingerprint && (d.disposition === "approved" || d.disposition === "approved_with_rulings"),
-    );
-    if (!approved) reasons.push("no approved review disposition for the current fingerprint");
+  if (gated) {
+    const mine = input.dispositions.filter((d) => d.taskId === input.taskId && d.fingerprint === input.fingerprint);
+    const last = mine[mine.length - 1];
+    if (!last || (last.disposition !== "approved" && last.disposition !== "approved_with_rulings")) {
+      reasons.push("no approved review disposition for this task at the current fingerprint");
+    }
   }
   return reasons.length === 0 ? { ok: true } : { ok: false, reasons };
 }
