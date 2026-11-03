@@ -27,33 +27,37 @@ export interface ReadOnlyRule {
   denyShort?: string;
   /** Maximum number of non-option arguments (`uniq in out` writes `out`). */
   maxPositionals?: number;
-  /** Why a disqualifying option is rejected; defaults to "can write or run code". */
+  /** Why a disqualifying option is rejected; defaults to `DEFAULT_DENY_REASON`. */
   denyReason?: string;
 }
 
-const RECURSIVE_READ = "reads every file under a directory, including secrets (R23)";
+export const DEFAULT_DENY_REASON = "can write, run code or read files beyond its explicit arguments (R24)";
+const INDIRECT_READ = "reads files beyond its explicit path arguments (recursion or an option-named file), which can reach secrets (R23, R24)";
 
 export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   ls: {},
   cat: {},
   head: {},
   tail: {},
-  wc: {},
-  sort: { denyShort: "o", denyLong: ["--output", "--compress-program"] },
+  wc: { denyLong: ["--files0-from"] },
+  // File-list options (`--files0-from`, `--files-from`, `--fromfile`, `file -f`) read paths from a file or stdin, so
+  // `find ~/.aws -print0 | sort --files0-from=-` would print contents the gate never sees as arguments (R24).
+  sort: { denyShort: "o", denyLong: ["--output", "--compress-program", "--files0-from"] },
   uniq: { maxPositionals: 1 },
   cut: {},
   tr: {},
   // `-d ACTION` / `--directories=ACTION` is rejected whatever the action (`recurse` reads recursively).
-  grep: { denyShort: "rRd", denyLong: ["--recursive", "--dereference-recursive", "--directories"], denyReason: RECURSIVE_READ },
+  // `-f FILE` reads patterns from a file named by an option value, which the gate does not see as a read argument.
+  grep: { denyShort: "rRdf", denyLong: ["--recursive", "--dereference-recursive", "--directories", "--file"], denyReason: INDIRECT_READ },
   fd: { denyShort: "xX", denyLong: ["--exec", "--exec-batch"] },
-  tree: { denyShort: "oR" },
+  tree: { denyShort: "oR", denyLong: ["--fromfile"] },
   pwd: {},
   which: {},
   whereis: {},
   type: {},
-  file: { denyShort: "C", denyLong: ["--compile"] },
+  file: { denyShort: "Cf", denyLong: ["--compile", "--files-from"] },
   stat: {},
-  du: {},
+  du: { denyLong: ["--files0-from"] },
   df: {},
   echo: {},
   printf: { denyShort: "v" },
@@ -66,9 +70,10 @@ export const READ_ONLY_COMMANDS: Readonly<Record<string, ReadOnlyRule>> = {
   readlink: {},
   date: { denyShort: "s", denyLong: ["--set"] },
   sleep: {},
-  diff: { denyShort: "r", denyLong: ["--recursive"], denyReason: RECURSIVE_READ },
+  diff: { denyShort: "r", denyLong: ["--recursive", "--from-file", "--to-file"], denyReason: INDIRECT_READ },
   cmp: {},
-  jq: { denyShort: "i", denyLong: ["--in-place"] },
+  // `--rawfile`/`--slurpfile`/`-f` read files named by option values (`jq -n --rawfile x <secret> .` prints it).
+  jq: { denyShort: "if", denyLong: ["--in-place", "--rawfile", "--slurpfile", "--from-file"] },
 };
 
 /** Content searchers that recurse by default (`unknown`, R23): the grep read tool is the supported path. */
@@ -99,11 +104,14 @@ export const VERSION_PROBES: Readonly<Record<string, readonly (readonly string[]
 export const GIT_GLOBAL_FLAGS: ReadonlySet<string> = new Set(["--no-pager", "-P", "--no-optional-locks"]);
 /** Options that inject configuration or redirect the repository: always `unknown`. */
 export const GIT_INJECTION_LONG: readonly string[] = ["--config-env", "--exec-path", "--git-dir", "--work-tree"];
+/** Options that read a path list from a file or stdin, anywhere on a git command line: always `unknown` (R24). */
+export const GIT_FILE_LIST_LONG: readonly string[] = ["--pathspec-from-file"];
 /** Read-only subcommands that accept any argument except the listed long options. */
 export const GIT_READ_ONLY: Readonly<Record<string, readonly string[]>> = {
   status: [],
   log: ["--output", "--ext-diff"],
-  diff: ["--output", "--ext-diff"],
+  // `--no-index` compares arbitrary paths (directories recursively) and prints their contents (R24).
+  diff: ["--output", "--ext-diff", "--no-index"],
   show: ["--output", "--ext-diff"],
   "rev-parse": [],
   "ls-files": [],

@@ -48,7 +48,7 @@ export interface CommandClassification {
   reasons: string[];
   /** Paths written by the line (write arguments and output redirection targets), for the gate's path checks. */
   pathArgs: string[];
-  /** Input redirection (`<`) sources: reads, checked by the gate for secrets only. */
+  /** Paths read that are not file arguments (`<` sources, `git -C` dirs of read-only git): checked for secrets only. */
   inputPaths: string[];
   allowlisted: boolean;
 }
@@ -58,6 +58,8 @@ interface Verdict {
   allowlisted: boolean;
   reasons: string[];
   pathArgs: string[];
+  /** Paths read without being file arguments (`git -C` of read-only git); reported in `inputPaths`. */
+  readPaths?: string[];
 }
 
 const readOnly = (reason: string): Verdict => ({ class: "read-only", allowlisted: true, reasons: [reason], pathArgs: [] });
@@ -172,7 +174,7 @@ function parseWithSpec(args: readonly string[], spec: R.OptionSpec): ParseResult
 // --- per-command rules ---
 
 function classifyReadOnly(name: string, args: readonly string[], rule: R.ReadOnlyRule): Verdict {
-  const why = `${name} with this option ${rule.denyReason ?? "can write or run code"}`;
+  const why = `${name} with this option ${rule.denyReason ?? R.DEFAULT_DENY_REASON}`;
   if (rule.denyLong && hasLong(args, rule.denyLong)) return unknown(why);
   if (rule.denyShort && hasShort(args, rule.denyShort)) return unknown(why);
   if (rule.maxPositionals !== undefined && positionals(args).length > rule.maxPositionals) {
@@ -187,8 +189,14 @@ function classifyFind(args: readonly string[]): Verdict {
   return readOnly("find without action predicates is read-only");
 }
 
+/** Absolute, home-relative or parent-relative spellings (posix or Windows) that can point outside the work tree. */
+function mayLeaveWorkTree(p: string): boolean {
+  return p.startsWith("/") || p.startsWith("~/") || p === ".." || p.startsWith("../") || /^[A-Za-z]:/.test(p);
+}
+
 function classifyGit(args: readonly string[]): Verdict {
   if (hasLong(args, R.GIT_INJECTION_LONG)) return unknown("git option injects configuration or redirects the repository");
+  if (hasLong(args, R.GIT_FILE_LIST_LONG)) return unknown("git reads a pathspec list from a file or stdin (R24)");
   const dirs: string[] = [];
   let i = 0;
   while (i < args.length && args[i]!.startsWith("-")) {
@@ -210,14 +218,21 @@ function classifyGit(args: readonly string[]): Verdict {
   const sub = args[i];
   if (sub === undefined) return unknown("git without a subcommand");
   const v = classifyGitSubcommand(sub, args.slice(i + 1));
-  if (v.class !== "read-only" && dirs.length > 0) v.pathArgs = [...dirs, ...v.pathArgs];
+  if (dirs.length > 0) {
+    if (v.class === "read-only") v.readPaths = [...dirs, ...(v.readPaths ?? [])];
+    else v.pathArgs = [...dirs, ...v.pathArgs];
+  }
   return v;
 }
 
 function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
   const readDeny = lookup(R.GIT_READ_ONLY, sub);
   if (readDeny) {
-    if (readDeny.length > 0 && hasLong(rest, readDeny)) return unknown(`git ${sub} with an option that writes or runs code`);
+    if (readDeny.length > 0 && hasLong(rest, readDeny)) return unknown(`git ${sub} with an option that writes, runs code or leaves the repository`);
+    // git diff falls back to --no-index on its own when a path lies outside the work tree.
+    if (sub === "diff" && positionals(rest).some(mayLeaveWorkTree)) {
+      return unknown("git diff with a path that may lie outside the work tree compares arbitrary files (implicit --no-index)");
+    }
     return readOnly(`git ${sub} is read-only`);
   }
   switch (sub) {
@@ -271,7 +286,8 @@ function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
       return create ? localWrite("git checkout -b is allowlisted") : destructive("git checkout may discard working tree changes");
     }
     case "stash": {
-      if (rest[0] === "push" || rest[0] === "list") return localWrite(`git stash ${rest[0]} is allowlisted`);
+      if (rest[0] === "list") return readOnly("git stash list is read-only");
+      if (rest[0] === "push") return localWrite("git stash push is allowlisted");
       if (rest[0] === "drop" || rest[0] === "clear") return destructive(`git stash ${rest[0]} discards stashed work`);
       return unknown("git stash other than push/list");
     }
@@ -594,6 +610,7 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
         allowlisted: true,
         reasons: ["project-declared command"],
         pathArgs: v.pathArgs,
+        ...(v.readPaths ? { readPaths: v.readPaths } : {}),
       };
     } else if (name !== argv0 && !isHard(v.class)) {
       v = unknown(`command word \`${argv0}\` is not a canonical command name (path, case or extension)`, v.pathArgs);
@@ -603,7 +620,7 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
   }
   let cls = v.class;
   const pathArgs = [...v.pathArgs];
-  const inputPaths: string[] = [];
+  const inputPaths: string[] = [...(v.readPaths ?? [])];
   const reasons = [...v.reasons];
   for (const r of seg.redirections) {
     if (r.op === "2>&1" || R.NULL_TARGETS.has(r.target)) continue;

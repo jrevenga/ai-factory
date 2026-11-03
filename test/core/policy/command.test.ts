@@ -94,6 +94,13 @@ describe("classifyCommandLine: inputPaths", () => {
     expect(classify("echo $(x)").inputPaths).toEqual([]);
   });
 
+  it("reports git -C directories of read-only git as read paths (R24)", () => {
+    const r = classify("git -C ../other status");
+    expect(r.inputPaths).toEqual(["../other"]);
+    expect(r.pathArgs).toEqual([]);
+    expect(classify("git -C ../other add .").inputPaths).toEqual([]);
+  });
+
   it("keeps a path that is both read and written in pathArgs", () => {
     const r = classify("sed -i s/a/b/ f < f");
     expect(r.pathArgs).toEqual(["f"]);
@@ -190,7 +197,7 @@ describe("classifyCommandLine: rule details", () => {
     ["git checkout -b feat/y", "local-write"],
     ["git checkout main", "destructive"],
     ["git stash push -m wip", "local-write"],
-    ["git stash list", "local-write"],
+    ["git stash list", "read-only"],
     ["git stash clear", "destructive"],
     ["git update-ref -d refs/heads/x", "destructive"],
     ["git filter-branch", "destructive"],
