@@ -95,6 +95,17 @@ describe("checkLayers", () => {
     expect(v.map((x) => [x.rule, x.specifier])).toEqual([["extension-core-only", "zod"]]);
   });
 
+  it("extension may value-import typebox and its subpaths (ruling 14); zod and look-alikes stay forbidden", async () => {
+    const root = await tree({
+      "src/adapters/pi/extension/tb.ts":
+        'import { Type } from "typebox";\nimport { Value } from "typebox/value";\nimport { z } from "zod";\nimport t from "typebox-extra";\nexport { Type, Value, z, t };\n',
+    });
+    expect(checkLayers(root).map((x) => [x.rule, x.specifier])).toEqual([
+      ["extension-core-only", "zod"],
+      ["extension-core-only", "typebox-extra"],
+    ]);
+  });
+
   it("extension may import node builtins, prefixed or bare (ruling R6)", async () => {
     const root = await tree({
       "src/adapters/pi/extension/b.ts":

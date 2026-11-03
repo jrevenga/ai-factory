@@ -17,6 +17,12 @@ const SCAN_DIRS = ["src", "guard", "scripts", "bin"];
 const SCAN_EXT = /\.(ts|mjs)$/;
 const IO_BUILTINS = new Set(["fs", "fs/promises", "child_process", "os", "net", "http"]);
 const PI_SCOPE = "@earendil-works/";
+/** Ruling 14: host-provided by Pi (docs/packages.md); the extension value-imports it for tool parameter schemas. */
+const EXTENSION_HOST_PACKAGES = ["typebox"];
+
+function isHostPackage(spec: string): boolean {
+  return EXTENSION_HOST_PACKAGES.some((p) => spec === p || spec.startsWith(`${p}/`));
+}
 
 type Zone = "core" | "extension" | "adapters" | "cli" | "guard" | "other";
 
@@ -143,6 +149,7 @@ export function checkLayers(root: string): LayerViolation[] {
       }
       // Ruling R6: the extension runs inside Pi and needs Node builtins (fs/path/os) for the handshake.
       if (zone === "extension" && isBuiltin(spec)) continue;
+      if (zone === "extension" && isHostPackage(spec)) continue;
       if (zone === "extension" && !spec.startsWith(PI_SCOPE)) {
         add("extension-core-only");
         continue;

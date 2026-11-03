@@ -30,7 +30,11 @@ describe("checkManifest", () => {
   });
   it("flags a floating peer dependency", async () => {
     const d = await copy();
-    edit(d, "package.json", (t) => t.replace('"@earendil-works/pi-coding-agent": "1.4.0"\n  },\n  "dependencies"', '"@earendil-works/pi-coding-agent": "*"\n  },\n  "dependencies"'));
+    edit(d, "package.json", (t) => {
+      const pkg = JSON.parse(t) as { peerDependencies: Record<string, string> };
+      pkg.peerDependencies["@earendil-works/pi-coding-agent"] = "*";
+      return `${JSON.stringify(pkg, null, 2)}\n`;
+    });
     const problems = checkManifest(d);
     expect(problems).toHaveLength(1);
     expect(problems[0]).toContain("@earendil-works/pi-coding-agent");
