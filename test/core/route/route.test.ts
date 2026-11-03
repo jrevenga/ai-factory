@@ -96,6 +96,34 @@ describe("validateSetRoute", () => {
     expect(validateSetRoute({ route: "small", taskId: "Bad Id", reason: "r" }, { projectRoot: ROOT }).ok).toBe(false);
   });
 
+  it("rejects unknown route values", () => {
+    for (const route of ["admin", "", "Feature"]) {
+      const r = validateSetRoute(
+        { route: route as never, taskId: "t1", reason: "r", worktree: "/w/wt" },
+        { projectRoot: ROOT, worktreeOk: WT_OK },
+      );
+      expect(r.ok).toBe(false);
+    }
+  });
+
+  it("rejects a relative worktree and accepts POSIX or win32 absolute ones", () => {
+    const mk = (worktree: string) =>
+      validateSetRoute({ route: "feature", taskId: "t1", reason: "r", worktree }, { projectRoot: ROOT, worktreeOk: WT_OK });
+    for (const w of ["wt", "../wt", "./wt", "C:wt"]) expect(mk(w).ok).toBe(false);
+    for (const w of ["/w/wt", "C:\\w\\wt", "C:/w/wt", "\\\\srv\\share\\wt"]) expect(mk(w).ok).toBe(true);
+  });
+
+  it("small ignores an extra worktree and leaves base/declaredForInput unset", () => {
+    const r = validateSetRoute({ route: "small", reason: "r", worktree: "/w/wt" }, { projectRoot: ROOT });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.state.worktree).toBeUndefined();
+      expect(r.state.writeRoots).toEqual([ROOT]);
+      expect("base" in r.state).toBe(false);
+      expect("declaredForInput" in r.state).toBe(false);
+    }
+  });
+
   it("requires a reason", () => {
     expect(validateSetRoute({ route: "small", reason: "  " }, { projectRoot: ROOT }).ok).toBe(false);
   });

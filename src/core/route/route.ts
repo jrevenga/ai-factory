@@ -20,7 +20,12 @@ export interface SetRouteFacts {
 
 export type SetRouteResult = { ok: true; state: RouteState } | { ok: false; error: string };
 
+const ROUTES: readonly string[] = ["answer", "small", "feature", "project"];
+/** Absolute POSIX (`/x`), win32 drive (`C:\x`, `C:/x`) or UNC (`\\\\srv\\share`) path; pure, platform independent. */
+const ABSOLUTE = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
+
 export function validateSetRoute(req: SetRouteRequest, facts: SetRouteFacts): SetRouteResult {
+  if (!ROUTES.includes(req.route)) return { ok: false, error: `unknown route: ${String(req.route)}` };
   const reason = req.reason.trim();
   if (reason === "") return { ok: false, error: "set_route requires a non-empty reason" };
 
@@ -51,6 +56,7 @@ export function validateSetRoute(req: SetRouteRequest, facts: SetRouteFacts): Se
   if (req.worktree === undefined || req.worktree === "") {
     return { ok: false, error: `the ${req.route} route requires a worktree` };
   }
+  if (!ABSOLUTE.test(req.worktree)) return { ok: false, error: "worktree must be an absolute path" };
   const wt = facts.worktreeOk;
   if (wt === undefined || !wt.exists) return { ok: false, error: `worktree does not exist: ${req.worktree}` };
   if (!wt.sameRepo) return { ok: false, error: "worktree is not a worktree of this repository" };
