@@ -158,6 +158,41 @@ describe("route state (e2e, faux provider)", () => {
     expect(runs[1]!.find((e) => e.type === "route")).toMatchObject({ reason: "restored from session", state: { route: "small", reason: "edit docs" } });
   }, 120_000);
 
+  it("C1: a session forked into another project does not carry its route there (the write is blocked)", async () => {
+    const s = await setup();
+    const sessions = join(s.dir, "sessions");
+    s.env.FAUX_SCRIPT = JSON.stringify([{ tool: "set_route", args: { route: "small", reason: "fix typo in A" } }]);
+    const first = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.project, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER], sessionDir: sessions });
+    expect(first.code, first.stderr).toBe(0);
+    const files = (readdirSync(sessions, { recursive: true }) as string[]).filter((f) => f.endsWith(".jsonl"));
+    expect(files).toHaveLength(1);
+
+    const other = join(s.dir, "other");
+    mkdirSync(other);
+    git(other, "init", "-q");
+    writeFileSync(join(other, "README.md"), "y\n");
+    git(other, "add", "-A");
+    git(other, "commit", "-q", "-m", "init");
+    const pwned = join(other, "pwned.txt");
+    s.env.FAUX_SCRIPT = JSON.stringify([{ tool: "write", args: { path: pwned, content: "x" } }]);
+    const second = await runPiPrint({
+      cli,
+      agentDir: s.agentDir,
+      cwd: other,
+      env: s.env,
+      extensions: [FAUX, EXTENSION, OBSERVER],
+      sessionDir: sessions,
+      args: ["--fork", join(sessions, files[0]!)],
+    });
+    expect(second.code, second.stderr).toBe(0);
+    expect(results(s.log).map(([n, e]) => [n, e])).toEqual([
+      ["set_route", false],
+      ["write", true],
+    ]);
+    expect(existsSync(pwned)).toBe(false);
+    expect(second.stderr).toContain(`declared for ${s.realProject}`);
+  }, 120_000);
+
   it("RPC steering: a user message consumed mid-run blocks the next write until set_route re-declares the route", async () => {
     const s = await setup();
     const signal = join(s.dir, "held");

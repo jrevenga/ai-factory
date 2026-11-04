@@ -191,5 +191,7 @@ describe("routeReminder and ROUTING_RULE_SECTION", () => {
     expect(ROUTING_RULE_SECTION).toContain("set_route");
     expect(ROUTING_RULE_SECTION).toMatch(/answer/);
     expect(ROUTING_RULE_SECTION).toMatch(/announce/i);
+    // The example matches what set_route returns (`Route: <route> — <reason>`).
+    expect(ROUTING_RULE_SECTION).toContain("Route: small — fix a typo");
   });
 });

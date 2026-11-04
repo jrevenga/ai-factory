@@ -111,6 +111,6 @@ export const ROUTING_RULE_SECTION = [
   "## Routing",
   "Declare the route with set_route before modifying anything: answer, small, feature or project.",
   "Until a route is declared, the route is answer (read-only); write and edit are denied.",
-  "Announce the route in one line when you declare it, for example: Route: small (fix a typo).",
+  "Announce the route in one line when you declare it, for example: Route: small — fix a typo.",
   "If a new user message changes the nature of the work, call set_route again.",
 ].join("\n");

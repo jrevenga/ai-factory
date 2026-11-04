@@ -251,6 +251,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
       setRoute(INITIAL_ROUTE);
       try {
         const session = openSession(ctx, personal, result.version);
+        routes.verifyTools();
         // Task 13 passes `interrupted: true` when reconciliation finds this session's previous run interrupted.
         routes.restore(routeSession(session), ctx, { interrupted: false });
         return { handshake: result, session };
@@ -275,6 +276,8 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     }
     const session = s.session;
     if (session === undefined) return { block: true, reason: `factory policy unavailable (fail closed): ${s.sessionError ?? "unknown error"}` };
+    // Review M2: a tool registered later under a factory name must not ride on the factory classification.
+    if (factoryTools.has(event.toolName)) routes.verifyTools();
     const ui: GateUi | undefined = ctx.hasUI ? { confirm: (title, message) => ctx.ui.confirm(title, message, { timeout: CONFIRM_TIMEOUT_MS }) } : undefined;
     return enforce(event, { cwd: ctx.cwd }, {
       policyContext: () => policyContext(session, ctx),

@@ -29,14 +29,20 @@ export const ROUTING_SECTION_KEY = "factory-routing";
 export const SET_ROUTE_TOOL = "set_route";
 const USER_INPUT_CONSUMED = "user input consumed";
 
-export const SetRouteParams = Type.Object({
-  route: Type.Enum(["answer", "small", "feature", "project"], {
-    description: "answer: read-only questions; small: a small change in the project; feature/project: work in the task worktree",
-  }),
-  taskId: Type.Optional(Type.String({ description: "Task id (lowercase letters, digits, dashes); required for feature and project" })),
-  reason: Type.String({ description: "One short sentence: why this route fits the request" }),
-  worktree: Type.Optional(Type.String({ description: "Absolute path of the task worktree on branch factory/<taskId>; required for feature and project" })),
-});
+/**
+ * A fresh schema object per registration: its identity tells this extension's `set_route` apart from a tool of
+ * the same name registered by anyone else (review M2, `verifyTools`).
+ */
+export function setRouteParams() {
+  return Type.Object({
+    route: Type.Enum(["answer", "small", "feature", "project"], {
+      description: "answer: read-only questions; small: a small change in the project; feature/project: work in the task worktree",
+    }),
+    taskId: Type.Optional(Type.String({ description: "Task id (lowercase letters, digits, dashes); required for feature and project" })),
+    reason: Type.String({ description: "One short sentence: why this route fits the request" }),
+    worktree: Type.Optional(Type.String({ description: "Absolute path of the task worktree on branch factory/<taskId>; required for feature and project" })),
+  });
+}
 
 /** Realpathed session facts the declaration is checked against (index.ts Session). */
 export interface RouteFacts {
@@ -65,8 +71,9 @@ export interface RouteSession {
   io?: RouteIo;
 }
 
+const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+
 function contains(parent: string, child: string): boolean {
-  const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
   const rel = path.relative(fold(parent), fold(child));
   return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 }
@@ -129,10 +136,23 @@ export interface RestoredRoute {
   notice?: string;
 }
 
+/** Stored and live write roots name the same directories (canonicalized; case-folded on win32). */
+function sameRoots(stored: readonly string[], live: readonly string[], io: RouteIo): boolean {
+  if (stored.length !== live.length) return false;
+  return stored.every((root, i) => {
+    try {
+      return fold(io.canonicalDir(root)) === fold(live[i]!);
+    } catch {
+      return false;
+    }
+  });
+}
+
 /**
- * The last `factory-route` entry of `entries` (the session branch, oldest first). Write roots are never taken
- * from the entry: the declaration is validated again with live facts (a worktree that is gone, or a project
- * that became protected, gives the answer route and a notice). The stored `base` and flag are kept; after an
+ * The last `factory-route` entry of `entries` (the session branch, oldest first). The declaration is validated
+ * again with live facts (a worktree that is gone, or a project that became protected, gives the answer route
+ * and a notice), and the live write roots must equal the stored ones (review C1): a session forked or opened in
+ * another project, or a forged entry, restores nothing. The stored `base` and flag are kept; after an
  * interrupted run the route is always flagged (ruling 20, `restored_after_interruption`).
  */
 export function restoreRoute(entries: readonly unknown[], facts: RouteFacts, opts: { interrupted: boolean }, io: RouteIo = ROUTE_IO): RestoredRoute {
@@ -163,6 +183,10 @@ export function restoreRoute(entries: readonly unknown[], facts: RouteFacts, opt
     };
     const v = validateWithFacts(req, facts, io);
     if (!v.ok) return { state: INITIAL_ROUTE, restored: false, notice: `factory: the stored ${stored.route} route no longer validates (${v.error}); ${readOnly}` };
+    if (!sameRoots(stored.writeRoots, v.state.writeRoots, io)) {
+      const notice = `factory: the stored ${stored.route} route was declared for ${stored.writeRoots.join(", ") || "(no root)"}, not ${v.state.writeRoots.join(", ")}; ${readOnly}`;
+      return { state: INITIAL_ROUTE, restored: false, notice };
+    }
     state = { ...v.state, ...(stored.base !== undefined ? { base: stored.base } : {}), needsReclassification: stored.needsReclassification };
   }
   if (opts.interrupted) state = routeReducer(state, { type: "restored_after_interruption", state });
@@ -190,7 +214,7 @@ function textOf(content: unknown): string {
     .join("\n");
 }
 
-type RoutePi = Pick<ExtensionAPI, "on" | "registerTool" | "appendEntry">;
+type RoutePi = Pick<ExtensionAPI, "on" | "registerTool" | "appendEntry" | "getAllTools">;
 type NoticeCtx = Pick<ExtensionContext, "hasUI" | "ui" | "sessionManager">;
 
 export interface RouteStateDeps {
@@ -203,6 +227,11 @@ export interface RouteStateDeps {
 export interface RouteStateHandle {
   /** Restores the route of `ctx`'s session branch (session start); `s` is passed because the run is still opening. */
   restore(s: RouteSession, ctx: NoticeCtx, opts: { interrupted: boolean }): void;
+  /**
+   * Review M2: Pi runs the first registration of a tool name. When the effective `set_route` is not this
+   * extension's (or cannot be checked), the name leaves `factoryTools` for good, so the gate treats it as unknown.
+   */
+  verifyTools(): void;
 }
 
 function warn(ctx: NoticeCtx, message: string): void {
@@ -227,6 +256,7 @@ function toolResult(text: string, details: RouteState | undefined, isError = fal
 }
 
 export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStateHandle {
+  const parameters = setRouteParams();
   pi.registerTool({
     name: SET_ROUTE_TOOL,
     label: "Set route",
@@ -237,7 +267,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       "Returns the one-line announcement to show the user.",
     ].join(" "),
     promptSnippet: "set_route: declare the route (answer, small, feature, project) before modifying anything",
-    parameters: SetRouteParams,
+    parameters,
     // Shares the in-memory route with every other call's gate decision.
     executionMode: "sequential",
     async execute(_toolCallId, params) {
@@ -278,7 +308,14 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
     try {
       pi.appendEntry(ROUTE_ENTRY, next);
     } catch (e) {
-      process.stderr.write(`factory: could not persist the route: ${(e as Error).message}\n`);
+      // Review M3: the session entry would restore unflagged; the ledger keeps the flag and this error.
+      const message = `could not persist the flagged route as a session entry: ${(e as Error).message}`;
+      process.stderr.write(`factory: ${message}\n`);
+      try {
+        s.ledger.append({ v: 1, ts: new Date().toISOString(), runId: s.runId, type: "error", where: "route-persist", message });
+      } catch {
+        // Nothing else can record it.
+      }
     }
   });
   pi.on("agent_settled", async () => {
@@ -330,5 +367,19 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
     if (s !== undefined) restore(s, ctx, { interrupted: false });
   });
 
-  return { restore };
+  const verifyTools = (): void => {
+    if (!deps.factoryTools.has(SET_ROUTE_TOOL)) return;
+    let ours = false;
+    try {
+      ours = pi.getAllTools().find((t) => t.name === SET_ROUTE_TOOL)?.parameters === parameters;
+    } catch {
+      ours = false;
+    }
+    if (!ours) {
+      deps.factoryTools.delete(SET_ROUTE_TOOL);
+      process.stderr.write(`factory: the active ${SET_ROUTE_TOOL} tool is not the factory's (another extension registered the name first); it is gated as unknown\n`);
+    }
+  };
+
+  return { restore, verifyTools };
 }

@@ -194,11 +194,34 @@ describe("restoreRoute (session entries)", () => {
     expect(restoreRoute([], w.facts, { interrupted: false }, fakeIo())).toEqual({ state: INITIAL_ROUTE, restored: false });
   });
 
-  it("recomputes the write roots from live facts (a stored root is never trusted) and keeps the stored base", async () => {
+  it("restores only when the live write roots equal the stored ones, and keeps the stored base then", async () => {
     const w = await world();
-    const stored = small(w.project, { writeRoots: ["/"], base: "feedface".repeat(5) });
-    const r = restoreRoute([custom(ROUTE_ENTRY, stored)], w.facts, { interrupted: false }, fakeIo());
-    expect(r.state).toEqual({ ...stored, writeRoots: [w.project] });
+    const stored = small(w.project, { base: "feedface".repeat(5) });
+    expect(restoreRoute([custom(ROUTE_ENTRY, stored)], w.facts, { interrupted: false }, fakeIo()).state).toEqual(stored);
+    // A spoofed root grants nothing: the route is answer and the notice names both roots.
+    const spoofed = restoreRoute([custom(ROUTE_ENTRY, small(w.project, { writeRoots: ["/"] }))], w.facts, { interrupted: false }, fakeIo());
+    expect(spoofed.state).toEqual(INITIAL_ROUTE);
+    expect(spoofed.restored).toBe(false);
+    expect(spoofed.notice).toContain(`declared for / , not ${w.project}`.replace(" ,", ","));
+  });
+
+  it("C1: a route declared for one project is not restored in another (fork or open across projects)", async () => {
+    const w = await world({ git: true });
+    const other = repo(join(w.home, "other"));
+    const fromA = small(w.project);
+    const r = restoreRoute([custom(ROUTE_ENTRY, fromA)], { ...w.facts, projectRoot: other, gitDirs: [join(other, ".git")] }, { interrupted: false });
+    expect(r.state).toEqual(INITIAL_ROUTE);
+    expect(r.restored).toBe(false);
+    expect(r.notice).toContain(w.project);
+    expect(r.notice).toContain(other);
+  });
+
+  it("stored roots compare after canonicalization (a symlinked spelling of the same project matches)", async () => {
+    const w = await world();
+    const link = join(w.dir, "project-link");
+    symlinkSync(w.project, link, isWin ? "junction" : "dir");
+    const r = restoreRoute([custom(ROUTE_ENTRY, small(link))], w.facts, { interrupted: false });
+    expect(r.state).toEqual(small(w.project));
   });
 
   it("an invalid stored worktree restores the answer route with a notice", async () => {
@@ -238,32 +261,38 @@ interface ToolLike {
   execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean; details: unknown }>;
 }
 
-async function wired(opts: { session?: boolean } = {}) {
+async function wired(opts: { session?: boolean; effectiveTools?: () => Array<{ name: string; parameters: unknown }> } = {}) {
   const w = await world();
   const handlers = new Map<string, Handler[]>();
   const tools: ToolLike[] = [];
   const entries: Array<{ customType: string; data: unknown }> = [];
   const events: RunEvent[] = [];
+  const state = { appendFails: false };
   const pi = {
     on: (name: string, h: Handler) => {
       handlers.set(name, [...(handlers.get(name) ?? []), h]);
       return () => undefined;
     },
     registerTool: (t: ToolLike) => void tools.push(t),
-    appendEntry: (customType: string, data: unknown) => void entries.push({ customType, data }),
+    appendEntry: (customType: string, data: unknown) => {
+      if (state.appendFails) throw new Error("disk full");
+      entries.push({ customType, data });
+    },
+    // Pi resolves a duplicated name to the first registration (runner.js getAllRegisteredTools).
+    getAllTools: () => (opts.effectiveTools ? opts.effectiveTools() : tools.map((t) => ({ name: t.name, parameters: t.parameters }))),
   };
   const session: RouteSession = { ledger: { append: (e) => void events.push(RunEvent.parse(e)) }, runId: "20261104T100000Z-1", facts: w.facts, io: fakeIo() };
   const factoryTools = new Set<string>();
-  registerRouteState(pi as never, { session: async () => (opts.session === false ? undefined : session), factoryTools });
-  const fire = async (name: string, event: Record<string, unknown>) => {
+  const routes = registerRouteState(pi as never, { session: async () => (opts.session === false ? undefined : session), factoryTools });
+  const fire = async (name: string, event: Record<string, unknown>, ctx: unknown = {}) => {
     let out: unknown;
-    for (const h of handlers.get(name) ?? []) out = await h({ type: name, ...event }, {});
+    for (const h of handlers.get(name) ?? []) out = await h({ type: name, ...event }, ctx);
     return out;
   };
   const user = (content: unknown) => fire("message_start", { message: { role: "user", content, timestamp: 0 } });
   const tool = tools.find((t) => t.name === "set_route")!;
   const setRouteCall = (params: Record<string, unknown>) => tool.execute("call-1", params, undefined, undefined, {});
-  return { w, handlers, tools, tool, entries, events, factoryTools, fire, user, setRouteCall };
+  return { w, handlers, tools, tool, entries, events, factoryTools, fire, user, setRouteCall, routes, state };
 }
 
 describe("registerRouteState (set_route tool, reclassification, prompt)", () => {
@@ -373,6 +402,50 @@ describe("registerRouteState (set_route tool, reclassification, prompt)", () => 
     await x.fire("before_agent_start", { systemPrompt: "base", systemPromptOptions: { sections }, messageType: "user", prompt: "go" });
     expect(sections).toEqual({});
     expect(await x.fire("context", { messages: [] })).toBeUndefined();
+  });
+
+  it("M2: set_route stays a factory tool only while the effective definition is the one this extension registered", async () => {
+    const ours = await wired();
+    ours.routes.verifyTools();
+    expect(ours.factoryTools.has("set_route")).toBe(true);
+    // An earlier-loaded extension registered its own set_route: Pi runs that one, so the gate must not trust it.
+    const shadowed = await wired({ effectiveTools: () => [{ name: "set_route", parameters: { type: "object", properties: {} } }] });
+    shadowed.routes.verifyTools();
+    expect(shadowed.factoryTools.has("set_route")).toBe(false);
+    const missing = await wired({ effectiveTools: () => [] });
+    missing.routes.verifyTools();
+    expect(missing.factoryTools.has("set_route")).toBe(false);
+    const broken = await wired({
+      effectiveTools: () => {
+        throw new Error("boom");
+      },
+    });
+    broken.routes.verifyTools();
+    expect(broken.factoryTools.has("set_route")).toBe(false);
+  });
+
+  it("M3: a flag that cannot be persisted as a session entry is audited as a ledger error", async () => {
+    const x = await wired();
+    await x.setRouteCall({ route: "small", reason: "fix a typo" });
+    await x.user("first");
+    x.state.appendFails = true;
+    await x.user("second");
+    expect(currentRoute().needsReclassification).toBe(true);
+    expect(x.events.at(-1)).toMatchObject({ type: "error", where: "route-persist", message: expect.stringContaining("disk full") });
+  });
+
+  it("M4: session_tree restores the route of the new branch", async () => {
+    const x = await wired();
+    await x.setRouteCall({ route: "small", reason: "fix a typo" });
+    const branch = (entries: unknown[]) => ({ hasUI: false, sessionManager: { getBranch: () => entries } });
+    // Navigating to a point before any route entry: answer.
+    await x.fire("session_tree", { newLeafId: "a", oldLeafId: "b" }, branch([]));
+    expect(currentRoute()).toEqual(INITIAL_ROUTE);
+    // Navigating to a branch whose last entry is a flagged small route of this project.
+    const flagged = small(x.w.project, { needsReclassification: true });
+    await x.fire("session_tree", { newLeafId: "c", oldLeafId: "a" }, branch([custom(ROUTE_ENTRY, small(x.w.project)), custom(ROUTE_ENTRY, flagged)]));
+    expect(currentRoute()).toEqual(flagged);
+    expect(x.events.at(-1)).toMatchObject({ type: "route", reason: "restored from session" });
   });
 
   it("announce names the route and the reason", () => {
