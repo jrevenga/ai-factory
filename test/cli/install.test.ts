@@ -153,6 +153,25 @@ describe("install", () => {
     expect(existsSync(paths.state)).toBe(false);
   });
 
+  it("outside npx, a lock release failure after the install committed → reports both, exit 1 (M2)", async () => {
+    const c = ctx();
+    c.deps = {
+      ...c.deps,
+      acquireLock: async (p, o, t) => {
+        const real = await acquireLock(p, o, t);
+        return { ...real, release: async () => {
+          await real.release();
+          throw new Error("lock compromised while installing");
+        } };
+      },
+    };
+    expect(await install(c, { yes: true }, deps())).toBe(1);
+    const text = err.join("\n");
+    expect(text).toContain("factory 0.1.0 is installed, but the factory lock could not be released cleanly: lock compromised while installing");
+    expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe("0.1.0");
+    expect(out.join("\n")).not.toContain("factory 0.1.0 installed.");
+  });
+
   it("outside npx, a failed apply → exit 1", async () => {
     const c = ctx();
     c.pi = new (class extends FakePi {

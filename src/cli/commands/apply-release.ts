@@ -41,6 +41,7 @@ export interface ApplyDeps {
   runDoctor: typeof runDoctor;
   migrations: readonly Migration[];
   clearTxn: typeof clearTxn;
+  acquireLock: typeof acquireLock;
 }
 
 export interface ApplyContext {
@@ -223,7 +224,7 @@ async function migrate(paths: FactoryPaths, manifest: ReleaseManifest, registry:
 export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promise<void> {
   const { paths, env, manifest, io, pi } = ctx;
   const root = ctx.root ?? PACKAGE_ROOT;
-  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, clearTxn, ...ctx.deps };
+  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, clearTxn, acquireLock, ...ctx.deps };
   const now = ctx.now();
 
   let lock: Lock | undefined;
@@ -231,7 +232,7 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
   /** True once state.json is written: the release is installed even if a later step fails. */
   let committed = false;
   try {
-    const held = await acquireLock(paths, { ownerPid: opts.parentLockPid });
+    const held = await deps.acquireLock(paths, { ownerPid: opts.parentLockPid });
     lock = held;
     /** The lock may be lost mid-run (compromised, or the lender ended; R5/R17): never mutate after that. */
     const live = () => held.verify();
@@ -322,7 +323,9 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
     throw new ApplyFailed(msg(failure), { cause: failure });
   }
   if (releaseError !== undefined) {
+    // M2: committed, but another process may have held the lock meanwhile; automation must see a failure.
     io.err(`factory ${manifest.factory} is installed, but the factory lock could not be released cleanly: ${msg(releaseError)}. Run "factory doctor".`);
+    throw new ApplyFailed(msg(releaseError), { cause: releaseError });
   }
   io.out(`factory ${manifest.factory} installed.`);
   try {
