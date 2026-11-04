@@ -3,8 +3,9 @@
 // personal config parses and that FACTORY_HOME is writable, then emits `factory:handshake` for the
 // guard (ruling 8). While the handshake has failed, its own tool_call handler blocks every tool except
 // the read-only ones, which covers "loaded but handshake failed" even without the guard file.
-// Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger) and enforces
-// the GatePolicy on every tool call (enforce.ts); `run_end` is written at session_shutdown.
+// Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger), restores the route
+// of the session branch (route-state.ts) and enforces the GatePolicy on every tool call (enforce.ts); `run_end`
+// is written at session_shutdown.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -30,6 +31,7 @@ import { FactoryState } from "../../../core/state/schema.ts";
 import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
+import { registerRouteState, type RouteSession } from "./route-state.ts";
 import { storeWritable } from "./store-probe.ts";
 
 const PACKAGE_JSON = fileURLToPath(new URL("../../../../package.json", import.meta.url));
@@ -208,6 +210,14 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
   };
 }
 
+function routeSession(s: Session): RouteSession {
+  return {
+    ledger: s.ledger,
+    runId: s.runId,
+    facts: { projectRoot: s.projectRoot, home: s.home, piAgentDir: s.piAgentDir, factoryHome: s.factoryHome, gitDirs: s.gitDirs },
+  };
+}
+
 interface Started {
   handshake: HandshakeResult;
   session?: Session;
@@ -218,10 +228,17 @@ export default function factoryExtension(pi: ExtensionAPI): void {
   let current: Promise<Started> | undefined;
   /**
    * Review M2: names of the tools this extension registered with `pi.registerTool`. Only these are gated as
-   * factory tools; Task 8+ add each registration here.
+   * factory tools; each registration adds its name here.
    */
   const factoryTools = new Set<string>();
   const sessionNow = async (): Promise<Session | undefined> => (current === undefined ? undefined : (await current).session);
+  const routes = registerRouteState(pi, {
+    session: async () => {
+      const s = await sessionNow();
+      return s === undefined ? undefined : routeSession(s);
+    },
+    factoryTools,
+  });
 
   const start = (ctx: ExtensionContext): Promise<Started> => {
     current = runHandshake().then(({ result, personal }) => {
@@ -230,10 +247,13 @@ export default function factoryExtension(pi: ExtensionAPI): void {
         report(ctx, handshakeFailureMessage(result));
         return { handshake: result };
       }
-      // Task 8 restores the route from session entries; a new session starts read-only.
+      // Read-only until the route of the session branch is restored (or when opening the run fails).
       setRoute(INITIAL_ROUTE);
       try {
-        return { handshake: result, session: openSession(ctx, personal, result.version) };
+        const session = openSession(ctx, personal, result.version);
+        // Task 13 passes `interrupted: true` when reconciliation finds this session's previous run interrupted.
+        routes.restore(routeSession(session), ctx, { interrupted: false });
+        return { handshake: result, session };
       } catch (e) {
         const sessionError = (e as Error).message;
         report(ctx, `factory policy unavailable (every tool is blocked): ${sessionError}`);

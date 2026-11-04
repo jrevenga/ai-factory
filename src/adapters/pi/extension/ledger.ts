@@ -171,7 +171,8 @@ export interface InterruptedRun {
 }
 
 /** The persisted route state, or undefined when it does not have the RouteState shape (never restore garbage). */
-function asRouteState(state: Record<string, unknown>): RouteState | undefined {
+export function asRouteState(state: unknown): RouteState | undefined {
+  if (typeof state !== "object" || state === null || Array.isArray(state)) return undefined;
   const s = state as Partial<Record<keyof RouteState, unknown>>;
   const optString = (v: unknown) => v === undefined || typeof v === "string";
   if (typeof s.route !== "string" || !ROUTES.includes(s.route as Route)) return undefined;

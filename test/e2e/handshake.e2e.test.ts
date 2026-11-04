@@ -89,27 +89,40 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
     const s = await setup("0.1.0");
     const log = join(s.dir, "observed.jsonl");
     s.env.OBSERVE_FILE = log;
+    // The project sits beside the factory home: a write root may not contain it (set_route, review M6).
+    const project = join(s.dir, "project");
+    mkdirSync(project);
+    const out = join(project, "out.txt");
     s.env.FAUX_SCRIPT = JSON.stringify([
       { tool: "bash", args: { command: "echo gate-ok" } },
-      { tool: "write", args: { path: s.out, content: "x" } },
+      { tool: "write", args: { path: out, content: "x" } },
+      { tool: "set_route", args: { route: "small", reason: "write out.txt" } },
+      { tool: "write", args: { path: out, content: "x" } },
     ]);
-    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER] });
+    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: project, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER] });
     expect(r.timedOut).toBe(false);
     expect(r.code, r.stderr).toBe(0);
     const results = observed(log).filter((o) => o.event === "tool_result");
     expect(results.map((x) => [x.toolName, x.isError])).toEqual([
       ["bash", false],
       ["write", true],
+      ["set_route", false],
+      ["write", false],
     ]);
     expect(results[0]?.text).toContain("gate-ok");
     // No route declared yet: the answer route is read-only.
     expect(results[1]?.text).toContain("the answer route cannot write");
-    expect(existsSync(s.out)).toBe(false);
+    // After set_route small the project root is writable.
+    expect(results[2]?.text).toBe("Route: small — write out.txt");
+    expect(readFileSync(out, "utf8")).toBe("x");
 
     const events = ledgerEvents(s.env.FACTORY_HOME as string);
-    expect(events.map((e) => e.type)).toEqual(["run_start", "gate", "gate", "run_end"]);
+    expect(events.map((e) => e.type)).toEqual(["run_start", "gate", "gate", "gate", "route", "gate", "run_end"]);
     expect(events[1]).toMatchObject({ tool: "bash", decision: "allow", class: "read-only", summary: "echo gate-ok" });
     expect(events[2]).toMatchObject({ tool: "write", decision: "deny" });
+    expect(events[3]).toMatchObject({ tool: "set_route", decision: "allow" });
+    expect(events[4]).toMatchObject({ reason: "set_route", state: { route: "small", reason: "write out.txt" } });
+    expect(events[5]).toMatchObject({ tool: "write", decision: "allow" });
   }, 120_000);
 
   it("state at another version: the write is blocked and the output names version-mismatch", async () => {

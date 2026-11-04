@@ -217,6 +217,12 @@
             "type": "string"
           },
           "additionalProperties": {}
+        },
+        "reason": {
+          "type": "string"
+        },
+        "input": {
+          "type": "string"
         }
       },
       "required": [

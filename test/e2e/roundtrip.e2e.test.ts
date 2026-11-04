@@ -13,7 +13,8 @@
 //
 // After the install, the update and the rollback, the pinned Pi runs with the faux provider and only the
 // test extensions on its command line: the factory package must load from Pi's settings (the checkout Pi
-// installed), handshake, let the guard step aside and enforce its GatePolicy (I4).
+// installed), handshake, let the guard step aside and enforce its GatePolicy (I4): a write is denied on the
+// initial answer route and allowed after `set_route small`.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -175,9 +176,9 @@ function observed(file: string): Observed[] {
 
 /**
  * Runs the installed pinned Pi (state.piCli) in print mode with the faux provider scripting a read-only
- * `bash` command and a `write`. Only the test extensions (faux provider, observer) are passed with -e; the
- * factory package comes from Pi's settings and the guard from Pi's extensions dir, exactly as a user's
- * session loads them.
+ * `bash` command, a `write`, `set_route small` and the same `write` again. Only the test extensions (faux
+ * provider, observer) are passed with -e; the factory package comes from Pi's settings and the guard from Pi's
+ * extensions dir, exactly as a user's session loads them.
  */
 async function piRun(label: string, extraEnv: NodeJS.ProcessEnv = {}) {
   const work = join(tmp.dir, "pi work", label);
@@ -187,6 +188,8 @@ async function piRun(label: string, extraEnv: NodeJS.ProcessEnv = {}) {
   const marker = `factory-${label.replace(/[^a-z0-9]+/gi, "-")}`;
   const script = [
     { tool: "bash", args: { command: `echo ${marker}` } },
+    { tool: "write", args: { path: target, content: label } },
+    { tool: "set_route", args: { route: "small", reason: `round-trip ${label}` } },
     { tool: "write", args: { path: target, content: label } },
   ];
   const run = await runPiPrint({
@@ -200,23 +203,36 @@ async function piRun(label: string, extraEnv: NodeJS.ProcessEnv = {}) {
   const o = observed(log);
   const handshakes = o.filter((x) => x.event === "handshake").map((x) => x.data);
   const results = o.filter((x) => x.event === "tool_result");
-  return { run, marker, written: existsSync(target), handshakes, bash: results.find((x) => x.toolName === "bash"), write: results.find((x) => x.toolName === "write") };
+  const writes = results.filter((x) => x.toolName === "write");
+  return {
+    run,
+    marker,
+    written: existsSync(target) ? readFileSync(target, "utf8") : undefined,
+    handshakes,
+    bash: results.find((x) => x.toolName === "bash"),
+    setRoute: results.find((x) => x.toolName === "set_route"),
+    write: writes[0],
+    writeAfterRoute: writes[1],
+  };
 }
 
 /**
  * I4: the installed factory package loads from Pi settings and handshakes at `version`, so the guard steps
  * aside (the read-only `bash` runs) and the package's own GatePolicy decides: the write is blocked on the
- * initial answer route (Phase 2), which also proves the installed package (not only the guard) is active.
+ * initial answer route (Phase 2) and allowed after `set_route small`, which also proves the installed package
+ * (not only the guard) is active.
  */
 async function expectInstalledPackageEnforces(label: string, version: string): Promise<void> {
-  const { run, marker, written, handshakes, bash, write } = await piRun(label);
+  const { run, marker, written, handshakes, bash, setRoute, write, writeAfterRoute } = await piRun(label);
   expect(run.code, describeRun(run)).toBe(0);
   expect(handshakes, describeRun(run)).toEqual([{ ok: true, version, policy: "v1", reasons: [] }]);
   expect(bash, describeRun(run)).toMatchObject({ isError: false });
   expect(bash?.text, describeRun(run)).toContain(marker);
   expect(write, describeRun(run)).toMatchObject({ isError: true });
   expect(write?.text, describeRun(run)).toContain("the answer route cannot write");
-  expect(written, describeRun(run)).toBe(false);
+  expect(setRoute, describeRun(run)).toMatchObject({ isError: false, text: `Route: small — round-trip ${label}` });
+  expect(writeAfterRoute, describeRun(run)).toMatchObject({ isError: false });
+  expect(written, describeRun(run)).toBe(label);
 }
 
 beforeAll(async () => {
@@ -288,7 +304,8 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       const emptyHome = join(tmp.dir, "empty factory home");
       await mkdir(emptyHome, { recursive: true });
       const blocked = await piRun("not installed", { FACTORY_HOME: emptyHome });
-      expect(blocked.written, describeRun(blocked.run)).toBe(false);
+      expect(blocked.written, describeRun(blocked.run)).toBeUndefined();
+      expect(blocked.setRoute).toMatchObject({ isError: true });
       expect(blocked.bash).toMatchObject({ isError: true });
       expect(blocked.run.stderr).toContain("factory handshake failed: not-installed");
       expect(blocked.handshakes).toEqual([{ ok: false, version: "0.1.0", policy: "v1", reasons: ["not-installed"] }]);

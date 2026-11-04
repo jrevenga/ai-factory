@@ -346,6 +346,13 @@ export function worktreeFacts(p: string, projectRoot: string): WorktreeFacts {
   return { exists: true, sameRepo, ...(branch ? { branch } : {}) };
 }
 
+/** `git rev-parse --verify HEAD` of the work tree at `dir` (ruling 10 `base`); undefined outside a repo or before the first commit. */
+export function headCommit(dir: string): string | undefined {
+  if (!isDir(dir)) return undefined;
+  const out = gitOut(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
+  return out !== undefined && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(out) ? out : undefined;
+}
+
 export function sha256hex(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
 }

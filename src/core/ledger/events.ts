@@ -32,7 +32,13 @@ export const RunEvent = z.discriminatedUnion("type", [
     reason: z.string(),
     summary: z.string(),
   }),
-  ev("route", { state: z.record(z.string(), z.unknown()) }),
+  ev("route", {
+    state: z.record(z.string(), z.unknown()),
+    /** Why the route changed: `set_route`, `restored from session`, `user input consumed`, ... */
+    reason: z.string().optional(),
+    /** The consumed user message (redacted, at most 500 chars) when `reason` is `user input consumed`. */
+    input: z.string().optional(),
+  }),
   ev("decision", {
     kind: open(["soft-gate-skipped", "soft-gate-resolved", "ruling"] as const),
     gate: z.string().optional(),
