@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { factoryPaths } from "../adapters/platform/paths.ts";
 import { PiRuntime } from "../adapters/pi/runtime.ts";
 import { withAbsoluteDirs } from "../core/paths/homes.ts";
-import { ReleaseManifest } from "../core/release/manifest.ts";
+import { CredentialsInSourceUrl, effectiveSource, ReleaseManifest } from "../core/release/manifest.ts";
 import { APPLY_REASONS, applyRelease, ApplyFailed, type ApplyContext, type ApplyDeps, type ApplyReason } from "./commands/apply-release.ts";
 import { configExplain } from "./commands/config.ts";
 import { runDoctor, formatDoctor, type DoctorCheck } from "./commands/doctor.ts";
@@ -96,13 +96,22 @@ async function run(argv: string[], io: CliIO, deps: MainDeps, env: NodeJS.Proces
 
   const manifest = ReleaseManifest.parse(JSON.parse(readFileSync(join(root, "release.json"), "utf8")));
 
-  if (toPi !== undefined) {
-    return launch({ paths: factoryPaths(env), env, manifest, io, root, doctor: deps.doctor }, toPi);
-  }
-
   if (cmd === "version") {
     io.out(manifest.factory);
     return 0;
+  }
+
+  // M3: a source URL with embedded credentials is refused before any command can print or store it.
+  try {
+    effectiveSource(manifest, env);
+  } catch (e) {
+    if (!(e instanceof CredentialsInSourceUrl)) throw e;
+    io.err(e.message);
+    return 1;
+  }
+
+  if (toPi !== undefined) {
+    return launch({ paths: factoryPaths(env), env, manifest, io, root, doctor: deps.doctor }, toPi);
   }
 
   if (cmd === "install" || cmd === "_apply-release") {

@@ -345,3 +345,29 @@ describe("relative directory overrides (I4)", () => {
     }
   });
 });
+
+describe("FACTORY_SOURCE with embedded credentials (M3)", () => {
+  it.each([[["doctor", "--offline"]], [["install", "--yes"]], [["update", "--yes"]], [["rollback", "--yes"]], [[]]])(
+    "%j refuses before doing anything and never prints the URL",
+    async (argv) => {
+      const t = await makeTmp("main-credentials");
+      try {
+        const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "https://user:s3cret@github.com/o/ai-factory.git", PI_OFFLINE: "1" };
+        const c = capture();
+        expect(await main([...argv], c.io, { env, doctor: async () => [] })).toBe(1);
+        const text = [...c.out, ...c.err].join("\n");
+        expect(text).toContain("FACTORY_SOURCE embeds credentials");
+        expect(text).toContain("credential helper");
+        expect(text).not.toContain("s3cret");
+        expect(existsSync(factoryPaths(env).home)).toBe(false);
+      } finally {
+        await t.cleanup();
+      }
+    },
+  );
+
+  it("version still works", async () => {
+    const c = capture();
+    expect(await main(["version"], c.io, { env: { FACTORY_SOURCE: "https://user:s3cret@github.com/o/x.git" } })).toBe(0);
+  });
+});
