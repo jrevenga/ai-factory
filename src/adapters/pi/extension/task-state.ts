@@ -186,7 +186,13 @@ export function commitCheckpoint(worktree: string, subject: string, message: str
     }
     if (stagedPaths.length === 0) return { sha: head(git, worktree), kind: "commit", changed: false, excluded };
     const body = message !== undefined && message.trim() !== "" ? ["-m", message.trim()] : [];
-    const commit = git(worktree, ["commit", "--no-verify", "-q", "-m", subject, ...body]);
+    // R49: the user's identity when both name and email are configured; otherwise a fixed one for this commit only.
+    const configured = (key: string) => {
+      const r = git(worktree, ["config", key]);
+      return r.status === 0 && r.stdout.trim() !== "";
+    };
+    const identity = configured("user.name") && configured("user.email") ? [] : ["-c", "user.name=ai-factory", "-c", "user.email=ai-factory@localhost"];
+    const commit = git(worktree, [...identity, "commit", "--no-verify", "-q", "-m", subject, ...body]);
     if (commit.status !== 0) {
       const err = gitError("git commit", commit);
       const reset = git(worktree, ["reset", "-q"]);

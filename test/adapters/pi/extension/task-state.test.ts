@@ -385,6 +385,28 @@ describe("task_progress on feature/project routes", () => {
     expect(r.content[0]?.text).toContain("certs/key.pem");
   });
 
+  it("R49: without any git identity the checkpoint commit is authored by ai-factory and no config is written", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    git(x.project, "config", "--unset", "user.name");
+    git(x.project, "config", "--unset", "user.email");
+    for (const k of ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"]) vi.stubEnv(k, undefined);
+    writeFileSync(join(x.wt, "app.ts"), "export {};\n");
+    const r = await x.progress({ phase: "implement", checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(git(x.wt, "log", "-1", "--format=%an <%ae>|%cn <%ce>")).toBe("ai-factory <ai-factory@localhost>|ai-factory <ai-factory@localhost>");
+    expect(readFileSync(join(x.project, ".git", "config"), "utf8")).not.toContain("ai-factory");
+  });
+
+  it("R49: with a configured identity the checkpoint commit uses it", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    writeFileSync(join(x.wt, "app.ts"), "export {};\n");
+    const r = await x.progress({ phase: "implement", checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(git(x.wt, "log", "-1", "--format=%an <%ae>")).toBe("Factory Test <factory-test@example.invalid>");
+  });
+
   it("R2-1 backstop: a staged secret path found before the commit resets the index and refuses the checkpoint", async () => {
     const x = await wired();
     writeFileSync(join(x.wt, "app.ts"), "export {};\n");
@@ -434,11 +456,10 @@ describe("task_progress on feature/project routes", () => {
   it("M2: a failed commit resets the staged index and says so", async () => {
     const x = await wired();
     setRoute(x.feature);
-    git(x.project, "config", "--unset", "user.email");
-    git(x.project, "config", "--unset", "user.name");
-    git(x.project, "config", "user.useConfigOnly", "true");
+    // An invalid cleanup mode makes `git commit` fail whatever the identity (R49 gives every commit one).
+    git(x.project, "config", "commit.cleanup", "bogus");
     writeFileSync(join(x.wt, "app.ts"), "export {};\n");
-    const r = await x.progress({ checkpoint: true });
+    const r = await x.progress({ phase: "implement", checkpoint: true });
     expect(r.isError).toBe(true);
     expect(r.content[0]?.text).toMatch(/git commit failed/);
     expect(r.content[0]?.text).toMatch(/index was reset/);
