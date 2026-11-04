@@ -201,6 +201,13 @@ function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionF
   return { action: { kind: "command", tool, command, pathFacts: facts }, summary, display };
 }
 
+/** The pre-call copy of the route's task file for the ruling-8 post-check; undefined when it cannot be read. */
+function taskFileCopy(taskFile: string, cwd: string, home: string): MachineCopy | undefined {
+  const fact = pathFacts(taskFile, cwd, home);
+  const cur = readTarget(fact.resolved);
+  return cur.kind === "error" ? undefined : { file: fact.resolved, input: taskFile, before: cur.kind === "text" ? cur.text : undefined };
+}
+
 /**
  * `run_check` is gated as the `bash` command it runs (Task 10, decision 1), with facts resolved in the directory it
  * runs in. A check can rewrite the task file through project code the gate cannot see, so its machine section gets
@@ -212,12 +219,7 @@ function runCheckAction(ev: ToolCallLike, f: ActionFacts): PreparedAction {
   const command = str(ev.input.command);
   if (prepared.action.kind !== "command" || command === undefined) return prepared;
   const display = `run_check in ${rc.cwd}:\n${prepared.display}`;
-  let machine: MachineCopy | undefined;
-  if (rc.taskFile !== undefined) {
-    const fact = pathFacts(rc.taskFile, rc.cwd, f.home);
-    const cur = readTarget(fact.resolved);
-    if (cur.kind !== "error") machine = { file: fact.resolved, input: rc.taskFile, before: cur.kind === "text" ? cur.text : undefined };
-  }
+  const machine = rc.taskFile !== undefined ? taskFileCopy(rc.taskFile, rc.cwd, f.home) : undefined;
   return { ...prepared, display, runCheck: { command, cwd: rc.cwd }, ...(machine !== undefined ? { machine } : {}) };
 }
 
@@ -619,8 +621,10 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
   let prepared: PreparedAction | undefined;
   const group = deps.inFlight.groupFor(ev.parentToolCallId);
   let mutating = true;
+  let taskFile: string | undefined;
   try {
     const policy = deps.policyContext();
+    taskFile = runCheckFacts(policy).taskFile;
     prepared = prepareAction(ev, {
       cwd: ctx.cwd,
       home: deps.home,
@@ -691,7 +695,13 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
 
   if (outcome.block !== undefined || prepared === undefined) return block(outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}`);
   // Task 11: when the gate returns `reconcile: true`, take the snapshot here instead of the R29 deny above.
-  if (prepared.machine !== undefined) deps.postChecks.remember(ev.toolCallId, prepared.machine);
+  if (prepared.machine !== undefined) {
+    deps.postChecks.remember(ev.toolCallId, prepared.machine);
+  } else if (prepared.action.kind === "command" && mutating && taskFile !== undefined) {
+    // M6: project code a command runs (an allowlisted or declared runner) can rewrite the task file too.
+    const copy = taskFileCopy(taskFile, ctx.cwd, deps.home);
+    if (copy !== undefined) deps.postChecks.remember(ev.toolCallId, copy);
+  }
   if (prepared.runCheck !== undefined) deps.gatedChecks?.approve(ev.toolCallId, prepared.runCheck);
   return undefined;
 }

@@ -538,6 +538,31 @@ describe("run_check", () => {
   });
 });
 
+describe("ruling-8 post-check for bash (M6)", () => {
+  it("an allowed non-read-only bash command on a feature route that rewrites the machine section is repaired; read-only bash is not tracked", async () => {
+    const x = await world();
+    setRoute(x.feature);
+    const deps = { policyContext: () => x.context("unattended"), ledger: x.ledger, runId: RUN_ID, home: homedir(), postChecks: x.postChecks, inFlight: x.inFlight, factoryTools: x.factoryTools };
+    expect(await enforce({ toolName: "bash", toolCallId: "ro-1", input: { command: "git status" } }, { cwd: x.wt }, deps)).toBeUndefined();
+    expect(x.postChecks.size).toBe(0);
+    x.inFlight.done("ro-1");
+    expect(await enforce({ toolName: "bash", toolCallId: "b-1", input: { command: "node scripts/rewrite-task.mjs" } }, { cwd: x.wt }, deps)).toBeUndefined();
+    execFileSync(process.execPath, ["scripts/rewrite-task.mjs"], { cwd: x.wt });
+    const post = x.postChecks.afterToolResult({ toolCallId: "b-1", content: [{ type: "text", text: "done" }], isError: false }, x.ledger, RUN_ID);
+    const p = parseMachine(readFileSync(x.taskFile, "utf8"));
+    expect(p && !("invalid" in p) ? p.fields.phase : undefined).toBe("build");
+    expect((post?.content ?? []).map((c) => ("text" in c ? c.text : "")).join("")).toContain("machine-owned section");
+  });
+
+  it("a small route has no task file to protect", async () => {
+    const x = await world();
+    setRoute(x.small);
+    const deps = { policyContext: () => x.context("unattended"), ledger: x.ledger, runId: RUN_ID, home: homedir(), postChecks: x.postChecks, inFlight: x.inFlight, factoryTools: x.factoryTools };
+    expect(await enforce({ toolName: "bash", toolCallId: "b-2", input: { command: "node scripts/ok.mjs" } }, { cwd: x.project }, deps)).toBeUndefined();
+    expect(x.postChecks.size).toBe(0);
+  });
+});
+
 describe("resolveProgram (decision 4, M2)", () => {
   const files = new Set(["C:\\node\\node.exe", "C:\\node\\npm.cmd", "C:\\tools\\run.bat", "C:\\repo\\git.exe", "C:\\node\\script.js", "C:\\repo\\bin\\cat.exe", "C:\\sys\\cat.exe"]);
   // Windows file names are case-insensitive (PATHEXT entries are upper case).
