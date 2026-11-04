@@ -27,7 +27,7 @@ async function runRpc(w: GateWorld, script: unknown[], answer: Answer, settleMs:
     await rpc.waitFor((r) => r.type === "agent_settled", settleMs);
   } finally {
     const closed = await rpc.close();
-    expect(closed.killed, rpc.stderr()).toBe(false);
+    expect(closed, rpc.stderr()).toEqual({ code: 0, signal: null, killed: false });
   }
   const confirms = rpc.records.filter((r) => r.type === "extension_ui_request" && r.method === "confirm");
   return { confirms, elapsed: Date.now() - started };

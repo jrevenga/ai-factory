@@ -4,7 +4,7 @@
 // ~/.factory (piPrintEnv refuses them).
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isolatedEnv } from "./isolated-env.ts";
 import { makeTmp, type Tmp } from "./tmp.ts";
@@ -30,18 +30,39 @@ export function jsonLines<T>(file: string): T[] {
     .map((l) => JSON.parse(l) as T);
 }
 
-const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: isWin ? "NUL" : "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+/** Git never prompts (terminal or credential manager) in the fixture or in the Pi runs. */
+const NO_PROMPT = { GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
+const GIT_ENV = { ...process.env, ...NO_PROMPT, GIT_CONFIG_GLOBAL: isWin ? "NUL" : "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+const GIT_TIMEOUT_MS = 30_000;
 
 export function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", "-c", "init.defaultBranch=main", ...args], {
     cwd,
     encoding: "utf8",
     env: GIT_ENV,
+    timeout: GIT_TIMEOUT_MS,
   }).trim();
 }
 
 /** `package.json` test script: rewrites the tracked `src/a.txt`, so a run is observable and reconcilable. */
-const NPM_TEST = ['import { writeFileSync } from "node:fs";', 'writeFileSync("src/a.txt", "changed by npm test\\n");', 'console.log("npm test ran");'].join("\n");
+/** Appends one line per run, so a run that was not reverted shows in the final content. */
+const NPM_TEST = [
+  'import { appendFileSync } from "node:fs";',
+  'appendFileSync("src/a.txt", "changed by npm test\\n");',
+  'console.log("npm test ran");',
+].join("\n");
+
+/**
+ * The git executable on PATH as an absolute path with forward slashes (`C:/Program Files/Git/cmd/git.exe` on Windows),
+ * for the absolute-executable bypass case; undefined when git is not on PATH.
+ */
+export function gitExecutable(): string | undefined {
+  const name = isWin ? "git.exe" : "git";
+  for (const d of (process.env.PATH ?? process.env.Path ?? "").split(delimiter)) {
+    if (d !== "" && existsSync(join(d, name))) return join(d, name).replaceAll("\\", "/");
+  }
+  return undefined;
+}
 
 export interface GateWorld {
   tmp: Tmp;
@@ -66,10 +87,10 @@ export interface GateWorld {
 /**
  * <dir>/factory home/state.json   valid install record (handshake ok)
  * <dir>/project                   git, origin = <dir>/remote.git; README.md, notes.md (machine block), src/a.txt,
- *                                 package.json (`npm test` rewrites src/a.txt), scripts/ok.mjs declared as `test` in
+ *                                 package.json (`npm test` appends to src/a.txt), scripts/ok.mjs declared as `test` in
  *                                 .factory/config.json, p.diff, key; untracked .env (dummy) and, on POSIX,
  *                                 rel/l -> ../home/.ssh/key
- * <dir>/home/.ssh/key             POSIX: the fake HOME's secret (dummy text)
+ * <dir>/home/.ssh/key             the temp home's secret (dummy text); HOME/USERPROFILE point at <dir>/home
  * <dir>/remote.git                bare, empty
  * <dir>/outside/target.txt, <dir>/victim/keep.txt
  */
@@ -77,15 +98,22 @@ export async function makeGateWorld(prefix: string): Promise<GateWorld> {
   const tmp = await makeTmp(prefix);
   const dir = tmp.dir;
   const env = isolatedEnv(dir);
-  // A fake home (Pi's gate reads os.homedir(), i.e. HOME on POSIX) so home-anchored secrets are fixture files. On
-  // Windows os.homedir() follows USERPROFILE and Git Bash its own HOME, so the real home is left as is there.
-  let fakeHome: string | undefined;
-  if (!isWin) {
-    fakeHome = join(dir, "home");
-    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
-    writeFileSync(join(fakeHome, ".ssh", "key"), `${SECRET_MARK}\n`);
-    env.HOME = fakeHome;
+  // A temp home on every platform: Pi's gate reads os.homedir() (HOME on POSIX, USERPROFILE on Windows), Git Bash
+  // and git read HOME, and Windows tools fall back to HOMEDRIVE/HOMEPATH. Home-anchored secrets are fixture files.
+  const fakeHome = join(dir, "home");
+  mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+  writeFileSync(join(fakeHome, ".ssh", "key"), `${SECRET_MARK}\n`);
+  for (const k of Object.keys(env)) {
+    if (["home", "userprofile", "homedrive", "homepath"].includes(k.toLowerCase())) delete env[k];
   }
+  env.HOME = fakeHome;
+  if (isWin) {
+    const root = parse(fakeHome).root;
+    env.USERPROFILE = fakeHome;
+    env.HOMEDRIVE = root.replace(/[\\/]+$/, "");
+    env.HOMEPATH = fakeHome.slice(env.HOMEDRIVE.length);
+  }
+  Object.assign(env, NO_PROMPT);
   const home = env.FACTORY_HOME as string;
   mkdirSync(home, { recursive: true });
   writeFileSync(
@@ -128,11 +156,11 @@ export async function makeGateWorld(prefix: string): Promise<GateWorld> {
   git(project, "add", "-A");
   git(project, "commit", "-q", "-m", "init");
   writeFileSync(join(project, ".env"), `TOKEN=${SECRET_MARK}\n`);
-  // R28 fixture (POSIX only, see `fakeHome`): rel/l -> ../home/.ssh/key points at project/home/.ssh/key, which does
-  // not exist and is no secret path; the same link copied to the project root points at <dir>/home/.ssh/key, a secret
+  // R28 fixture (POSIX only: Git Bash `cp -P` does not preserve symlinks without developer mode): rel/l ->
+  // ../home/.ssh/key points at project/home/.ssh/key, which does not exist and is no secret path; the same link copied to the project root points at <dir>/home/.ssh/key, a secret
   // of the fake home.
   let symlinks = false;
-  if (fakeHome !== undefined) {
+  if (!isWin) {
     try {
       symlinkSync(join("..", "home", ".ssh", "key"), join(project, "rel", "l"));
       symlinks = true;

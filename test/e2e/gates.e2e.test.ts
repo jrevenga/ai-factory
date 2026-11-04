@@ -11,6 +11,7 @@ import {
   FAUX,
   gateEvents,
   git,
+  gitExecutable,
   isWin,
   ledgerRuns,
   makeGateWorld,
@@ -122,8 +123,8 @@ describe("gate suite (e2e, faux provider, unattended print mode)", () => {
     expect(existsSync(join(w.dir, "outside.txt"))).toBe(false);
     expect(readFileSync(w.victim, "utf8")).toBe("must survive\n");
     expect(existsSync(join(w.project, "dangerous.txt"))).toBe(false);
-    // The answer-route run was reverted; the small-route run kept its change.
-    expect(readFileSync(join(w.project, "src", "a.txt"), "utf8")).toBe("changed by npm test\n");
+    // Each run appends one line: the answer-route run was reverted (else two lines), the small-route run kept its own.
+    expect(readFileSync(join(w.project, "src", "a.txt"), "utf8")).toBe("a original\nchanged by npm test\n");
 
     const gates = gateEvents(w);
     expect(decisions(gates)).toEqual([
@@ -169,8 +170,12 @@ describe("gate suite (e2e, faux provider, unattended print mode)", () => {
       // so R28's "fresh path" rule does not fire. Pinned here as the current behaviour.
       { step: bash("git apply p.diff && cat key"), class: "unknown" },
     ];
-    // macOS and Linux runners have /usr/bin/git; Windows has no such path.
+    // Absolute executable paths: /usr/bin/git where it exists (Linux, macOS) and git's resolved path on every platform
+    // (`C:/Program Files/Git/cmd/git.exe` on Windows), single-quoted because it may contain a space.
     if (!isWin && existsSync("/usr/bin/git")) steps.push({ step: bash(`/usr/bin/git push origin main`), hardGate: "remote-mutation" });
+    const absGit = gitExecutable();
+    expect(absGit, "git on PATH").toBeDefined();
+    steps.push({ step: bash(`'${absGit!}' push origin main`), hardGate: "remote-mutation" });
     const r28 = w.symlinks && !isWin;
     if (r28) {
       // R28 (relative-symlink fixture): rel/l is harmless in rel/ and a secret once copied to the project root.
@@ -327,7 +332,7 @@ describe("gate suite (e2e, faux provider, RPC mode with a UI)", () => {
       await rpc.waitFor((r) => r.type === "agent_settled", 90_000);
     } finally {
       const closed = await rpc.close();
-      expect(closed.killed, rpc.stderr()).toBe(false);
+      expect(closed, rpc.stderr()).toEqual({ code: 0, signal: null, killed: false });
     }
 
     const res = results(w);
