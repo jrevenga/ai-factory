@@ -48,6 +48,39 @@ const KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
 const KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
 /** A "line" without a newline is cut here, so a stream that never prints one stays bounded in memory. */
 const MAX_PENDING = 64 * 1024;
+/** M1: how far before the cut a whitespace or the start of a secret may move it. */
+const CUT_WINDOW = 512;
+const globalRules: readonly RegExp[] = RULES.map(([re]) => new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`));
+
+/**
+ * M1: where to cut a newline-free run longer than MAX_PENDING so that no secret straddles the cut: at the last
+ * whitespace within CUT_WINDOW before it, then moved back to the start of any redaction match that spans it.
+ */
+function safeCut(text: string): number {
+  let at = MAX_PENDING;
+  for (let i = MAX_PENDING - 1; i > MAX_PENDING - CUT_WINDOW; i--) {
+    if (/\s/.test(text[i]!)) {
+      at = i;
+      break;
+    }
+  }
+  for (let round = 0; round < 8; round++) {
+    const lo = Math.max(0, at - CUT_WINDOW);
+    const window = text.slice(lo, at + CUT_WINDOW);
+    let moved = false;
+    for (const re of globalRules) {
+      for (const m of window.matchAll(re)) {
+        const start = lo + m.index;
+        if (start > 0 && start < at && start + m[0].length > at) {
+          at = start;
+          moved = true;
+        }
+      }
+    }
+    if (!moved) break;
+  }
+  return at;
+}
 
 /**
  * Line-wise `redact` for streamed command output (Task 10: no secrets in check logs). Complete lines are redacted
@@ -64,9 +97,11 @@ export class LineRedactor {
     for (;;) {
       const nl = this.pending.indexOf("\n");
       if (nl < 0) {
-        if (this.pending.length <= MAX_PENDING) break;
-        out += this.line(this.pending.slice(0, MAX_PENDING));
-        this.pending = this.pending.slice(MAX_PENDING);
+        // Cut only with a full window after the cut point, so a secret still arriving is seen whole.
+        if (this.pending.length < MAX_PENDING + CUT_WINDOW) break;
+        const cut = safeCut(this.pending);
+        out += this.line(this.pending.slice(0, cut));
+        this.pending = this.pending.slice(cut);
         continue;
       }
       out += this.line(this.pending.slice(0, nl + 1));

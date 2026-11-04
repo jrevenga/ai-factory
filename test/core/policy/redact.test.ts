@@ -117,6 +117,29 @@ describe("LineRedactor", () => {
     expect(out).not.toContain("b3BlbnNzaC1rZXktdjEA");
   });
 
+  it("M1: a token straddling the 64 KiB cut of a newline-free line is still redacted", () => {
+    const r = new LineRedactor();
+    const out = r.push(`${"x".repeat(65536 - 10)} ${TOKEN} tail`) + r.end();
+    expect(out).not.toContain(TOKEN.slice(4));
+    expect(out).toContain("*** tail");
+  });
+
+  it("M1: a credential straddling the cut without any whitespace nearby is still redacted", () => {
+    const r = new LineRedactor();
+    const out = r.push(`${"a".repeat(65536 - 6)}://user:hunter2pw@host/x`) + r.end();
+    expect(out).not.toContain("hunter2pw");
+    expect(out).toContain("://***@host/x");
+  });
+
+  it("M1: a secret still arriving at the cut is not split (the cut waits for a full window)", () => {
+    const r = new LineRedactor();
+    let out = r.push(`${"a".repeat(65536 - 3)}://us`);
+    out += r.push("er:pw123456@host end");
+    out += r.end();
+    expect(out).not.toContain("pw123456");
+    expect(out).toContain("://***@host end");
+  });
+
   it("stays bounded on output without newlines", () => {
     const r = new LineRedactor();
     const out = r.push("x".repeat(200 * 1024));
