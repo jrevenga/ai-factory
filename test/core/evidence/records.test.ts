@@ -88,3 +88,13 @@ describe("validateDelivery", () => {
     expect(isKnownDisposition("maybe")).toBe(false);
   });
 });
+
+describe("ReviewDisposition type (M5)", () => {
+  it("types every known field (not an index signature only)", () => {
+    const d: ReviewDisposition = { taskId: "t1", fingerprint: "fp", disposition: "approved", reviewer: "r", findingsSummary: "s", at: "now" };
+    // Each assignment fails to typecheck while the fields are `unknown`.
+    const fields: [string, string, string, string, string] = [d.taskId, d.fingerprint, d.reviewer, d.findingsSummary, d.at];
+    const known: "approved" | "approved_with_rulings" | "escalated" = d.disposition;
+    expect([...fields, known]).toEqual(["t1", "fp", "r", "s", "now", "approved"]);
+  });
+});

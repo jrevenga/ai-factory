@@ -27,9 +27,19 @@ export const ReviewDisposition = z.looseObject({
   findingsSummary: z.string(),
   at: z.string(),
 });
-export type ReviewDisposition = Omit<z.infer<typeof ReviewDisposition>, "disposition"> & {
+/**
+ * A disposition this release knows (M5: an explicit shape; `Omit` over the loose schema type would collapse it to an
+ * index signature). Extra fields of newer releases are kept.
+ */
+export interface ReviewDisposition {
+  taskId: string;
+  fingerprint: string;
   disposition: (typeof REVIEW_DISPOSITIONS)[number];
-};
+  reviewer: string;
+  findingsSummary: string;
+  at: string;
+  [extra: string]: unknown;
+}
 
 /** The persisted `disposition` is an open string (R13); use this guard before narrowing. */
 export function isKnownDisposition(d: string): d is ReviewDisposition["disposition"] {

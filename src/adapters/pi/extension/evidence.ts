@@ -19,7 +19,6 @@ import { Type } from "typebox";
 import { HARD_GATES, SOFT_GATES, type SoftGateId } from "../../../core/config/schema.ts";
 import { declaredNameOf, planCheck, type CheckStep, type DeclaredCommand } from "../../../core/evidence/check-plan.ts";
 import { isKnownDisposition, REVIEW_DISPOSITIONS, type CheckRecord, type ReviewDisposition } from "../../../core/evidence/records.ts";
-import type { RunEvent } from "../../../core/ledger/events.ts";
 import { resolvePiAgentDir } from "../../../core/paths/homes.ts";
 import { autonomyAllowsSkip, type AutonomyLevel } from "../../../core/policy/autonomy.ts";
 import { isSecretPath } from "../../../core/policy/paths.ts";
@@ -150,7 +149,10 @@ export function loadEvidence(ledgerDir: string, runIds?: readonly string[]): { c
     if (!existsSync(ledger.file)) continue;
     for (const e of RunLedger.read(ledger.file)) {
       if (e.type === "check") checks.push(e.record);
-      else if (e.type === "review" && isKnownDisposition(e.disposition.disposition)) dispositions.push(e.disposition as ReviewDisposition);
+      else if (e.type === "review") {
+        const known = e.disposition.disposition;
+        if (isKnownDisposition(known)) dispositions.push({ ...e.disposition, disposition: known });
+      }
     }
   }
   return { checks, dispositions };
@@ -625,7 +627,7 @@ function recordReview(s: EvidenceSession, params: { taskId: string; disposition:
   const root = route.writeRoots[0];
   if (root === undefined) throw new Refusal(`the ${route.route} route has no write root`);
   const fp = fingerprint(root, secretTestFor(root, s));
-  const disposition: Extract<RunEvent, { type: "review" }>["disposition"] = { taskId, fingerprint: fp, disposition: params.disposition, reviewer, findingsSummary, at: now() };
+  const disposition: ReviewDisposition = { taskId, fingerprint: fp, disposition: params.disposition, reviewer, findingsSummary, at: now() };
   try {
     s.ledger.append({ v: 1, ts: now(), runId: s.runId, type: "review", disposition });
   } catch (e) {
