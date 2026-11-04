@@ -672,3 +672,30 @@ describe("evaluateGate: fail closed", () => {
     expect(evaluateGate(write("src/a.ts"), ctx({ ledgerDir: "runs" })).decision).toBe("deny");
   });
 });
+
+describe("evaluateGate: git staging (R37)", () => {
+  const staged = (command: string, facts: PathFacts[]): ToolAction => ({ kind: "command", tool: "bash", command, pathFacts: facts });
+  const file = (input: string, over: Partial<PathFacts> = {}): PathFacts => ({ ...fact(input), exists: true, directory: false, ...over });
+
+  it("git add of an explicit secret path asks `secrets`", () => {
+    expect(evaluateGate(staged("git add .env", [file(".env")]), ctx(UNATTENDED))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("git add of explicit non-secret files is allowed on a change route", () => {
+    expect(evaluateGate(staged("git add src/a.ts", [file("src/a.ts")]), ctx(UNATTENDED))).toMatchObject({ decision: "allow" });
+  });
+
+  it("git add of a directory, or of a path whose kind is unknown, is not allowlisted (unknown asks)", () => {
+    for (const f of [file("src", { directory: true }), file("src", { directory: undefined })]) {
+      const r = evaluateGate(staged("git add src", [f]), ctx(UNATTENDED));
+      expect(r.decision).toBe("ask");
+      expect(r.class).toBe("unknown");
+      expect(r.reason).toContain("can stage secret files");
+    }
+    expect(evaluateGate(staged("git add src", [file("src", { directory: true })]), ctx()).decision).toBe("ask");
+  });
+
+  it("git add of an explicit path without a fact asks `secrets`", () => {
+    expect(evaluateGate(staged("git add notes", []), ctx(UNATTENDED))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+});

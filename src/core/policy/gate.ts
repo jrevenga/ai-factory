@@ -9,7 +9,7 @@ import path from "node:path";
 import type { HardGateId } from "../config/schema.ts";
 import type { RouteState } from "../route/types.ts";
 import type { AutonomyLevel } from "./autonomy.ts";
-import { classifyCommandLine, isPathLikeArg, type CommandClass, type CommandClassification } from "./command.ts";
+import { classifyCommandLine, isPathLikeArg, severity, type CommandClass, type CommandClassification } from "./command.ts";
 import { invisibleCharacter } from "./shell.ts";
 import { classifyPath, isSecretPath, type PathClassification, type PathContext, type PathFacts, type PathPlatform } from "./paths.ts";
 
@@ -261,6 +261,27 @@ function answerRouteDeny(c: CommandClassification, ctx: GateContext): string | u
   return `${summary(c)}: ${reason}`;
 }
 
+/**
+ * R37: a `git add` path that names a directory, or whose kind is unknown, can stage secret files: its segment is
+ * `unknown` (not allowlisted). A path without any fact is left to the missing-input rule (asks `secrets`).
+ */
+function demoteSweepingStages(c: CommandClassification, facts: PathFacts[]): CommandClassification {
+  const unknownClass = (cls: CommandClass): CommandClass => (severity(cls) < severity("unknown") ? "unknown" : cls);
+  let out = c;
+  for (const p of c.segments.flatMap((s) => s.stagePaths ?? [])) {
+    const own = facts.filter((f) => f.input === p);
+    if (own.length === 0 || own.every((f) => f.directory === false)) continue;
+    out = {
+      ...out,
+      class: unknownClass(out.class),
+      allowlisted: false,
+      reasons: [...out.reasons, `git add ${p} names a directory (or a path of unknown kind) and can stage secret files (R37)`],
+      segments: out.segments.map((s) => (s.stagePaths?.includes(p) ? { ...s, class: unknownClass(s.class), allowlisted: false } : s)),
+    };
+  }
+  return out;
+}
+
 function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): GateResult {
   // R33: a command whose text a terminal may not show faithfully is never offered for approval.
   const hidden = invisibleCharacter(action.command);
@@ -270,7 +291,7 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   if (action.tool === "powershell") {
     return result("ask", "PowerShell commands are not classified in Phase 2 (ruling 3)", { class: "unknown" });
   }
-  const c = classifyCommandLine(action.command, { projectCommands: ctx.projectCommands });
+  const c = demoteSweepingStages(classifyCommandLine(action.command, { projectCommands: ctx.projectCommands }), action.pathFacts);
   const base = { class: c.class };
   const noRoots = ctx.route.route === "answer" || ctx.route.needsReclassification;
   const noRootsReason = ctx.route.needsReclassification ? RECLASSIFY : DECLARE;

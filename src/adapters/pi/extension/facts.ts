@@ -169,8 +169,17 @@ function lexists(p: string): boolean {
   }
 }
 
+/** R37: a directory at hook time, following links (a missing or unreadable target is not one). */
+function isDirectoryNow(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function resolvedFact(input: string, resolved: string, platform: PathPlatform): PathFacts {
-  return { input, resolved, platform, exists: lexists(resolved) };
+  return { input, resolved, platform, exists: lexists(resolved), directory: isDirectoryNow(resolved) };
 }
 
 /** Pi's `resolveReadPath` fallbacks for a missing path (macOS screenshot names, NFD, curly quotes). */

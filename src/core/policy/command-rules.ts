@@ -140,6 +140,12 @@ export const GIT_CONFIG_READ_MODIFIERS: ReadonlySet<string> = new Set([
   "--path",
 ]);
 export const GIT_PUSH_FORCE: readonly string[] = ["--force", "--force-with-lease", "--force-if-includes"];
+/** R37: the only `git add` options allowed with explicit paths (exact spellings; anything else is `unknown`). */
+export const GIT_ADD_SHORT = "vnNf";
+export const GIT_ADD_LONG: readonly string[] = ["--verbose", "--dry-run", "--intent-to-add", "--force"];
+/** R37: `git stash push` options that store untracked (or ignored) files. */
+export const GIT_STASH_UNTRACKED_SHORT = "ua";
+export const GIT_STASH_UNTRACKED_LONG: readonly string[] = ["--include-untracked", "--all"];
 
 // --- package managers and runners (ruling 18) ---
 
@@ -196,6 +202,14 @@ export interface OptionSpec {
   longBool: readonly string[];
   longValue: readonly string[];
 }
+
+/** R37: `git commit` options allowed (no `-a`/`--all`, `-i`/`-o`, `-F`, `-C`/`-c`, `--fixup`, ...). */
+export const GIT_COMMIT_SPEC: OptionSpec = {
+  shortBool: "qvsn",
+  shortValue: "m",
+  longBool: ["--quiet", "--verbose", "--signoff", "--no-verify", "--allow-empty", "--allow-empty-message", "--no-edit"],
+  longValue: ["--message", "--author", "--date"],
+};
 
 export const MKDIR_SPEC: OptionSpec = { shortBool: "pv", shortValue: "m", longBool: ["--parents", "--verbose"], longValue: ["--mode"] };
 export const TOUCH_SPEC: OptionSpec = { shortBool: "acm", shortValue: "", longBool: ["--no-create"], longValue: [] };

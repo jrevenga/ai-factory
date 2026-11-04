@@ -16,6 +16,11 @@ export interface PathFacts {
    * as not existing where it matters (a later segment of a command may use a path an earlier one creates).
    */
   exists?: boolean;
+  /**
+   * R37: whether the target is a directory (following symbolic links) at hook time. Undefined means unknown; a
+   * `git add` path counts as an explicit file only when this is `false`.
+   */
+  directory?: boolean;
 }
 
 export interface PathContext {

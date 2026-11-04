@@ -61,7 +61,7 @@ describe("pathFacts (tool paths, Pi resolveToCwd semantics)", () => {
     mkdirSync(outside);
     linkDir(outside, join(root, "link"));
     const f = pathFacts("link/new dir/file.txt", root, t);
-    expect(f).toEqual({ input: "link/new dir/file.txt", resolved: join(outside, "new dir", "file.txt"), platform: host, exists: false });
+    expect(f).toEqual({ input: "link/new dir/file.txt", resolved: join(outside, "new dir", "file.txt"), platform: host, exists: false, directory: false });
   });
 
   it.skipIf(isWin)("a dangling symlink resolves to its (missing) target, not to the link", async () => {
@@ -175,6 +175,18 @@ describe("resolveToolPath (lexical, both platforms)", () => {
 });
 
 describe("command path facts (bash semantics)", () => {
+  it("R37: report whether the target is a directory (following links); a missing target is not one", async () => {
+    const t = await tmp();
+    const root = join(t, "root");
+    mkdirSync(join(root, "src"), { recursive: true });
+    writeFileSync(join(root, "a.ts"), "1\n");
+    linkDir(join(root, "src"), join(root, "link"));
+    expect(commandPathFacts("src", root, t)[0]!.directory).toBe(true);
+    expect(commandPathFacts("link", root, t)[0]!.directory).toBe(true);
+    expect(commandPathFacts("a.ts", root, t)[0]!.directory).toBe(false);
+    expect(commandPathFacts("missing.ts", root, t)[0]!.directory).toBe(false);
+  });
+
   it("resolve .. physically: a symlink followed by .. leaves the root", async () => {
     const t = await tmp();
     const root = join(t, "root");
@@ -182,7 +194,7 @@ describe("command path facts (bash semantics)", () => {
     mkdirSync(root);
     linkDir(join(t, "outside", "deep"), join(root, "link"));
     expect(commandPathFacts("link/../x.txt", root, t)).toEqual([
-      { input: "link/../x.txt", resolved: join(t, "outside", "x.txt"), platform: host, exists: false },
+      { input: "link/../x.txt", resolved: join(t, "outside", "x.txt"), platform: host, exists: false, directory: false },
     ]);
   });
 

@@ -3,6 +3,7 @@
 // Each segment from `tokenizeCommandLine` is classified on its own; the line's reported class is the most
 // severe segment class, `hardClass` the most severe hard class, and `allowlisted` requires every segment to be
 // read-only or allowlisted. Anything not recognized by the rule tables is `unknown`.
+import path from "node:path";
 import * as R from "./command-rules.ts";
 import { tokenizeCommandLine, type Segment } from "./shell.ts";
 
@@ -43,6 +44,11 @@ export interface SegmentClassification {
   pathArgs: string[];
   inputPaths: string[];
   readArgs: string[];
+  /**
+   * R37: the explicit paths `git add` stages (also in `inputPaths`). The gate requires each to be a known
+   * non-directory: staging a directory can sweep secret files into git objects.
+   */
+  stagePaths?: string[];
 }
 
 export interface CommandClassification {
@@ -69,6 +75,8 @@ interface Verdict {
   pathArgs: string[];
   /** Paths read without being file arguments (`git -C` of read-only git); reported in `inputPaths`. */
   readPaths?: string[];
+  /** R37: explicit `git add` paths (see SegmentClassification.stagePaths). */
+  stagePaths?: string[];
 }
 
 const readOnly = (reason: string): Verdict => ({ class: "read-only", allowlisted: true, reasons: [reason], pathArgs: [] });
@@ -264,6 +272,9 @@ function classifyGit(args: readonly string[]): Verdict {
   const sub = args[i];
   if (sub === undefined) return unknown("git without a subcommand");
   const v = classifyGitSubcommand(sub, args.slice(i + 1));
+  if (dirs.length > 0 && v.stagePaths !== undefined) {
+    return unknown("git -C with git add: the staged paths resolve against another directory and cannot be checked (R37)", dirs);
+  }
   if (dirs.length > 0) {
     if (v.class === "read-only") v.readPaths = [...dirs, ...(v.readPaths ?? [])];
     else v.pathArgs = [...dirs, ...v.pathArgs];
@@ -320,9 +331,9 @@ function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
       return ok ? readOnly("git remote listing is read-only") : unknown("git remote that changes configuration");
     }
     case "add":
-      return localWrite("git add is allowlisted");
+      return classifyGitAdd(rest);
     case "commit":
-      return hasLong(rest, ["--amend"]) ? destructive("git commit --amend rewrites history") : localWrite("git commit is allowlisted");
+      return classifyGitCommit(rest);
     case "switch": {
       if (hasShort(rest, "f") || hasLong(rest, ["--discard-changes", "--force"])) return destructive("git switch discarding changes");
       const create = (rest[0] === "-c" || rest[0] === "--create") && (rest.length === 2 || rest.length === 3);
@@ -336,7 +347,13 @@ function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
     }
     case "stash": {
       if (rest[0] === "list") return readOnly("git stash list is read-only");
-      if (rest[0] === "push") return localWrite("git stash push is allowlisted");
+      if (rest[0] === "push") {
+        const opts = rest.slice(1);
+        if (hasShort(opts, R.GIT_STASH_UNTRACKED_SHORT) || hasLong(opts, R.GIT_STASH_UNTRACKED_LONG)) {
+          return unknown("git stash with untracked or ignored files stores them in git objects, secret files included (R37)");
+        }
+        return localWrite("git stash push is allowlisted");
+      }
       if (rest[0] === "drop" || rest[0] === "clear") return destructive(`git stash ${rest[0]} discards stashed work`);
       return unknown("git stash other than push/list");
     }
@@ -365,6 +382,47 @@ function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
     default:
       return unknown(`git ${sub} is not in the rule tables`);
   }
+}
+
+/** A pathspec that names the whole tree or a parent of it once normalized (`.`, `./`, `src/..`, `..`). */
+function isTreePath(p: string): boolean {
+  const n = path.posix.normalize(p.replaceAll("\\", "/"));
+  return n === "." || n === "./" || n === ".." || n.startsWith("../") || n === "/";
+}
+
+/**
+ * R37: `git add` is allowlisted only for explicit paths with listed options. Everything that can stage beyond the
+ * named files (`-A`, `-u`, `.`, a directory, no pathspec, pathspec magic or globs, any other option) is `unknown`.
+ * The named paths are input paths, so the gate secret-checks each and asks `secrets` for a secret one.
+ */
+function classifyGitAdd(rest: readonly string[]): Verdict {
+  const paths: string[] = [];
+  let end = false;
+  for (const a of rest) {
+    if (!end && a === "--") {
+      end = true;
+    } else if (!end && a.startsWith("-") && a !== "-") {
+      const ok = a.startsWith("--") ? R.GIT_ADD_LONG.includes(a) : [...a.slice(1)].every((c) => R.GIT_ADD_SHORT.includes(c));
+      if (!ok) return unknown(`git add ${a} may stage files beyond the named ones, secret files included (R37)`);
+    } else {
+      paths.push(a);
+    }
+  }
+  if (paths.length === 0) return unknown("git add without an explicit path (R37)");
+  const sweeping = paths.find((p) => p.startsWith(":") || /[*?[\]]/.test(p) || /[\\/]$/.test(p) || isTreePath(p));
+  if (sweeping !== undefined) {
+    return unknown(`git add ${sweeping} names a directory, the whole tree or uses pathspec magic, and can stage secret files (R37)`);
+  }
+  return { ...localWrite("git add of explicit files is allowlisted"), readPaths: [...paths], stagePaths: [...paths] };
+}
+
+/** R37: `git commit` is allowlisted without `-a`/`--all`, without pathspecs and with listed options only. */
+function classifyGitCommit(rest: readonly string[]): Verdict {
+  if (hasLong(rest, ["--amend"])) return destructive("git commit --amend rewrites history");
+  const parsed = parseWithSpec(rest, R.GIT_COMMIT_SPEC);
+  if (!parsed.ok) return unknown(`git commit ${parsed.option} may stage or read files (R37)`);
+  if (parsed.positionals.length > 0) return unknown("git commit with pathspecs stages those paths, secret files included (R37)");
+  return localWrite("git commit is allowlisted");
 }
 
 function classifyBin(bin: string, rest: readonly string[]): Verdict {
@@ -681,7 +739,7 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
     if (r.op !== "<") cls = maxClass(cls, "local-write");
   }
   const allowlisted = v.allowlisted && (cls === "read-only" || cls === "local-write");
-  return { class: cls, allowlisted, reasons, pathArgs, inputPaths };
+  return { class: cls, allowlisted, reasons, pathArgs, inputPaths, ...(v.stagePaths !== undefined ? { stagePaths: v.stagePaths } : {}) };
 }
 
 /**
@@ -755,6 +813,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
       pathArgs: [...v.pathArgs],
       inputPaths: [...v.inputPaths],
       readArgs: segReadArgs,
+      ...(v.stagePaths !== undefined && v.stagePaths.length > 0 ? { stagePaths: [...v.stagePaths] } : {}),
     });
     cls = maxClass(cls, v.class);
     if (isHard(v.class) && (hard === undefined || severity(v.class) > severity(hard))) hard = v.class;

@@ -416,3 +416,66 @@ describe("classifyCommandLine: recursive copies that follow links (R32)", () => 
     expect(classify("cp -L link out").class).toBe("local-write");
   });
 });
+
+describe("classifyCommandLine: staging that can sweep secrets (R37)", () => {
+  it("git add with -A/--all/-u/--update, `.`, a trailing-slash directory, no pathspec, pathspec magic or an unlisted option is unknown", () => {
+    for (const cmd of [
+      "git add -A",
+      "git add --all",
+      "git add -u",
+      "git add --update",
+      "git add -Av a.ts",
+      "git add .",
+      "git add ./",
+      "git add -- .",
+      "git add src/",
+      "git add ..",
+      "git add",
+      "git add -v",
+      "git add ':(glob)src'",
+      "git add :/",
+      "git add --renormalize a.ts",
+      "git add --no-ignore-removal a.ts",
+      "git add -e a.ts",
+    ]) {
+      const c = classify(cmd);
+      expect(c.class, cmd).toBe("unknown");
+      expect(c.allowlisted, cmd).toBe(false);
+    }
+  });
+
+  it("git add of explicit file paths stays an allowlisted local write and reports every path as an input path", () => {
+    for (const [cmd, paths] of [
+      ["git add a.ts", ["a.ts"]],
+      ["git add -v src/a.ts b.md", ["src/a.ts", "b.md"]],
+      ["git add -- -odd.ts", ["-odd.ts"]],
+      ["git add -N new.ts", ["new.ts"]],
+      ["git add .env", [".env"]],
+    ] as const) {
+      const c = classify(cmd);
+      expect(c.class, cmd).toBe("local-write");
+      expect(c.allowlisted, cmd).toBe(true);
+      expect(c.inputPaths, cmd).toEqual(paths);
+      expect(c.segments[0]!.stagePaths, cmd).toEqual(paths);
+    }
+  });
+
+  it("git commit with -a/--all, with pathspecs or with an unlisted option is unknown; a plain commit stays allowlisted", () => {
+    for (const cmd of ["git commit -a -m x", "git commit -am x", "git commit --all -m x", "git commit -m x a.ts", "git commit -m x -- a.ts", "git commit -F msg.txt", "git commit -m x -i a.ts"]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+    for (const cmd of ['git commit -m "feat: x"', "git commit -q -m x", "git commit --allow-empty -m x --no-verify", "git commit -qm x", "git commit --message=x -s"]) {
+      const c = classify(cmd);
+      expect(c.class, cmd).toBe("local-write");
+      expect(c.allowlisted, cmd).toBe(true);
+    }
+    expect(classify("git commit --amend -m x").class).toBe("destructive");
+  });
+
+  it("git stash with -u/--include-untracked/-a/--all is unknown; git stash push -m stays allowlisted", () => {
+    for (const cmd of ["git stash push -u", "git stash push --include-untracked", "git stash push -a", "git stash push --all", "git stash push -um wip"]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+    expect(classify("git stash push -m wip")).toMatchObject({ class: "local-write", allowlisted: true });
+  });
+});
