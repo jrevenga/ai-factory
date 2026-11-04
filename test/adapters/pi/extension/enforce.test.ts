@@ -491,6 +491,53 @@ describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
     expect(w.inFlight.size).toBe(0);
   });
 
+  it("R31 (R2-1): a call is reserved while its approval dialog is open; a sibling arriving meanwhile is denied", async () => {
+    const w = await world();
+    let release: (ok: boolean) => void = () => {};
+    const answers: Array<boolean | Promise<boolean>> = [true, new Promise<boolean>((res) => (release = res))];
+    const ui: GateUi = { confirm: () => Promise.resolve(answers.shift() ?? false) };
+    const d = () => w.deps(w.feature, { mode: "interactive" }, ui);
+    const parent = call("codemode", { code: "..." });
+    expect(await enforce(parent, { cwd: w.root }, d())).toBeUndefined();
+    const nested = (n: number, command: string) =>
+      call("bash", { command }, { toolCallId: `${parent.toolCallId}/${n}`, parentToolCallId: parent.toolCallId });
+
+    const a = nested(1, "git push");
+    const pendingA = enforce(a, { cwd: w.root }, d());
+    await new Promise((res) => setImmediate(res));
+    // A's dialog is open: the sibling must not slip past the conflict check.
+    const b = await enforce(nested(2, "ls"), { cwd: w.root }, d());
+    expect(b?.block).toBe(true);
+    expect(b?.reason).toContain("re-issue");
+    release(true);
+    expect(await pendingA).toBeUndefined();
+    expect(w.inFlight.has(a.toolCallId)).toBe(true);
+  });
+
+  it("R31 (R2-1): every deny after a reservation releases it (rejected, no UI, too long, ledger failure)", async () => {
+    const w = await world();
+    const rejected = await enforce(call("bash", { command: "git push" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, confirmer(false).ui));
+    expect(rejected?.block).toBe(true);
+    const noUi = await enforce(call("bash", { command: "git push" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }));
+    expect(noUi?.block).toBe(true);
+    const long = await enforce(call("bash", { command: `ls ${"README.md ".repeat(450)}&& git push` }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, confirmer(true).ui));
+    expect(long?.block).toBe(true);
+    const failing: EnforceDeps = { ...w.deps(w.feature), ledger: { append: () => { throw new Error("ENOSPC"); } } };
+    expect((await enforce(call("bash", { command: "ls" }), { cwd: w.root }, failing))?.block).toBe(true);
+    expect(w.inFlight.size).toBe(0);
+  });
+
+  it("R30: the 4000-character cap applies to the escaped text shown", async () => {
+    const w = await world();
+    const { ui, calls } = confirmer(true);
+    const outside = join(w.dir, "o.txt");
+    // 900 invisible characters become 900 `\u{200b}` escapes (8 characters each): over the cap once shown.
+    const r = await enforce(call("write", { path: outside, content: "\u200b".repeat(900) }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, ui));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("too long to approve safely");
+    expect(calls).toHaveLength(0);
+  });
+
   it("R32: a recursive copy that follows links is not allowed silently (it would copy secrets into the project)", async () => {
     const w = await symlinkWorld();
     const { ui, calls } = confirmer(false);

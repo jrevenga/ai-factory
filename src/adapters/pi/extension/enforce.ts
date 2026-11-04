@@ -455,11 +455,12 @@ export function visible(text: string): { text: string; escaped: boolean } {
 async function resolveAsk(r: GateResult, tool: string, display: string, ui: GateUi | undefined): Promise<Outcome> {
   const label = r.hardGate ?? r.class ?? "unclassified";
   if (ui === undefined) return deny(`requires human approval (${label}): ${r.reason}`);
-  // R30: the owner approves exactly what runs: the full, unredacted text with its newlines, or nothing.
-  if (display.length > MAX_APPROVAL_CHARS) {
-    return deny(`too long to approve safely (${display.length} > ${MAX_APPROVAL_CHARS} characters; ${label}): ${r.reason}`);
-  }
+  // R30: the owner approves exactly what runs: the full, unredacted text with its newlines, or nothing. The cap
+  // applies to the text as shown (after escaping).
   const shown = visible(display);
+  if (shown.text.length > MAX_APPROVAL_CHARS) {
+    return deny(`too long to approve safely (${shown.text.length} > ${MAX_APPROVAL_CHARS} characters; ${label}): ${r.reason}`);
+  }
   const message = [
     `Tool: ${tool}`,
     `Reason: ${r.reason}`,
@@ -519,12 +520,25 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
     prepared = undefined;
   }
 
-  const outcome: Outcome =
-    r.decision === "ask"
-      ? await resolveAsk(r, ev.toolName, prepared?.display ?? ev.toolName, deps.ui)
-      : r.decision === "allow"
-        ? { decision: "allow", reason: r.reason }
-        : deny(r.reason);
+  // R31 (R2-1): reserve the slot before any dialog, so a sibling call arriving while the owner decides is denied.
+  const reserved = r.decision !== "deny" && prepared !== undefined;
+  if (reserved) deps.inFlight.add(ev.toolCallId, group, mutating);
+  const block = (reason: string): BlockResult => {
+    if (reserved) deps.inFlight.done(ev.toolCallId);
+    return { block: true, reason };
+  };
+
+  let outcome: Outcome;
+  try {
+    outcome =
+      r.decision === "ask"
+        ? await resolveAsk(r, ev.toolName, prepared?.display ?? ev.toolName, deps.ui)
+        : r.decision === "allow"
+          ? { decision: "allow", reason: r.reason }
+          : deny(r.reason);
+  } catch (e) {
+    outcome = deny(`approval failed (fail closed): ${(e as Error).message}`);
+  }
 
   try {
     deps.ledger.append({
@@ -542,12 +556,11 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
       summary,
     });
   } catch (e) {
-    return { block: true, reason: `${BLOCK_PREFIX}: the audit ledger could not be written (fail closed): ${(e as Error).message}` };
+    return block(`${BLOCK_PREFIX}: the audit ledger could not be written (fail closed): ${(e as Error).message}`);
   }
 
-  if (outcome.block !== undefined || prepared === undefined) return { block: true, reason: outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}` };
+  if (outcome.block !== undefined || prepared === undefined) return block(outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}`);
   // Task 11: when the gate returns `reconcile: true`, take the snapshot here instead of the R29 deny above.
-  deps.inFlight.add(ev.toolCallId, group, mutating);
   if (prepared.machine !== undefined) deps.postChecks.remember(ev.toolCallId, prepared.machine);
   return undefined;
 }
