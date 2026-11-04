@@ -23,6 +23,8 @@ const MAX_SYMLINK_HOPS = 40;
 const GIT_TIMEOUT_MS = 10_000;
 /** Inherited location variables would point git at another repository than the cwd's. */
 const GIT_LOCATION_VARS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE"];
+/** Inherited pathspec modes would change how factory pathspecs (`:(literal)…`, `:(exclude,literal)…`) are read. */
+const GIT_PATHSPEC_VARS = ["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"];
 
 export function hostPlatform(): PathPlatform {
   return process.platform === "win32" ? "win32" : "posix";
@@ -264,7 +266,10 @@ export function canonicalDir(p: string): string {
 /** The process env for git: no prompts, and no inherited location variables. */
 function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
-  for (const k of Object.keys(env)) if (GIT_LOCATION_VARS.includes(k.toUpperCase())) delete env[k];
+  for (const k of Object.keys(env)) {
+    const u = k.toUpperCase();
+    if (GIT_LOCATION_VARS.includes(u) || GIT_PATHSPEC_VARS.includes(u)) delete env[k];
+  }
   return env;
 }
 

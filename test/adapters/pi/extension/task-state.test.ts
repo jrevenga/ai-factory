@@ -1,10 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { MachinePostChecks, setRoute } from "../../../../src/adapters/pi/extension/enforce.ts";
 import { ROUTE_ENTRY } from "../../../../src/adapters/pi/extension/route-state.ts";
-import { registerTaskState, TASK_PROGRESS_TOOL, type TaskSession } from "../../../../src/adapters/pi/extension/task-state.ts";
+import { commitCheckpoint, registerTaskState, TASK_PROGRESS_TOOL, type TaskSession } from "../../../../src/adapters/pi/extension/task-state.ts";
 import { RunEvent } from "../../../../src/core/ledger/events.ts";
 import { INITIAL_ROUTE } from "../../../../src/core/route/route.ts";
 import type { RouteState } from "../../../../src/core/route/types.ts";
@@ -338,6 +338,82 @@ describe("task_progress on feature/project routes", () => {
     // The secret files stay as they are in the working tree.
     expect(readFileSync(join(x.wt, ".env"), "utf8")).toBe("TOKEN=supersecret-env\n");
     expect(git(x.wt, "status", "--porcelain")).toContain("?? .env");
+  });
+
+  const blobOf = (cwd: string, text: string) => execFileSync("git", ["hash-object", "--stdin"], { cwd, input: text, encoding: "utf8", env: GIT_ENV }).trim();
+  const hasObject = (cwd: string, sha: string) => {
+    try {
+      execFileSync("git", ["cat-file", "-e", sha], { cwd, env: GIT_ENV, stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it("R2-1: a tracked file replaced by a directory holding a secret does not let the secret in through the deletion", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    writeFileSync(join(x.wt, "conf"), "plain\n");
+    git(x.wt, "add", "-A");
+    git(x.wt, "commit", "-q", "-m", "tracked conf");
+    rmSync(join(x.wt, "conf"));
+    mkdirSync(join(x.wt, "conf"));
+    writeFileSync(join(x.wt, "conf", ".env"), "TOKEN=dir-secret-1\n");
+    writeFileSync(join(x.wt, "conf", "ok.ts"), "export {};\n");
+    const r = await x.progress({ checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(git(x.wt, "show", "--name-status", "--format=", "HEAD").split("\n").sort()).toEqual(["A\tconf/ok.ts", "D\tconf"]);
+    expect(hasObject(x.wt, blobOf(x.wt, "TOKEN=dir-secret-1\n"))).toBe(false);
+    const cp = x.events.find((e) => e.type === "checkpoint") as { excluded?: string[] } | undefined;
+    expect(cp?.excluded).toEqual(["conf/.env"]);
+    expect(git(x.wt, "status", "--porcelain")).toContain("?? conf/.env");
+  });
+
+  it.skipIf(isWin)("R2-1: a tracked symlink replaced by a directory holding a secret keeps the secret out", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    symlinkSync("elsewhere", join(x.wt, "certs"));
+    git(x.wt, "add", "-A");
+    git(x.wt, "commit", "-q", "-m", "tracked link");
+    rmSync(join(x.wt, "certs"));
+    mkdirSync(join(x.wt, "certs"));
+    writeFileSync(join(x.wt, "certs", "key.pem"), "-----BEGIN PRIVATE KEY-----\ndir-secret-2\n");
+    const r = await x.progress({ checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(git(x.wt, "show", "--name-status", "--format=", "HEAD")).toBe("D\tcerts");
+    expect(hasObject(x.wt, blobOf(x.wt, "-----BEGIN PRIVATE KEY-----\ndir-secret-2\n"))).toBe(false);
+    expect(r.content[0]?.text).toContain("certs/key.pem");
+  });
+
+  it("R2-1 backstop: a staged secret path found before the commit resets the index and refuses the checkpoint", async () => {
+    const x = await wired();
+    writeFileSync(join(x.wt, "app.ts"), "export {};\n");
+    writeFileSync(join(x.wt, "creds.txt"), "x\n");
+    // A classifier that misses creds.txt while staging but reports it afterwards stands in for any staging gap.
+    const seen = new Map<string, number>();
+    const isSecret = (p: string) => {
+      const n = (seen.get(p) ?? 0) + 1;
+      seen.set(p, n);
+      return p === "creds.txt" && n > 1;
+    };
+    expect(() => commitCheckpoint(x.wt, "factory checkpoint: t1", undefined, isSecret)).toThrow(/creds\.txt/);
+    expect(git(x.wt, "diff", "--cached", "--name-only")).toBe("");
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
+  });
+
+  it("R2-2: a task file with more than one hard link is refused and the other link is not copied", async () => {
+    const x = await wired({ taskText: null });
+    setRoute(x.feature);
+    const outside = join(x.dir, "outside.txt");
+    writeFileSync(outside, "AWS_SECRET=abc\n");
+    mkdirSync(join(x.wt, ".factory", "knowledge", "tasks"), { recursive: true });
+    linkSync(outside, x.taskFile);
+    const r = await x.progress({ phase: "plan", checkpoint: true });
+    expect(r.isError).toBe(true);
+    expect(r.content[0]?.text).toMatch(/hard link/);
+    expect(readFileSync(outside, "utf8")).toBe("AWS_SECRET=abc\n");
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
+    expect(x.events).toEqual([]);
   });
 
   it("R34: an already staged secret file is unstaged, and a checkpoint with only secret changes commits nothing", async () => {

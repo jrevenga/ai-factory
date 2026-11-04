@@ -129,13 +129,19 @@ const head = (git: Git, cwd: string): string => {
 /** True for a worktree-relative path the gate treats as a secret (R34: never stored in git objects). */
 export type SecretTest = (relative: string) => boolean;
 
-/** Pathspecs for `--pathspec-from-file=- --pathspec-file-nul` under `--literal-pathspecs`. */
+/** Pathspecs read NUL-separated from stdin. */
 const PATHSPECS = ["--pathspec-from-file=-", "--pathspec-file-nul"];
+const nulList = (specs: readonly string[]) => `${specs.join("\0")}\0`;
 
 /**
  * Ruling 10 as amended by R34, feature/project: stage every changed path of the task worktree except secret paths
  * (enumerated with `git status`, so no secret blob is ever written), unstage secret paths someone else staged,
  * and commit; HEAD when nothing remains. A failed commit resets the index to HEAD (the working tree is unchanged).
+ *
+ * R2-1: a kept path can be a directory prefix of an excluded one (a tracked file or symlink `x` replaced by a
+ * directory holding `x/.env`): `add` matches pathspecs against directories too, so every excluded path is also
+ * passed as `:(exclude,literal)`. Backstop: the staged paths are checked again before the commit; a secret among
+ * them resets the index and refuses the checkpoint.
  */
 export function commitCheckpoint(worktree: string, subject: string, message: string | undefined, isSecret: SecretTest): Checkpoint {
   return withSafeGit((git) => {
@@ -155,16 +161,25 @@ export function commitCheckpoint(worktree: string, subject: string, message: str
       if (entry[0] !== " " && entry[0] !== "?") stagedSecrets.push(p);
     }
     if (stagedSecrets.length > 0) {
-      const reset = git(worktree, ["--literal-pathspecs", "reset", "-q", ...PATHSPECS], `${stagedSecrets.join("\0")}\0`);
+      const reset = git(worktree, ["reset", "-q", ...PATHSPECS], nulList(stagedSecrets.map((p) => `:(literal)${p}`)));
       if (reset.status !== 0) throw gitError("git reset of staged secret files", reset);
     }
     if (keep.length > 0) {
-      const add = git(worktree, ["--literal-pathspecs", "add", "-A", ...PATHSPECS], `${keep.join("\0")}\0`);
+      const specs = [...keep.map((p) => `:(literal)${p}`), ...excluded.map((p) => `:(exclude,literal)${p}`)];
+      const add = git(worktree, ["add", "-A", ...PATHSPECS], nulList(specs));
       if (add.status !== 0) throw gitError("git add", add);
     }
-    const staged = git(worktree, ["diff", "--cached", "--quiet"]);
-    if (staged.status !== 0 && staged.status !== 1) throw gitError("git diff --cached", staged);
-    if (staged.status === 0) return { sha: head(git, worktree), kind: "commit", changed: false, excluded };
+    const listed = git(worktree, ["diff", "--cached", "--name-only", "-z", "--no-renames"]);
+    if (listed.status !== 0) throw gitError("git diff --cached", listed);
+    const stagedPaths = listed.stdout.split("\0").filter((p) => p !== "");
+    const leaked = stagedPaths.filter((p) => isSecret(p));
+    if (leaked.length > 0) {
+      const reset = git(worktree, ["reset", "-q"]);
+      throw new Refusal(
+        `secret paths were staged for the checkpoint and nothing was committed (R34): ${leaked.join(", ")}; ${reset.status === 0 ? "the index was reset to HEAD" : "resetting the index also failed: check `git status` in the worktree"}`,
+      );
+    }
+    if (stagedPaths.length === 0) return { sha: head(git, worktree), kind: "commit", changed: false, excluded };
     const body = message !== undefined && message.trim() !== "" ? ["-m", message.trim()] : [];
     const commit = git(worktree, ["commit", "--no-verify", "-q", "-m", subject, ...body]);
     if (commit.status !== 0) {
@@ -250,6 +265,8 @@ function verifiedTaskFile(worktree: string, taskId: string): TaskFile {
     throw new Refusal(`the task file ${rel} cannot be read: ${(e as Error).message}`);
   }
   if (!st.isFile()) throw new Refusal(`the task file ${rel} must be a regular file (found a symbolic link or another file type)`);
+  // R2-2: another hard link to the same file may live outside the worktree (its content would be copied in and committed).
+  if (st.nlink > 1) throw new Refusal(`the task file ${rel} has ${st.nlink} hard links; it must be a file of its own (remove the other links)`);
   return { dir: real, file, rel };
 }
 
