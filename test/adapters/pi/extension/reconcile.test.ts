@@ -171,7 +171,8 @@ describe("takeSnapshot / reconcileAfter (Task 11)", () => {
     // The directory's content and the link itself (as a link) are kept.
     expect(read(join(bd, "after", "src", "a.txt", "inner.txt"))).toBe("inside the directory\n");
     expect(lstatSync(join(bd, "after", "c.txt")).isSymbolicLink()).toBe(true);
-    expect(readlinkSync(join(bd, "after", "c.txt"))).toBe("src/b.txt");
+    // Windows reports a link target with its native separator, whatever the creator wrote.
+    expect(readlinkSync(join(bd, "after", "c.txt")).replaceAll("\\", "/")).toBe("src/b.txt");
     expect(read(join(r.root, "src", "b.txt"))).toBe("b original\n");
     expect(git(r.root, "status", "--porcelain")).toBe("");
     expect(repoState(r.root)).toEqual(before);

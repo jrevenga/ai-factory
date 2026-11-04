@@ -72,7 +72,8 @@ async function makeWorld(trackSecret: boolean): Promise<World> {
   return { tmp, home, project, outside, ledger };
 }
 
-const quote = (p: string) => `'${p}'`;
+// Forward slashes only: the command lexer rejects a backslash (fail closed), and Windows accepts `/` in paths.
+const quote = (p: string) => `'${p.replaceAll("\\", "/")}'`;
 
 /** Maps the review's absolute paths into the fixture (single-quoted: the temporary directory contains a space). */
 function localize(cmd: string, w: World): string {
