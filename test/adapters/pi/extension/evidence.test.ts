@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { currentRoute as currentRouteForTest, enforce, GatedChecks, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "../../../../src/adapters/pi/extension/enforce.ts";
 import {
+  CheckOutput,
   fingerprint,
   loadEvidence,
   RECORD_DECISION_TOOL,
@@ -535,6 +536,26 @@ describe("run_check", () => {
     expect(note).toContain("machine-owned section");
     expect(readFileSync(x.taskFile, "utf8")).toContain(MACHINE_OPEN);
     expect(readFileSync(x.taskFile, "utf8")).toContain(MACHINE_CLOSE);
+  });
+});
+
+describe("check log cap (M7)", () => {
+  it("once the cap is hit nothing but the final truncation note is written (no gaps)", async () => {
+    const t = await makeTmp("evidence-log");
+    cleanups.push(t.cleanup);
+    const file = join(t.dir, "x.log");
+    const out = new CheckOutput(openSync(file, "wx"), 100);
+    out.data("stdout", Buffer.from("first line\n"));
+    out.data("stdout", Buffer.from(`${"y".repeat(120)}\n`));
+    out.data("stdout", Buffer.from("small\n"));
+    out.note("a note");
+    out.close();
+    const log = readFileSync(file, "utf8");
+    expect(log).toContain("first line\n");
+    expect(log).not.toContain("yyyy");
+    expect(log).not.toContain("small");
+    expect(log).not.toContain("a note");
+    expect(log.trimEnd().split("\n").at(-1)).toMatch(/^\[run_check\] log truncated at 100 bytes: \d+ further bytes of output were not written$/);
   });
 });
 

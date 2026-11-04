@@ -165,16 +165,21 @@ export function loadEvidence(ledgerDir: string, runIds?: readonly string[]): { c
 
 // --- Output: redacted log + bounded tail -----------------------------------------------------------------------
 
-class CheckOutput {
+/** The check log (redacted, capped) and the in-memory tail for the result. Exported for tests. */
+export class CheckOutput {
   private readonly redactors = { stdout: new LineRedactor(), stderr: new LineRedactor() };
   private readonly decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
   private tail = "";
   private written = 0;
   private dropped = 0;
+  /** M7: set when the cap is first hit; from then on only the final truncation note is written. */
+  private capped = false;
   private readonly fd: number;
+  private readonly maxBytes: number;
 
-  constructor(fd: number) {
+  constructor(fd: number, maxBytes = LOG_MAX_BYTES) {
     this.fd = fd;
+    this.maxBytes = maxBytes;
   }
 
   data(stream: "stdout" | "stderr", chunk: Buffer): void {
@@ -205,7 +210,7 @@ class CheckOutput {
   }
 
   close(): void {
-    if (this.dropped > 0) this.writeRaw(`[run_check] log truncated: ${this.dropped} further bytes of output were not written\n`);
+    if (this.capped) this.writeRaw(`[run_check] log truncated at ${this.maxBytes} bytes: ${this.dropped} further bytes of output were not written\n`);
     closeSync(this.fd);
   }
 
@@ -218,7 +223,8 @@ class CheckOutput {
 
   private write(text: string): void {
     const buf = Buffer.from(text, "utf8");
-    if (this.written + buf.length > LOG_MAX_BYTES) {
+    if (this.capped || this.written + buf.length > this.maxBytes) {
+      this.capped = true;
       this.dropped += buf.length;
       return;
     }
