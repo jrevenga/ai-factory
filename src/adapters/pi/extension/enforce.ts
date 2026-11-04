@@ -21,7 +21,8 @@ const BLOCK_PREFIX = "Blocked by the factory gate";
 const READ_TOOLS: ReadonlySet<string> = new Set(["read", "grep", "find", "ls"]);
 /** grep, find and ls search Pi's cwd when no path is given (dist/core/tools/*.js). */
 const DEFAULT_CWD_TOOLS: ReadonlySet<string> = new Set(["grep", "find", "ls"]);
-const FACTORY_TOOLS: ReadonlySet<string> = new Set(["set_route", "task_progress", "run_check", "record_decision", "record_review"]);
+/** R30: a command the owner cannot read in full is not offered for approval. */
+export const MAX_APPROVAL_CHARS = 4000;
 const TASK_FILE_DIRS = [".factory", "knowledge", "tasks"];
 
 // --- Route state ---------------------------------------------------------------------------------------------
@@ -51,6 +52,11 @@ export interface ActionFacts {
   home: string;
   /** Project-declared runners, tokenized (Task 10); they must match the gate's context. */
   projectCommands: string[][];
+  /**
+   * Tool names this extension registered itself (review M2). A factory tool name from anyone else (another
+   * extension, an MCP bridge) is `unknown`.
+   */
+  factoryTools?: ReadonlySet<string>;
 }
 
 /** The pre-call copy of a file whose machine section the post-check protects. */
@@ -64,8 +70,10 @@ export interface MachineCopy {
 
 export interface PreparedAction {
   action: ToolAction;
-  /** Redacted, truncated one-line description for the ledger and the confirm dialog. */
+  /** Redacted, truncated one-line description for the ledger (ruling 15). */
   summary: string;
+  /** The full, unredacted action for the owner's approval dialog (R30): command text with its newlines. */
+  display: string;
   /** Set for write/edit on a task file or on a file that holds machine markers (ruling 8 post-check). */
   machine?: MachineCopy;
 }
@@ -121,7 +129,7 @@ function writeAction(ev: ToolCallLike, tool: "write" | "edit", f: ActionFacts): 
   const content = str(ev.input.content);
   const edits = tool === "edit" ? editsOf(ev.input) : undefined;
   if (p === undefined || (tool === "write" && content === undefined) || (tool === "edit" && edits === undefined)) {
-    return { action: { kind: "unknown", tool }, summary: summarizeCommand(`${tool} (malformed input)`) };
+    return malformed(ev, tool);
   }
   const fact = pathFacts(p, f.cwd, f.home);
   const targetExists = fact.resolved !== "" && exists(fact.resolved);
@@ -136,18 +144,20 @@ function writeAction(ev: ToolCallLike, tool: "write" | "edit", f: ActionFacts): 
     else if (tool === "write") touches = touchesMachine(currentText, content!);
     else touches = editTouchesMachine(currentText, edits!);
   }
-  const summary = summarizeCommand(tool === "edit" ? `edit ${p} (${edits!.length} replacement(s))` : `write ${p}`);
+  const display = tool === "edit" ? `edit ${p} (${edits!.length} replacement(s))` : `write ${p}`;
+  const summary = summarizeCommand(display);
   const action: ToolAction = { kind: "write", tool, path: fact, touchesMachineSection: touches, targetExists };
-  if (!protectedFile || cur.kind === "error") return { action, summary };
-  return { action, summary, machine: { file: fact.resolved, input: p, before: cur.kind === "text" ? cur.text : undefined } };
+  if (!protectedFile || cur.kind === "error") return { action, summary, display };
+  return { action, summary, display, machine: { file: fact.resolved, input: p, before: cur.kind === "text" ? cur.text : undefined } };
 }
 
 function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionFacts): PreparedAction {
   const command = str(ev.input.command);
-  if (command === undefined) return { action: { kind: "unknown", tool }, summary: summarizeCommand(`${tool} (malformed input)`) };
+  if (command === undefined) return malformed(ev, tool);
   const summary = summarizeCommand(command);
+  const display = command;
   // Ruling 3: PowerShell is not classified in Phase 2; the gate asks without facts.
-  if (tool === "powershell") return { action: { kind: "command", tool, command, pathFacts: [] }, summary };
+  if (tool === "powershell") return { action: { kind: "command", tool, command, pathFacts: [] }, summary, display };
   const c = classifyCommandLine(command, { projectCommands: f.projectCommands });
   // Gate contract (gate.ts ToolAction "command"): every pathArg and inputPath, and every readArg that is
   // path-like or exists relative to the cwd. commandPathFacts may return several facts per argument (win32).
@@ -159,30 +169,42 @@ function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionF
   for (const a of c.inputPaths) add(a);
   for (const a of c.readArgs) if (isPathLikeArg(a) || exists(path.resolve(f.cwd, a))) add(a);
   const facts: PathFacts[] = args.flatMap((a) => commandPathFacts(a, f.cwd, f.home));
-  return { action: { kind: "command", tool, command, pathFacts: facts }, summary };
+  return { action: { kind: "command", tool, command, pathFacts: facts }, summary, display };
+}
+
+function rawInput(ev: ToolCallLike): string {
+  try {
+    return JSON.stringify(ev.input, null, 2) ?? "";
+  } catch {
+    return "(unserializable input)";
+  }
+}
+
+function malformed(ev: ToolCallLike, tool: string): PreparedAction {
+  const display = `${tool} (malformed input) ${rawInput(ev)}`;
+  return { action: { kind: "unknown", tool }, summary: summarizeCommand(display), display };
 }
 
 export function prepareAction(ev: ToolCallLike, f: ActionFacts): PreparedAction {
   const tool = ev.toolName;
-  if (FACTORY_TOOLS.has(tool)) return { action: { kind: "factory", tool }, summary: summarizeCommand(`${tool} ${JSON.stringify(ev.input)}`) };
+  if (f.factoryTools?.has(tool) === true) {
+    const display = `${tool} ${rawInput(ev)}`;
+    return { action: { kind: "factory", tool }, summary: summarizeCommand(display), display };
+  }
   if (tool === "write" || tool === "edit") return writeAction(ev, tool, f);
   if (tool === "bash" || tool === "powershell") return commandAction(ev, tool, f);
   if (READ_TOOLS.has(tool)) {
     const given = ev.input.path;
-    if (given !== undefined && typeof given !== "string") return { action: { kind: "unknown", tool }, summary: `${tool} (malformed input)` };
+    if (given !== undefined && typeof given !== "string") return malformed(ev, tool);
     const p = given ?? (DEFAULT_CWD_TOOLS.has(tool) ? "." : undefined);
-    if (p === undefined) return { action: { kind: "unknown", tool }, summary: `${tool} (malformed input)` };
+    if (p === undefined) return malformed(ev, tool);
     const fact = pathFacts(p, f.cwd, f.home, tool === "read" ? { read: true } : {});
     const pattern = str(ev.input.pattern);
-    return { action: { kind: "read", tool, path: fact }, summary: summarizeCommand(`${tool} ${pattern !== undefined ? `${pattern} ` : ""}${p}`) };
+    const display = `${tool} ${pattern !== undefined ? `${pattern} ` : ""}${p}`;
+    return { action: { kind: "read", tool, path: fact }, summary: summarizeCommand(display), display };
   }
-  let input: string;
-  try {
-    input = JSON.stringify(ev.input) ?? "";
-  } catch {
-    input = "(unserializable input)";
-  }
-  return { action: { kind: "unknown", tool }, summary: summarizeCommand(`${tool} ${input}`) };
+  const display = `${tool} ${rawInput(ev)}`;
+  return { action: { kind: "unknown", tool }, summary: summarizeCommand(display), display };
 }
 
 export function toToolAction(ev: ToolCallLike, f: ActionFacts): ToolAction {
@@ -233,6 +255,11 @@ export class MachinePostChecks {
 
   get size(): number {
     return this.pending.size;
+  }
+
+  /** Review M4: entries whose `tool_result` never fires (another extension blocked the call) are dropped here. */
+  clear(): void {
+    this.pending.clear();
   }
 
   /**
@@ -288,6 +315,34 @@ export interface GateUi {
   confirm(title: string, message: string): Promise<boolean>;
 }
 
+/**
+ * R31: allowed calls that may change the filesystem, from their decision until their result. Pi's default parallel
+ * tool execution runs every `tool_call` hook of a batch before executing any call, so the facts of a later call
+ * would predate an earlier call's effects; while this set is not empty, further top-level calls are blocked.
+ * Sequential execution is unaffected (`tool_result` fires before the next `tool_call`).
+ */
+export class InFlightCalls {
+  private readonly ids = new Set<string>();
+
+  add(toolCallId: string): void {
+    this.ids.add(toolCallId);
+  }
+  /** Called at `tool_result` and `tool_execution_end` (the latter also fires for calls another hook blocked). */
+  done(toolCallId: string): void {
+    this.ids.delete(toolCallId);
+  }
+  has(toolCallId: string): boolean {
+    return this.ids.has(toolCallId);
+  }
+  get size(): number {
+    return this.ids.size;
+  }
+  /** Backstop at `agent_settled` / `session_shutdown`. */
+  clear(): void {
+    this.ids.clear();
+  }
+}
+
 export interface EnforceDeps {
   /** Built per call: route, mode and facts can change between calls. May throw (config error → deny). */
   policyContext(): GateContext;
@@ -296,6 +351,9 @@ export interface EnforceDeps {
   /** `os.homedir()` unmodified (see ActionFacts.home). */
   home: string;
   postChecks: MachinePostChecks;
+  inFlight: InFlightCalls;
+  /** Tool names this extension registered (review M2). */
+  factoryTools: ReadonlySet<string>;
   /** Present only when Pi has a dialog-capable UI (`ctx.hasUI`); otherwise `ask` denies (ruling 4). */
   ui?: GateUi;
 }
@@ -306,16 +364,19 @@ function confirmWithTimeout(ui: GateUi, title: string, message: string): Promise
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => resolve(false), CONFIRM_TIMEOUT_MS);
     timer.unref?.();
-    ui.confirm(title, message).then(
-      (ok) => {
-        clearTimeout(timer);
-        resolve(ok === true);
-      },
-      () => {
-        clearTimeout(timer);
-        resolve(false);
-      },
-    );
+    // Review M3: a synchronous throw from confirm resolves to false like a rejection.
+    Promise.resolve()
+      .then(() => ui.confirm(title, message))
+      .then(
+        (ok) => {
+          clearTimeout(timer);
+          resolve(ok === true);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(false);
+        },
+      );
   });
 }
 
@@ -325,33 +386,62 @@ interface Outcome {
   block?: string;
 }
 
-async function resolveAsk(r: GateResult, tool: string, summary: string, ui: GateUi | undefined): Promise<Outcome> {
+const deny = (reason: string): Outcome => ({ decision: "deny", reason, block: `${BLOCK_PREFIX}: ${reason}` });
+
+async function resolveAsk(r: GateResult, tool: string, display: string, ui: GateUi | undefined): Promise<Outcome> {
   const label = r.hardGate ?? r.class ?? "unclassified";
-  if (ui === undefined) {
-    const reason = `requires human approval (${label}): ${r.reason}`;
-    return { decision: "deny", reason, block: `${BLOCK_PREFIX}: ${reason}` };
+  if (ui === undefined) return deny(`requires human approval (${label}): ${r.reason}`);
+  // R30: the owner approves exactly what runs: the full, unredacted text with its newlines, or nothing.
+  if (display.length > MAX_APPROVAL_CHARS) {
+    return deny(`too long to approve safely (${display.length} > ${MAX_APPROVAL_CHARS} characters; ${label}): ${r.reason}`);
   }
-  const message = [`Tool: ${tool}`, `Action: ${summary}`, `Reason: ${r.reason}`, "", "Allow this call?"].join("\n");
+  const message = [`Tool: ${tool}`, `Reason: ${r.reason}`, "", "Action (exactly as it will run):", display, "", "Allow this call?"].join("\n");
   const ok = await confirmWithTimeout(ui, `Factory gate: ${label}`, message);
   if (ok) return { decision: "allow (approved)", reason: `approved by the user: ${r.reason}` };
   const reason = `rejected by the user or not answered within ${CONFIRM_TIMEOUT_MS / 1000} s (${label}): ${r.reason}`;
   return { decision: "deny (rejected)", reason, block: `${BLOCK_PREFIX}: ${reason}` };
 }
 
+/** R31: write, edit, powershell, unknown tools and every bash command that is not read-only. */
+function mayMutate(action: ToolAction, r: GateResult): boolean {
+  switch (action.kind) {
+    case "write":
+    case "unknown":
+      return true;
+    case "command":
+      return action.tool === "powershell" || r.class !== "read-only";
+    default:
+      return false;
+  }
+}
+
 /**
  * Evaluates one tool call against the GatePolicy and returns Pi's block result for a deny. Every decision,
  * allow included, appends exactly one `gate` event; when that append fails the call is blocked (no unaudited
- * effects). The answer-route runner reconciliation (Task 11) hooks in where `r.reconcile` is true.
+ * effects).
  */
 export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: EnforceDeps): Promise<BlockResult | undefined> {
   let summary = summarizeCommand(ev.toolName);
   let r: GateResult;
   let prepared: PreparedAction | undefined;
+  const nestedInFlight = ev.parentToolCallId !== undefined && deps.inFlight.has(ev.parentToolCallId);
   try {
     const policy = deps.policyContext();
-    prepared = prepareAction(ev, { cwd: ctx.cwd, home: deps.home, projectCommands: policy.projectCommands });
+    prepared = prepareAction(ev, { cwd: ctx.cwd, home: deps.home, projectCommands: policy.projectCommands, factoryTools: deps.factoryTools });
     summary = prepared.summary;
-    r = evaluateGate(prepared.action, policy);
+    if (deps.inFlight.size > 0 && !nestedInFlight) {
+      r = {
+        decision: "deny",
+        reason: "another call that may change files is still running: re-issue this call after the previous call finishes (R31)",
+        reconcile: false,
+      };
+    } else {
+      r = evaluateGate(prepared.action, policy);
+      // R29: ruling 5 allows answer-route runners only with reconciliation, which Task 11 adds.
+      if (r.decision === "allow" && r.reconcile) {
+        r = { ...r, decision: "deny", reason: "answer-route runner reconciliation is not available yet: declare a change route with set_route", reconcile: false };
+      }
+    }
   } catch (e) {
     r = { decision: "deny", reason: `policy error (fail closed): ${(e as Error).message}`, reconcile: false };
     prepared = undefined;
@@ -359,10 +449,10 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
 
   const outcome: Outcome =
     r.decision === "ask"
-      ? await resolveAsk(r, ev.toolName, summary, deps.ui)
+      ? await resolveAsk(r, ev.toolName, prepared?.display ?? ev.toolName, deps.ui)
       : r.decision === "allow"
         ? { decision: "allow", reason: r.reason }
-        : { decision: "deny", reason: r.reason, block: `${BLOCK_PREFIX}: ${r.reason}` };
+        : deny(r.reason);
 
   try {
     deps.ledger.append({
@@ -383,9 +473,9 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
     return { block: true, reason: `${BLOCK_PREFIX}: the audit ledger could not be written (fail closed): ${(e as Error).message}` };
   }
 
-  if (outcome.block !== undefined) return { block: true, reason: outcome.block };
-  // Task 11: when `r.reconcile` is true (allowlisted runner on the answer route), take the snapshot here and
-  // reconcile at `tool_result`.
-  if (prepared?.machine !== undefined) deps.postChecks.remember(ev.toolCallId, prepared.machine);
+  if (outcome.block !== undefined || prepared === undefined) return { block: true, reason: outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}` };
+  // Task 11: when the gate returns `reconcile: true`, take the snapshot here instead of the R29 deny above.
+  if (!nestedInFlight && mayMutate(prepared.action, r)) deps.inFlight.add(ev.toolCallId);
+  if (prepared.machine !== undefined) deps.postChecks.remember(ev.toolCallId, prepared.machine);
   return undefined;
 }

@@ -1,10 +1,11 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CONFIRM_TIMEOUT_MS,
   enforce,
+  InFlightCalls,
   MachinePostChecks,
   toToolAction,
   type EnforceDeps,
@@ -72,16 +73,20 @@ async function world() {
   });
   const ledger = fakeLedger();
   const postChecks = new MachinePostChecks();
+  const inFlight = new InFlightCalls();
+  const factoryTools = new Set<string>();
   const deps = (route: RouteState, over: Partial<GateContext> = {}, ui?: GateUi): EnforceDeps => ({
     policyContext: () => context(route, over),
     ledger,
     runId: RUN_ID,
     home: homedir(),
     postChecks,
+    inFlight,
+    factoryTools,
     ...(ui ? { ui } : {}),
   });
   const taskFile = join(root, ".factory", "knowledge", "tasks", "t1.md");
-  return { dir: t.dir, root, real, answer, feature, context, ledger, postChecks, deps, taskFile };
+  return { dir: t.dir, root, real, answer, feature, context, ledger, postChecks, inFlight, factoryTools, deps, taskFile };
 }
 
 let seq = 0;
@@ -294,7 +299,7 @@ describe("enforce (tool_call hook)", () => {
 });
 
 describe("toToolAction", () => {
-  const facts = (cwd: string) => ({ cwd, home: homedir(), projectCommands: [] });
+  const facts = (cwd: string, factoryTools: ReadonlySet<string> = new Set()) => ({ cwd, home: homedir(), projectCommands: [], factoryTools });
 
   it("bash: one fact per pathArg and per path-like or existing readArg, input equal to the argument", async () => {
     const w = await world();
@@ -337,10 +342,148 @@ describe("toToolAction", () => {
 
   it("classifies factory tools, powershell and anything else", async () => {
     const w = await world();
-    expect(toToolAction(call("set_route", { route: "small" }), facts(w.root))).toEqual({ kind: "factory", tool: "set_route" });
+    // M2: a factory tool name counts only when this extension registered it.
+    expect(toToolAction(call("set_route", { route: "small" }), facts(w.root))).toEqual({ kind: "unknown", tool: "set_route" });
+    expect(toToolAction(call("set_route", { route: "small" }), facts(w.root, new Set(["set_route"])))).toEqual({ kind: "factory", tool: "set_route" });
     expect(toToolAction(call("powershell", { command: "Get-ChildItem" }), facts(w.root))).toMatchObject({ kind: "command", tool: "powershell" });
     expect(toToolAction(call("mcp_tool", {}), facts(w.root))).toEqual({ kind: "unknown", tool: "mcp_tool" });
     // A malformed built-in call is not trusted.
     expect(toToolAction(call("write", { path: 3 }), facts(w.root))).toEqual({ kind: "unknown", tool: "write" });
+  });
+});
+
+describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
+  /** `evil/up -> ../..` committed in the project: a relative symlink, no user name needed (review C1). */
+  async function symlinkWorld() {
+    const w = await world();
+    mkdirSync(join(w.root, "evil"));
+    symlinkSync(join("..", ".."), join(w.root, "evil", "up"));
+    // The parent of the project plays home, so `out/up/.aws/credentials` lands on a home secret.
+    const over: Partial<GateContext> = { mode: "interactive", home: canonicalDir(w.dir) };
+    return { ...w, over };
+  }
+
+  it("R28: copying a planted symlink and then using the copy is not allowed silently", async () => {
+    const w = await symlinkWorld();
+    const { ui, calls } = confirmer(false);
+    for (const command of ["cp -r evil out && cat out/up/.aws/credentials", "cp -r evil out && echo x > out/up/outside/f"]) {
+      const r = await enforce(call("bash", { command }), { cwd: w.root }, w.deps(w.feature, w.over, ui));
+      expect(r?.block, command).toBe(true);
+    }
+    // Both layers catch it (the gate's R28 ask on the missing later target, the copy's R28 `unknown` class);
+    // the hard-gate ask is reported first.
+    expect(calls.map((c) => c.title)).toEqual(["Factory gate: secrets", "Factory gate: outside-root-write"]);
+    expect(gates(w.ledger).map((g) => g.class)).toEqual(["unknown", "unknown"]);
+  });
+
+  it("R28: a dereferencing copy still asks for the later target that does not exist yet", async () => {
+    const w = await symlinkWorld();
+    const { ui, calls } = confirmer(false);
+    const r1 = await enforce(call("bash", { command: "cp -rL evil out && cat out/up/.aws/credentials" }), { cwd: w.root }, w.deps(w.feature, w.over, ui));
+    const r2 = await enforce(call("bash", { command: "mkdir out && echo x > out/up/outside/f" }), { cwd: w.root }, w.deps(w.feature, w.over, ui));
+    expect(r1?.block).toBe(true);
+    expect(r2?.block).toBe(true);
+    expect(calls.map((c) => c.title)).toEqual(["Factory gate: secrets", "Factory gate: outside-root-write"]);
+    // The direct read through the symlink was already caught by its facts.
+    const r3 = await enforce(call("bash", { command: "cat evil/up/.aws/credentials" }), { cwd: w.root }, w.deps(w.feature, w.over, ui));
+    expect(r3?.block).toBe(true);
+    expect(calls[2]?.title).toBe("Factory gate: secrets");
+  });
+
+  it("R28: facts report whether each target exists", async () => {
+    const w = await world();
+    writeFileSync(join(w.root, "a.txt"), "a");
+    const a = toToolAction(call("bash", { command: "cat a.txt ./missing" }), { cwd: w.root, home: homedir(), projectCommands: [] });
+    if (a.kind !== "command") throw new Error("expected a command");
+    expect(a.pathFacts.find((f) => f.input === "a.txt")?.exists).toBe(true);
+    expect(a.pathFacts.find((f) => f.input === "./missing")?.exists).toBe(false);
+  });
+
+  it("R29: an answer-route runner the gate would reconcile is denied until reconciliation exists", async () => {
+    const w = await world();
+    const r = await enforce(call("bash", { command: "npm test" }), { cwd: w.root }, w.deps(w.answer));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("answer-route runner reconciliation is not available yet");
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "deny" })]);
+    expect(gates(w.ledger)[0]!.reason).toContain("answer-route runner reconciliation is not available yet");
+  });
+
+  it("R30: the dialog shows the full command unredacted with its newlines; the ledger keeps the redacted summary", async () => {
+    const w = await world();
+    const { ui, calls } = confirmer(false);
+    const command = `ls ${"README.md ".repeat(80)}\ngit push https://user:${TOKEN}@example.com/x.git`;
+    await enforce(call("bash", { command }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, ui));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.message).toContain(command);
+    const [g] = gates(w.ledger);
+    expect(JSON.stringify(g)).not.toContain(TOKEN);
+  });
+
+  it("R30: a command too long to approve safely is denied without a dialog", async () => {
+    const w = await world();
+    const { ui, calls } = confirmer(true);
+    const command = `ls ${"README.md ".repeat(450)}&& git push`;
+    expect(command.length).toBeGreaterThan(4000);
+    const r = await enforce(call("bash", { command }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, ui));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("too long to approve safely");
+    expect(calls).toHaveLength(0);
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "deny" })]);
+  });
+
+  it("R31: while an allowed mutating call is in flight, further top-level calls are blocked (parallel batch)", async () => {
+    const w = await world();
+    writeFileSync(join(w.root, "a.txt"), "a");
+    const cp = call("bash", { command: "cp a.txt out.txt" });
+    expect(await enforce(cp, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    const second = await enforce(call("read", { path: "out.txt" }), { cwd: w.root }, w.deps(w.feature));
+    expect(second?.block).toBe(true);
+    expect(second?.reason).toContain("re-issue");
+    // A nested call of the in-flight parent is gated normally, not blocked.
+    const nested = call("write", { path: "nested.txt", content: "x" }, { toolCallId: `${cp.toolCallId}/1`, parentToolCallId: cp.toolCallId });
+    expect(await enforce(nested, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    w.inFlight.done(nested.toolCallId);
+    w.inFlight.done(cp.toolCallId);
+    expect(await enforce(call("read", { path: "out.txt" }), { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    expect(gates(w.ledger).map((g) => g.decision)).toEqual(["allow", "deny", "allow", "allow"]);
+  });
+
+  it("R31: read tools, read-only commands and denied calls do not hold the batch", async () => {
+    const w = await world();
+    expect(await enforce(call("bash", { command: "ls" }), { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    expect(await enforce(call("read", { path: "a.txt" }), { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    expect((await enforce(call("write", { path: "x.txt", content: "x" }), { cwd: w.root }, w.deps(w.answer)))?.block).toBe(true);
+    expect(await enforce(call("grep", { pattern: "x" }), { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    expect(w.inFlight.size).toBe(0);
+    w.inFlight.clear();
+  });
+
+  it("M2: a factory tool name is allowed only when this extension registered it", async () => {
+    const w = await world();
+    expect((await enforce(call("set_route", { route: "small" }), { cwd: w.root }, w.deps(w.answer)))?.block).toBe(true);
+    w.factoryTools.add("set_route");
+    expect(await enforce(call("set_route", { route: "small" }), { cwd: w.root }, w.deps(w.answer))).toBeUndefined();
+  });
+
+  it("M3: a confirm that throws synchronously denies and is audited", async () => {
+    const w = await world();
+    const ui: GateUi = {
+      confirm: () => {
+        throw new Error("sync boom");
+      },
+    };
+    const r = await enforce(call("bash", { command: "git push" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, ui));
+    expect(r?.block).toBe(true);
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "deny (rejected)" })]);
+  });
+
+  it("M4: pending post-checks can be cleared (agent_settled / session_shutdown)", async () => {
+    const w = await world();
+    mkdirSync(join(w.taskFile, ".."), { recursive: true });
+    writeFileSync(w.taskFile, TASK_DOC);
+    await enforce(call("edit", { path: w.taskFile, edits: [{ oldText: "free text here", newText: "y" }] }), { cwd: w.root }, w.deps(w.feature));
+    expect(w.postChecks.size).toBe(1);
+    w.postChecks.clear();
+    expect(w.postChecks.size).toBe(0);
   });
 });

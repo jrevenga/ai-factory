@@ -27,7 +27,7 @@ import type { GateContext } from "../../../core/policy/gate.ts";
 import { INITIAL_ROUTE } from "../../../core/route/route.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { FactoryState } from "../../../core/state/schema.ts";
-import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
+import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
 import { storeWritable } from "./store-probe.ts";
@@ -119,6 +119,7 @@ interface Session {
   tmpCandidates: string[];
   autonomy: AutonomyLevel;
   postChecks: MachinePostChecks;
+  inFlight: InFlightCalls;
 }
 
 function within(child: string, parent: string): boolean {
@@ -203,6 +204,7 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     tmpCandidates: [canonicalDir(tmpdir())],
     autonomy,
     postChecks: new MachinePostChecks(),
+    inFlight: new InFlightCalls(),
   };
 }
 
@@ -214,6 +216,12 @@ interface Started {
 
 export default function factoryExtension(pi: ExtensionAPI): void {
   let current: Promise<Started> | undefined;
+  /**
+   * Review M2: names of the tools this extension registered with `pi.registerTool`. Only these are gated as
+   * factory tools; Task 8+ add each registration here.
+   */
+  const factoryTools = new Set<string>();
+  const sessionNow = async (): Promise<Session | undefined> => (current === undefined ? undefined : (await current).session);
 
   const start = (ctx: ExtensionContext): Promise<Started> => {
     current = runHandshake().then(({ result, personal }) => {
@@ -254,18 +262,39 @@ export default function factoryExtension(pi: ExtensionAPI): void {
       runId: session.runId,
       home: session.rawHome,
       postChecks: session.postChecks,
+      inFlight: session.inFlight,
+      factoryTools,
       ...(ui ? { ui } : {}),
     });
   });
 
   pi.on("tool_result", async (event) => {
-    const session = current === undefined ? undefined : (await current).session;
-    return session?.postChecks.afterToolResult(event, session.ledger, session.runId);
+    const session = await sessionNow();
+    if (session === undefined) return undefined;
+    try {
+      return session.postChecks.afterToolResult(event, session.ledger, session.runId);
+    } finally {
+      session.inFlight.done(event.toolCallId);
+    }
+  });
+
+  // Fires for every call, also for one a later extension's hook blocked (which gets no tool_result).
+  pi.on("tool_execution_end", async (event) => {
+    (await sessionNow())?.inFlight.done(event.toolCallId);
+  });
+
+  // Backstop (review M4): nothing is in flight once the agent has settled.
+  pi.on("agent_settled", async () => {
+    const session = await sessionNow();
+    session?.inFlight.clear();
+    session?.postChecks.clear();
   });
 
   pi.on("session_shutdown", async (event) => {
-    const session = current === undefined ? undefined : (await current).session;
+    const session = await sessionNow();
     if (session === undefined) return;
+    session.inFlight.clear();
+    session.postChecks.clear();
     try {
       session.ledger.append({ v: 1, ts: new Date().toISOString(), runId: session.runId, type: "run_end", reason: event.reason });
     } catch (e) {

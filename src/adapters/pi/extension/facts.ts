@@ -154,7 +154,21 @@ function safeRealpath(p: string): string | undefined {
 
 /** A fact core treats as secret and outside every root (empty `resolved` is not an absolute path). */
 function unresolvable(input: string, platform: PathPlatform): PathFacts {
-  return { input, resolved: "", platform };
+  return { input, resolved: "", platform, exists: false };
+}
+
+/** R28: whether the resolved target exists now (a dangling symlink counts as existing: lstat). */
+function lexists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolvedFact(input: string, resolved: string, platform: PathPlatform): PathFacts {
+  return { input, resolved, platform, exists: lexists(resolved) };
 }
 
 /** Pi's `resolveReadPath` fallbacks for a missing path (macOS screenshot names, NFD, curly quotes). */
@@ -185,7 +199,7 @@ export function pathFacts(p: string, cwd: string, home: string, opts: PathFactsO
   try {
     let lexical = resolveToolPath(p, cwd, home, platform);
     if (opts.read) lexical = readVariant(lexical);
-    return { input: p, resolved: realTarget(lexical), platform };
+    return resolvedFact(p, realTarget(lexical), platform);
   } catch {
     return unresolvable(p, platform);
   }
@@ -231,7 +245,7 @@ export function commandPathFacts(arg: string, cwd: string, home: string): PathFa
   return commandCandidates(arg, cwd, realHome, platform).map((abs) => {
     if (abs === "") return unresolvable(arg, platform);
     try {
-      return { input: arg, resolved: realTarget(abs), platform };
+      return resolvedFact(arg, realTarget(abs), platform);
     } catch {
       return unresolvable(arg, platform);
     }
