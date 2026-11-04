@@ -98,6 +98,16 @@ async function setup() {
   git(wt, "commit", "-q", "-m", "task t1");
   const log = join(t.dir, "observed.jsonl");
   env.OBSERVE_FILE = log;
+  // The checkpoint commit runs git inside Pi with the inherited environment: give it an identity and no host config
+  // (a CI runner has no user.name/user.email, so the commit, and with it the checkpoint, would fail).
+  Object.assign(env, {
+    GIT_CONFIG_GLOBAL: isWin ? "NUL" : "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "Factory Test",
+    GIT_AUTHOR_EMAIL: "factory-test@example.invalid",
+    GIT_COMMITTER_NAME: "Factory Test",
+    GIT_COMMITTER_EMAIL: "factory-test@example.invalid",
+  });
   return { dir: t.dir, env, home, project, wt, realWt: realpathSync.native(wt), taskFile, log, agentDir: env.PI_CODING_AGENT_DIR as string, sessions: join(t.dir, "sessions") };
 }
 
@@ -135,6 +145,11 @@ describe("resume after a killed session (e2e, faux provider)", () => {
     const exit = await run1.exited;
     if (!isWin) expect(exit, run1.stderr() + run1.stdout()).toEqual({ code: null, signal: "SIGKILL" });
 
+    // The checkpoint call succeeded before the hold (its result is in the observer log, which Pi writes before the
+    // next LLM call, i.e. before the hold).
+    const run1Results = jsonLines<Observed>(s.log).filter((o) => o.event === "tool_result");
+    expect(run1Results.find((o) => o.toolName === "task_progress"), JSON.stringify(run1Results)).toMatchObject({ isError: false });
+
     const before = ledgerRuns(s.home);
     expect(before).toHaveLength(1);
     const [run1Id, run1Events] = before[0]!;
@@ -151,8 +166,10 @@ describe("resume after a killed session (e2e, faux provider)", () => {
       { tool: "write", args: { path: after, content: "after\n" } },
       { tool: "set_route", args: { route: "feature", taskId: "t1", reason: "resume t1", worktree: s.wt } },
       { tool: "write", args: { path: after, content: "after\n" } },
+      { text: "first agent run done" },
     ]);
-    const run2 = await runPiSession({ cli, agentDir: s.agentDir, cwd: s.project, env: s.env, extensions, sessionDir: s.sessions, continue: true });
+    // Two prompts in one process: two agent runs; the resume section must reach the first only.
+    const run2 = await runPiSession({ cli, agentDir: s.agentDir, cwd: s.project, env: s.env, extensions, sessionDir: s.sessions, continue: true, args: ["go"], prompt: "again" });
     expect(run2.timedOut).toBe(false);
     expect(run2.code, run2.stderr).toBe(0);
 
@@ -171,6 +188,9 @@ describe("resume after a killed session (e2e, faux provider)", () => {
     // The resume section reached run 2's prompt (once), naming the run, the task, the phase and the checkpoint.
     const observed = jsonLines<Observed>(s.log);
     const sections = observed.filter((o) => o.event === "prompt_sections").map((o) => o.sections as Record<string, string>);
+    // Run 1 had one agent run, run 2 two; the second agent run of run 2 has no resume section.
+    expect(sections).toHaveLength(3);
+    expect(Object.keys(sections[2]!)).not.toContain("factory-resume");
     const resume = sections.map((x) => Object.values(x).find((v) => v.includes("Interrupted factory run"))).filter((v) => v !== undefined);
     expect(resume).toEqual([
       `Interrupted factory run ${run1Id}: task t1, phase implement, last checkpoint ${sha}. Resume from the checkpoint; re-declare the route with set_route.`,
