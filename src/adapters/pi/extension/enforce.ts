@@ -14,7 +14,7 @@ import { summarizeCommand } from "../../../core/policy/redact.ts";
 import { INITIAL_ROUTE } from "../../../core/route/route.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { editTouchesMachine, MACHINE_CLOSE, MACHINE_OPEN, parseMachine, touchesMachine, type TextEdit } from "../../../core/task/machine.ts";
-import { commandPathFacts, pathFacts } from "./facts.ts";
+import { commandPathFacts, pathFacts, trackedSecretFact } from "./facts.ts";
 import type { Reconciler } from "./reconcile.ts";
 
 /** Ruling 4: an unanswered confirm dialog denies after 120 s. */
@@ -66,6 +66,8 @@ export interface ActionFacts {
   factoryTools?: ReadonlySet<string>;
   /** `run_check`: where the command runs (default `cwd`) and the task file whose machine section it must not change. */
   runCheck?: RunCheckFacts;
+  /** The gate context's Pi agent dir, for the R41 tracked-secret fact (default `<home>/.pi/agent`). */
+  piAgentDir?: string;
 }
 
 export interface RunCheckFacts {
@@ -199,7 +201,13 @@ function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionF
   for (const a of c.inputPaths) add(a);
   for (const a of c.readArgs) if (isPathLikeArg(a) || exists(path.resolve(f.cwd, a))) add(a);
   const facts: PathFacts[] = args.flatMap((a) => commandPathFacts(a, f.cwd, f.home));
-  return { action: { kind: "command", tool, command, pathFacts: facts }, summary, display };
+  const action: ToolAction = { kind: "command", tool, command, pathFacts: facts };
+  // R41: only content-printing git commands need the tracked-secret fact (one `git ls-files` per call).
+  if (c.trackedContent) {
+    const tracked = trackedSecretFact(f.cwd, f.home, f.piAgentDir ?? path.join(f.home, ".pi", "agent"));
+    if (tracked !== undefined) action.trackedSecret = tracked;
+  }
+  return { action, summary, display };
 }
 
 /** The pre-call copy of the route's task file for the ruling-8 post-check; undefined when it cannot be read. */
@@ -649,6 +657,7 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
       projectCommands: policy.projectCommands,
       factoryTools: deps.factoryTools,
       runCheck: runCheckFacts(policy),
+      piAgentDir: policy.piAgentDir,
     });
     summary = prepared.summary;
     r = evaluateGate(prepared.action, policy);

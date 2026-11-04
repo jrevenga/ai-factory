@@ -15,7 +15,7 @@ import { createHash } from "node:crypto";
 import { accessSync, constants, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { PathFacts, PathPlatform } from "../../../core/policy/paths.ts";
+import { isSecretPath, type PathFacts, type PathPlatform } from "../../../core/policy/paths.ts";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const NARROW_NO_BREAK_SPACE = "\u202F";
@@ -607,6 +607,32 @@ export function headCommit(dir: string): string | undefined {
   if (!isDir(dir)) return undefined;
   const out = gitOut(dir, ["rev-parse", "--verify", "--quiet", "HEAD"]);
   return out !== undefined && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(out) ? out : undefined;
+}
+
+/** Bound for the `git ls-files -z` listing of a large repository. */
+const LS_FILES_MAX_BUFFER = 256 * 1024 * 1024;
+
+/**
+ * R41: whether the repository around `cwd` tracks a secret path (`git ls-files -z` at the top level through the safe
+ * git wrapper, each path checked with `isSecretPath`). Undefined when it cannot be determined (not a work tree, git
+ * missing or failing, unusable home): the gate then asks. Content-printing git commands (diff, show, blame, log with
+ * patches) print tracked files wherever they run in the work tree, hence the top level.
+ */
+export function trackedSecretFact(cwd: string, home: string, piAgentDir: string): boolean | undefined {
+  const top = repoRoot(cwd);
+  if (top === undefined) return undefined;
+  let ctx: { home: string; piAgentDir: string; platform: PathPlatform };
+  try {
+    ctx = { home: canonicalDir(home), piAgentDir: canonicalDir(piAgentDir), platform: hostPlatform() };
+  } catch {
+    return undefined;
+  }
+  const r = gitRunBytes(top, ["ls-files", "-z"], GIT_TIMEOUT_MS, LS_FILES_MAX_BUFFER);
+  if (r.status !== 0) return undefined;
+  for (const rel of r.stdout.toString("utf8").split("\0")) {
+    if (rel !== "" && isSecretPath(path.join(top, rel), ctx)) return true;
+  }
+  return false;
 }
 
 export function sha256hex(s: string): string {
