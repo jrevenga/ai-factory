@@ -414,7 +414,37 @@ describe("run_check", () => {
     setRoute(x.small);
     const asked: string[] = [];
     const r = await x.check("git push", { ui: { confirm: async (t) => (asked.push(t), true) } });
-    expect(r.blocked).toBeDefined();
+    expect(r.blocked).toContain("run_check runs only read-only, allowlisted or project-declared commands");
+    expect(r.blocked).toContain("git push mutates a remote");
+    expect(asked).toEqual([]);
+    expect(x.events().some((e) => e.type === "check")).toBe(false);
+  });
+
+  it("M9: environment assignments — an allowed name reaches the step env only, any other name is refused", async () => {
+    const x = await world({ declared: [...DECLARED, { name: "env", argv: ["node", "scripts/env.mjs"] }] });
+    writeFileSync(join(x.project, "scripts", "env.mjs"), 'console.log(`CI=${process.env.CI ?? "unset"}`);\n');
+    setRoute(x.small);
+    const ok = await x.check("CI=factory node scripts/env.mjs");
+    expect(ok.record?.exitCode).toBe(0);
+    expect(ok.text).toContain("CI=factory");
+    expect(process.env.CI === "factory").toBe(false);
+    for (const cmd of ["NODE_OPTIONS=--require=./x.js node scripts/ok.mjs", "PATH=. git status", "GIT_DIR=/tmp git status"]) {
+      const r = await x.check(cmd, { ui: approve() });
+      expect(r.blocked, cmd).toContain("is not allowed");
+    }
+  });
+
+  it("M9: `cd` and a declared command chained with an unknown one are refused before any ask", async () => {
+    const x = await world();
+    setRoute(x.small);
+    const asked: string[] = [];
+    const ui: GateUi = { confirm: async (t) => (asked.push(t), true) };
+    const cd = await x.check("cd scripts && node ok.mjs", { ui });
+    expect(cd.blocked).toContain("run_check runs only read-only, allowlisted or project-declared commands");
+    expect(cd.blocked).toContain("cd");
+    const chained = await x.check('node scripts/ok.mjs && node -e "process.exit"', { ui });
+    expect(chained.blocked).toContain("run_check runs only read-only, allowlisted or project-declared commands");
+    expect(chained.blocked).toContain("segment 2 (node)");
     expect(asked).toEqual([]);
     expect(x.events().some((e) => e.type === "check")).toBe(false);
   });
