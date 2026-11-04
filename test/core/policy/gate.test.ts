@@ -610,6 +610,41 @@ describe("evaluateGate: commands", () => {
   });
 });
 
+describe("evaluateGate: targets created by an earlier segment (R28)", () => {
+  /** Facts with `exists` as the extension reports it at hook time. */
+  function cmd(command: string, facts: [string, boolean][]): ToolAction {
+    return { kind: "command", tool: "bash", command, pathFacts: facts.map(([i, exists]) => ({ ...fact(i), exists })) };
+  }
+
+  it("a later read of a path that does not exist yet asks secrets (it may be a planted symlink)", () => {
+    for (const over of [{}, UNATTENDED]) {
+      const r = evaluateGate(cmd("mkdir out && cat out/up/.aws/credentials", [["out", false], ["out/up/.aws/credentials", false]]), ctx(over));
+      expect(r).toMatchObject({ decision: "ask", hardGate: "secrets" });
+      expect(r.reason).toContain("out/up/.aws/credentials");
+    }
+  });
+
+  it("a later write to a path that does not exist yet asks outside-root-write", () => {
+    const r = evaluateGate(cmd("mkdir out && echo x > out/up/outside/f", [["out", false], ["out/up/outside/f", false]]), ctx());
+    expect(r).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+  });
+
+  it("an earlier local-write segment without write targets (git switch) triggers the rule too", () => {
+    const r = evaluateGate(cmd("git switch other && cat ./k", [["./k", false]]), ctx());
+    expect(r).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("a fact without `exists` counts as not existing (fail closed)", () => {
+    expect(evaluateGate(bash("mkdir out && cat out/x", [["out"], ["out/x"]]), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("is not triggered by existing later targets, by earlier read-only segments or within a single segment", () => {
+    expect(evaluateGate(cmd("mkdir -p out && cat src/a.ts", [["out", false], ["src/a.ts", true]]), ctx()).decision).toBe("allow");
+    expect(evaluateGate(cmd("ls && cat ./missing", [["./missing", false]]), ctx()).decision).toBe("allow");
+    expect(evaluateGate(cmd("echo x > out/new.txt", [["out/new.txt", false]]), ctx()).decision).toBe("allow");
+  });
+});
+
 describe("evaluateGate: fail closed", () => {
   it("a relative home is a configuration error and denies", () => {
     expect(evaluateGate(read("src/a.ts"), ctx({ home: "h" })).decision).toBe("deny");

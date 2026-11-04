@@ -54,8 +54,8 @@ describe("classifyCommandLine: allowlisted", () => {
 
   it("reports per-segment classes", () => {
     expect(classify("ls && git push").segments).toEqual([
-      { argv: ["ls"], class: "read-only", allowlisted: true },
-      { argv: ["git", "push"], class: "remote-mutating", allowlisted: false },
+      { argv: ["ls"], class: "read-only", allowlisted: true, pathArgs: [], inputPaths: [], readArgs: [] },
+      { argv: ["git", "push"], class: "remote-mutating", allowlisted: false, pathArgs: [], inputPaths: [], readArgs: [] },
     ]);
   });
 });
@@ -371,5 +371,35 @@ describe("classifyCommandLine: rule details", () => {
 
   it("go build -o reports the output path", () => {
     expect(classify("go build -o ../bin/x ./cmd").pathArgs).toEqual(["../bin/x"]);
+  });
+});
+
+describe("classifyCommandLine: link-preserving copies and moves before another segment (R28)", () => {
+  it("a recursive or link-preserving cp followed by another segment is unknown", () => {
+    for (const cp of ["cp -r evil out", "cp -R evil out", "cp -a evil out", "cp -rf evil out", "cp -P a b", "cp -s a b", "cp --recursive evil out", "cp --archive evil out", "cp --no-dereference a b", "cp --preserve=links a b"]) {
+      for (const join of [" && ", "; ", " | ", "\n"]) {
+        const c = classify(`${cp}${join}cat out/x`);
+        expect(c.segments[0]?.class, `${cp}${JSON.stringify(join)}`).toBe("unknown");
+        expect(c.reasons.join(" ")).toContain("R28");
+        expect(c.allowlisted).toBe(false);
+      }
+    }
+  });
+  it("any mv followed by another segment is unknown (a directory or a symlink keeps its links)", () => {
+    expect(classify("mv evil out && cat out/x").segments[0]?.class).toBe("unknown");
+    expect(classify("mv a b; ls").segments[0]?.class).toBe("unknown");
+  });
+  it("is unchanged when the copy is the last segment, or dereferences with -L", () => {
+    expect(classify("cp -r evil out").class).toBe("local-write");
+    expect(classify("ls && cp -r evil out").class).toBe("local-write");
+    expect(classify("mv a b").class).toBe("local-write");
+    expect(classify("cp -rL evil out && cat out/x").segments[0]?.class).toBe("local-write");
+    expect(classify("cp -r --dereference evil out && cat out/x").segments[0]?.class).toBe("local-write");
+    expect(classify("cp a b && cat b").segments[0]?.class).toBe("local-write");
+  });
+  it("reports pathArgs, inputPaths and readArgs per segment", () => {
+    const c = classify("cp a.txt out.txt && cat ./out.txt < in.txt > log.txt");
+    expect(c.segments[0]!.pathArgs).toContain("out.txt");
+    expect(c.segments[1]).toMatchObject({ pathArgs: ["log.txt"], inputPaths: ["in.txt"], readArgs: ["./out.txt"] });
   });
 });

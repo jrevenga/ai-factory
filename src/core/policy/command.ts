@@ -39,6 +39,10 @@ export interface SegmentClassification {
   argv: string[];
   class: CommandClass;
   allowlisted: boolean;
+  /** This segment's share of the line's `pathArgs`, `inputPaths` and `readArgs` (R28 needs the segment order). */
+  pathArgs: string[];
+  inputPaths: string[];
+  readArgs: string[];
 }
 
 export interface CommandClassification {
@@ -680,6 +684,21 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
   return { class: cls, allowlisted, reasons, pathArgs, inputPaths };
 }
 
+/**
+ * R28: a copy or move whose result can contain a symbolic link that a later segment then follows. Any `mv` counts
+ * (a moved directory or symlink keeps its links; whether the source is a directory is not known here).
+ */
+function plantsLinks(argv: readonly string[]): string | undefined {
+  const name = argv[0] === undefined ? undefined : commandName(argv[0]);
+  const args = argv.slice(1);
+  if (name === "mv") return "mv keeps symbolic links";
+  if (name !== "cp") return undefined;
+  const preserve = args.some((a) => /^--pr(e(s(e(r(ve?)?)?)?)?)?=/.test(a) && /\b(links|all)\b/.test(a.slice(a.indexOf("=") + 1)));
+  const keeps = preserve || hasShort(args, R.CP_LINK_PRESERVING_SHORT) || hasLong(args, R.CP_LINK_PRESERVING_LONG);
+  const derefs = hasShort(args, R.CP_DEREFERENCE_SHORT) || hasLong(args, R.CP_DEREFERENCE_LONG);
+  return keeps && !derefs ? "cp copies symbolic links as links" : undefined;
+}
+
 export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandClassification {
   const tok = tokenizeCommandLine(cmd);
   if (!tok.ok) {
@@ -701,9 +720,24 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
   const pathArgs: string[] = [];
   const inputPaths: string[] = [];
   const readArgs: string[] = [];
+  const last = tok.segments.length - 1;
   tok.segments.forEach((seg, i) => {
     const v = classifySegment(seg, ctx);
-    segments.push({ argv: seg.argv, class: v.class, allowlisted: v.allowlisted });
+    const planted = i < last ? plantsLinks(seg.argv) : undefined;
+    if (planted !== undefined) {
+      if (severity(v.class) < severity("unknown")) v.class = "unknown";
+      v.allowlisted = false;
+      v.reasons = [...v.reasons, `${planted} and a later segment may follow them (R28)`];
+    }
+    const segReadArgs = v.class === "read-only" || v.class === "local-write" ? extractReadArgs(seg.argv.slice(1)) : [];
+    segments.push({
+      argv: seg.argv,
+      class: v.class,
+      allowlisted: v.allowlisted,
+      pathArgs: [...v.pathArgs],
+      inputPaths: [...v.inputPaths],
+      readArgs: segReadArgs,
+    });
     cls = maxClass(cls, v.class);
     if (isHard(v.class) && (hard === undefined || severity(v.class) > severity(hard))) hard = v.class;
     allowlisted &&= v.allowlisted;
@@ -711,9 +745,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
     for (const r of v.reasons) reasons.push(`segment ${i + 1} (${label}): ${r}`);
     for (const p of v.pathArgs) if (!pathArgs.includes(p)) pathArgs.push(p);
     for (const p of v.inputPaths) if (!inputPaths.includes(p)) inputPaths.push(p);
-    if (v.class === "read-only" || v.class === "local-write") {
-      for (const w of extractReadArgs(seg.argv.slice(1))) if (!readArgs.includes(w)) readArgs.push(w);
-    }
+    for (const w of segReadArgs) if (!readArgs.includes(w)) readArgs.push(w);
   });
   const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, readArgs, allowlisted };
   if (hard !== undefined) result.hardClass = hard;

@@ -11,6 +11,11 @@ export interface PathFacts {
   /** Absolute; realpath of the nearest existing ancestor plus the remaining tail. */
   resolved: string;
   platform: PathPlatform;
+  /**
+   * R28: whether the target existed when the facts were taken (hook time). Undefined means unknown and counts
+   * as not existing where it matters (a later segment of a command may use a path an earlier one creates).
+   */
+  exists?: boolean;
 }
 
 export interface PathContext {

@@ -215,6 +215,14 @@ export const MV_SPEC: OptionSpec = {
   longBool: ["--force", "--interactive", "--no-clobber", "--verbose", "--update", "--no-target-directory"],
   longValue: ["--target-directory", "--suffix"],
 };
+/**
+ * R28: cp options that copy symbolic links as links (recursive copies keep nested links, `-P`/`-d`/
+ * `--no-dereference` keep them, `-s` creates them) unless `-L`/`--dereference` follows every link.
+ */
+export const CP_LINK_PRESERVING_SHORT = "rRadPs";
+export const CP_LINK_PRESERVING_LONG: readonly string[] = ["--recursive", "--archive", "--no-dereference", "--symbolic-link"];
+export const CP_DEREFERENCE_SHORT = "L";
+export const CP_DEREFERENCE_LONG: readonly string[] = ["--dereference"];
 /** Options of cp/mv whose value is a path. */
 export const TARGET_DIRECTORY_OPTIONS: ReadonlySet<string> = new Set(["-t", "--target-directory"]);
 export const RM_SPEC: OptionSpec = {

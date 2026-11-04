@@ -300,6 +300,30 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   if (secretDir) {
     return result("ask", `the command reads a directory that contains secret files: ${secretDir.input}`, { ...base, hardGate: "secrets" });
   }
+  // R28: facts are taken before any segment runs. After a segment that may change the filesystem (write targets,
+  // or any non-read-only class such as `git switch`), a path that does not exist yet may be created by it (a copied
+  // symlink, a checked-out link) and resolve anywhere: the fact's location proves nothing, so ask.
+  const firstMutating = c.segments.findIndex((seg) => seg.class !== "read-only" || seg.pathArgs.length > 0);
+  if (firstMutating >= 0) {
+    const later = c.segments.slice(firstMutating + 1);
+    const laterWrites = new Set(later.flatMap((seg) => seg.pathArgs));
+    const laterReads = new Set(later.flatMap((seg) => [...seg.inputPaths, ...seg.readArgs]));
+    const fresh = (f: PathFacts) => f.exists !== true;
+    const read = action.pathFacts.find((f) => laterReads.has(f.input) && fresh(f));
+    if (read) {
+      return result("ask", `a later segment reads ${read.input}, which does not exist yet and may be created by an earlier segment (R28)`, {
+        ...base,
+        hardGate: "secrets",
+      });
+    }
+    const written = action.pathFacts.find((f) => laterWrites.has(f.input) && fresh(f));
+    if (written) {
+      return result("ask", `a later segment writes ${written.input}, whose location an earlier segment may change (R28)`, {
+        ...base,
+        hardGate: "outside-root-write",
+      });
+    }
+  }
   if (missingInputs.length > 0) {
     return result("ask", `read paths could not be checked for secrets: ${missingInputs.join(", ")}`, { ...base, hardGate: "secrets" });
   }
