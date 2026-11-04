@@ -18,7 +18,7 @@ import type { RouteState } from "../../../core/route/types.ts";
 import { parseMachine, renderMachine, replaceMachine } from "../../../core/task/machine.ts";
 import { currentRoute, setRoute, type LedgerSink } from "./enforce.ts";
 import { canonicalDir, gitFailureText, gitRun, gitRunBytes, hostPlatform, type GitRun, type GitRunBytes } from "./facts.ts";
-import { checkedBase, ROUTE_ENTRY, ROUTE_IO, verifyRegisteredTool, type RouteIo } from "./route-state.ts";
+import { checkedBase, ROUTE_ENTRY, ROUTE_IO, routeEntryData, verifyRegisteredTool, type RouteIo } from "./route-state.ts";
 
 export const TASK_PROGRESS_TOOL = "task_progress";
 /** `git add -A` and `git commit` over a large worktree can take a while; still bounded. */
@@ -391,7 +391,7 @@ export function registerTaskState(pi: TaskPi, deps: TaskStateDeps): TaskStateHan
     if (checked.notice !== undefined) {
       try {
         s.ledger.append({ v: 1, ts: now(), runId: s.runId, type: "route", state: { ...checked.state }, reason: "base reset" });
-        pi.appendEntry(ROUTE_ENTRY, checked.state);
+        pi.appendEntry(ROUTE_ENTRY, routeEntryData(checked.state, s.runId));
       } catch (e) {
         throw new Refusal(`the corrected base could not be recorded (${(e as Error).message})`);
       }

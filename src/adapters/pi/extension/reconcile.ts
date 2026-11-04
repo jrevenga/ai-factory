@@ -99,6 +99,11 @@ export interface ReconcileResult {
   backupRemoved?: boolean;
   /** Proven unused but kept (`removeUnused: false`): the caller removes it once the result is audited. */
   unused?: boolean;
+  /**
+   * Entries that were set aside (their content is in `after*`) but whose backup could not be finished: R39 modes
+   * not applied, or a multiply-linked file not replaced by an independent copy. Each names the copy and the reason.
+   */
+  warnings?: string[];
 }
 
 /** The manifest (`<backupDir>/manifest.json`) and the in-memory snapshot are the same object. */
@@ -594,7 +599,18 @@ function privatizeTree(p: string): void {
     if (st.nlink <= 1) chmodBestEffort(p, FILE_MODE);
     return;
   }
-  const fd = openSync(p, constants.O_RDONLY | NOFOLLOW);
+  let fd: number;
+  try {
+    fd = openSync(p, constants.O_RDONLY | NOFOLLOW);
+  } catch (e) {
+    // An owner-unreadable file (EACCES/EPERM) can still have its mode set by path; lstat said it is a regular file.
+    // A multiply-linked one is left as it is: it cannot be copied, and chmod would change the other links too.
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== "EACCES" && code !== "EPERM") throw e;
+    if (st.nlink > 1) throw new Error(`${p} is unreadable and has other hard links: its mode was left unchanged`, { cause: e });
+    chmodBestEffort(p, FILE_MODE);
+    return;
+  }
   let shared: boolean;
   try {
     const now = fstatSync(fd);
@@ -636,6 +652,7 @@ function chmodBestEffort(p: string, mode: number): void {
 class Restorer {
   readonly result: ReconcileResult;
   private readonly elsewhere: Record<string, string> = {};
+  readonly warnings: string[] = [];
   private readonly s: Snapshot;
   private readonly gitBytes: GitBytes;
   private readonly onOperation: ((op: JournalOp) => void) | undefined;
@@ -719,8 +736,15 @@ class Restorer {
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
     }
-    if (renamed) privatizeTree(dst);
-    else {
+    if (renamed) {
+      // The entry is in `after*` now, whatever happens next: it is journaled and reported as set aside, with a
+      // warning when its backup modes could not be applied (Task 11 minor, carry-forward Task 13).
+      try {
+        privatizeTree(dst);
+      } catch (e) {
+        this.warnings.push(`${rel} (set aside to ${dst}, but its backup could not be finished: ${(e as Error).message})`);
+      }
+    } else {
       copyTree(src, dst);
       rmSync(src, { recursive: true, force: false });
     }
@@ -848,7 +872,9 @@ class Restorer {
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       this.result.notRestored.push(
-        code === "EEXIST" ? `(index) (${lock} exists: another git command holds the index; it was neither checked nor restored)` : `(index) (${(e as Error).message})`,
+        code === "EEXIST"
+          ? `(index) (index not checked: ${lock} exists, held by another git command or left by an interrupted one; the index was neither checked nor restored and the lock was left in place)`
+          : `(index) (${(e as Error).message})`,
       );
       return;
     }
@@ -956,7 +982,11 @@ export function reconcileAfter(root: string, snapshot: Snapshot, opts: Reconcile
         journaled = r.journaled;
       }
       const elsewhere = r.elsewhereMap;
-      return Object.keys(elsewhere).length > 0 ? { ...r.result, elsewhere } : r.result;
+      return {
+        ...r.result,
+        ...(Object.keys(elsewhere).length > 0 ? { elsewhere } : {}),
+        ...(r.warnings.length > 0 ? { warnings: [...r.warnings] } : {}),
+      };
     });
   } catch (e) {
     if (e instanceof Interrupted) throw e.original;
@@ -1058,6 +1088,7 @@ export function reconcileNotes(r: ReconcileResult): string[] {
   if (r.moved.length > 0) sections.push(["moved aside (new files)", r.moved]);
   if (r.notRestored.length > 0) sections.push(["not restored (check these before continuing):", r.notRestored]);
   if (r.skipped.length > 0) sections.push(["not reconciled (skipped):", r.skipped]);
+  if (r.warnings !== undefined && r.warnings.length > 0) sections.push(["set aside with an incomplete backup:", r.warnings]);
   const flags = r.indexRestored ? ["index restored"] : [];
   if (sections.length === 0 && flags.length === 0) return [];
   const removed = r.backupRemoved === true;
@@ -1165,47 +1196,116 @@ export class Reconciler {
     const p = this.pending.get(toolCallId);
     if (p === undefined) return notes;
     this.pending.delete(toolCallId);
-    const backupDir = p.snapshot.backupDir;
-    const auditFailed = (what: string, error: string) => {
-      const message = `the ${what} for answer-route call ${toolCallId} could not be written to the run ledger (${error}); the snapshot, manifest and copies are kept in ${backupDir}`;
-      notes.push(message);
-      diagnose?.(`factory: ${message}`);
-    };
-    let r: ReconcileResult;
-    try {
-      r = reconcileAfter(p.snapshot.root, p.snapshot, { removeUnused: false });
-    } catch (e) {
-      const message = `reconciliation of answer-route call ${toolCallId} failed (${(e as Error).message}); the snapshot and copies are in ${backupDir}: check the working tree before continuing`;
-      notes.push(message);
-      diagnose?.(`factory: ${message}`);
-      const err = append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile", message });
-      if (err !== undefined) auditFailed("error event", err);
-      return notes;
-    }
-    const remove = r.unused === true;
-    const err = append(ledger, {
-      v: 1,
-      ts: new Date().toISOString(),
-      runId,
-      type: "reconciled",
-      toolCallId,
-      reverted: r.reverted,
-      moved: r.moved,
-      backupDir,
-      ...(r.notRestored.length > 0 ? { notRestored: r.notRestored } : {}),
-      ...(r.skipped.length > 0 ? { skipped: r.skipped } : {}),
-      ...(r.indexRestored ? { indexRestored: true } : {}),
-      ...(remove ? { backupRemoved: true } : {}),
-    });
-    if (err === undefined && remove) {
-      // The audit says the backup was redundant; only now is it removed.
-      rmSync(backupDir, { recursive: true, force: true });
-      r = { ...r, backupRemoved: true };
-    }
-    notes.push(...reconcileNotes(r));
-    if (err !== undefined) auditFailed("reconciled event", err);
+    notes.push(...reconcileAudited(toolCallId, p.snapshot, ledger, runId, diagnose));
     return notes;
   }
+}
+
+/**
+ * Reconciles `snapshot` (kept on disk: `removeUnused: false`), audits the result as a `reconciled` event and returns
+ * the note blocks. A backup proven unused is removed only once that event is in the ledger; a failed reconcile or
+ * audit keeps everything and is reported (notes and `diagnose`).
+ */
+function reconcileAudited(toolCallId: string, snapshot: Snapshot, ledger: Sink, runId: string, diagnose: Diagnose | undefined): string[] {
+  const notes: string[] = [];
+  const backupDir = snapshot.backupDir;
+  const auditFailed = (what: string, error: string) => {
+    const message = `the ${what} for answer-route call ${toolCallId} could not be written to the run ledger (${error}); the snapshot, manifest and copies are kept in ${backupDir}`;
+    notes.push(message);
+    diagnose?.(`factory: ${message}`);
+  };
+  let r: ReconcileResult;
+  try {
+    r = reconcileAfter(snapshot.root, snapshot, { removeUnused: false });
+  } catch (e) {
+    const message = `reconciliation of answer-route call ${toolCallId} failed (${(e as Error).message}); the snapshot and copies are in ${backupDir}: check the working tree before continuing`;
+    notes.push(message);
+    diagnose?.(`factory: ${message}`);
+    const err = append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile", message });
+    if (err !== undefined) auditFailed("error event", err);
+    return notes;
+  }
+  const remove = r.unused === true;
+  const err = append(ledger, {
+    v: 1,
+    ts: new Date().toISOString(),
+    runId,
+    type: "reconciled",
+    toolCallId,
+    reverted: r.reverted,
+    moved: r.moved,
+    backupDir,
+    ...(r.notRestored.length > 0 ? { notRestored: r.notRestored } : {}),
+    ...(r.skipped.length > 0 ? { skipped: r.skipped } : {}),
+    ...(r.warnings !== undefined && r.warnings.length > 0 ? { warnings: r.warnings } : {}),
+    ...(r.indexRestored ? { indexRestored: true } : {}),
+    ...(remove ? { backupRemoved: true } : {}),
+  });
+  if (err === undefined && remove) {
+    // The audit says the backup was redundant; only now is it removed.
+    rmSync(backupDir, { recursive: true, force: true });
+    r = { ...r, backupRemoved: true };
+  }
+  notes.push(...reconcileNotes(r));
+  if (err !== undefined) auditFailed("reconciled event", err);
+  return notes;
+}
+
+/** What a startup replay did with one `reconcile/<name>` directory of an interrupted run. */
+export interface ReplayOutcome {
+  dir: string;
+  /** `replayed`: a pending or reconciling manifest was finished; `removed`: an interrupted snapshot without manifest. */
+  kind: "replayed" | "removed" | "kept";
+  notes: string[];
+}
+
+/**
+ * Task 13: finishes the answer-route reconciliations an interrupted run (SIGKILL, crash) left in `<runDir>/reconcile/`.
+ * A manifest with status `pending` (the runner may have run; nothing was reverted yet) or `reconciling` (a reconcile
+ * was cut short; `journal.jsonl` holds its completed operations, which the result includes) is finished with
+ * `loadSnapshot` + `reconcileAfter` and audited in `ledger` under `runId` (the run that replays it). `after*` content
+ * is never removed. A directory without a manifest is a snapshot that never completed, so its runner never ran: it is
+ * removed, unless it holds a journal or `after*` content (then it is kept and reported). `done` manifests are left.
+ * A stale `index.lock` (from a git command, or from a reconcile killed while it held the lock) is reported as "index
+ * not checked" and never removed. Call it only for a run this process claimed (`ledger.reconcile`).
+ */
+export function replayInterrupted(runDir: string, ledger: Sink, runId: string, diagnose?: Diagnose): ReplayOutcome[] {
+  const base = path.join(runDir, "reconcile");
+  let names: string[];
+  try {
+    names = readdirSync(base).sort();
+  } catch {
+    return [];
+  }
+  const out: ReplayOutcome[] = [];
+  for (const name of names) {
+    const dir = path.join(base, name);
+    if (kindOf(dir) !== "dir") continue;
+    if (kindOf(path.join(dir, MANIFEST_FILE)) === "missing") {
+      if (kindOf(path.join(dir, JOURNAL_FILE)) === "missing" && !hasAfterContent(dir)) {
+        rmSync(dir, { recursive: true, force: true });
+        out.push({ dir, kind: "removed", notes: [] });
+      } else {
+        const message = `${dir} holds reconcile copies but no manifest: it was kept; check it before continuing`;
+        diagnose?.(`factory: ${message}`);
+        out.push({ dir, kind: "kept", notes: [message] });
+      }
+      continue;
+    }
+    let snapshot: Snapshot;
+    try {
+      snapshot = loadSnapshot(dir);
+    } catch (e) {
+      const message = `the reconcile manifest in ${dir} cannot be read (${(e as Error).message}): it was kept; check the working tree before continuing`;
+      diagnose?.(`factory: ${message}`);
+      append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile-replay", message });
+      out.push({ dir, kind: "kept", notes: [message] });
+      continue;
+    }
+    if (snapshot.status !== "pending" && snapshot.status !== "reconciling") continue;
+    out.push({ dir, kind: "replayed", notes: reconcileAudited(name, snapshot, ledger, runId, diagnose) });
+  }
+  return out;
 }
 
 /** Appends the event; the error message when the ledger refused it. */

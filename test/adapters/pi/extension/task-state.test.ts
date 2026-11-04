@@ -505,7 +505,7 @@ describe("task_progress on feature/project routes", () => {
     expect(r.isError).not.toBe(true);
     expect(r.content[0]?.text).toMatch(/base/);
     expect(machineOf(x.taskFile).base).toBe(x.base);
-    expect(x.entries.at(-1)).toEqual({ customType: ROUTE_ENTRY, data: { ...x.feature, base: x.base } });
+    expect(x.entries.at(-1)).toEqual({ customType: ROUTE_ENTRY, data: { ...x.feature, base: x.base, runId: RUN_ID } });
     expect(x.events.some((e) => e.type === "route")).toBe(true);
   });
 

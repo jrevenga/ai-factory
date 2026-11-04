@@ -489,6 +489,12 @@
             "type": "string"
           }
         },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "indexRestored": {
           "type": "boolean"
         },

@@ -1,0 +1,104 @@
+// Startup recovery (Phase 2 Task 13, acceptance 2). Before the new run's `run_start` is written, the project's run
+// ledger is reconciled: runs that ended without `run_end` while their process is gone are marked `run_interrupted`
+// (claimed once per project, ledger.ts) and this Pi session's own interrupted earlier run is found independently of
+// that claim (review M5), so a continued session restores its route flagged (ruling 20). The new run records the runs
+// it resumed (`run_start.resumedFrom`); answer-route reconciliations the claimed runs left pending are finished
+// (reconcile.ts `replayInterrupted`); and the next agent run gets one prompt section naming each interrupted task's
+// phase and last checkpoint.
+import { join } from "node:path";
+import type { RunEvent } from "../../../core/ledger/events.ts";
+import { ledgerDirFor, reconcile, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
+import { replayInterrupted, type Diagnose } from "./reconcile.ts";
+import { ROUTE_ENTRY } from "./route-state.ts";
+
+/** Key of the resume section in `systemPromptOptions.sections`. */
+export const RESUME_SECTION_KEY = "factory-resume";
+
+/** The resume line for an interrupted run with a task; undefined when the run had no task. */
+export function resumeLine(run: InterruptedRun): string | undefined {
+  const taskId = run.lastProgress?.taskId ?? run.lastCheckpoint?.taskId ?? run.route?.taskId;
+  if (taskId === undefined) return undefined;
+  const phase = run.lastProgress?.taskId === taskId ? run.lastProgress.phase : undefined;
+  const sha = run.lastCheckpoint?.taskId === taskId ? run.lastCheckpoint.sha : undefined;
+  return `Interrupted factory run ${run.runId}: task ${taskId}, phase ${phase ?? "unknown"}, last checkpoint ${sha ?? "none"}. Resume from the checkpoint; re-declare the route with set_route.`;
+}
+
+/** `runId` of the session branch's last `factory-route` entry (stored since Task 13), when it has one. */
+export function lastRouteEntryRunId(entries: readonly unknown[]): string | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as { type?: unknown; customType?: unknown; data?: unknown } | null;
+    if (e?.type === "custom" && e.customType === ROUTE_ENTRY) {
+      const runId = (e.data as { runId?: unknown } | null | undefined)?.runId;
+      return typeof runId === "string" ? runId : undefined;
+    }
+  }
+  return undefined;
+}
+
+export interface RecoveryInput {
+  factoryHome: string;
+  projectId: string;
+  /** The new run's id (its ledger does not exist yet). */
+  runId: string;
+  piSession?: string;
+  /** The Pi session branch (oldest first), for the last route entry's run. */
+  entries: readonly unknown[];
+  isAlive(pid: number): boolean;
+}
+
+export interface Recovery {
+  /** Runs this session picked up: claimed interrupted runs of the project and this session's own interrupted run. */
+  resumedFrom: string[];
+  /** This Pi session's previous run was interrupted: the restored route starts flagged (ruling 20). */
+  sessionInterrupted: boolean;
+  /** Runs claimed here (marked `run_interrupted` by this run): their pending reconciliations are replayed by this run. */
+  claimed: InterruptedRun[];
+  /** One line per interrupted run with a task. */
+  lines: string[];
+  /** Interrupted runs whose ledger could not be read (reported, not marked). */
+  errors: string[];
+}
+
+/** Marks and finds the interrupted runs before `run_start` is written. Throws only when the ledger dir is unusable. */
+export function recoverRuns(input: RecoveryInput): Recovery {
+  const found = reconcile(input.factoryHome, input.projectId, input.runId, input.isAlive);
+  const routeRunId = lastRouteEntryRunId(input.entries);
+  const own = sessionInterruptedRuns(
+    input.factoryHome,
+    input.projectId,
+    input.runId,
+    { ...(input.piSession !== undefined ? { piSession: input.piSession } : {}), ...(routeRunId !== undefined ? { routeRunId } : {}) },
+    input.isAlive,
+  );
+  const claimed = found.filter((r) => r.error === undefined);
+  const errors = [...found, ...own].filter((r) => r.error !== undefined).map((r) => `factory: the run ledger of ${r.runId} cannot be read (${r.error})`);
+  const byId = new Map<string, InterruptedRun>();
+  for (const r of [...claimed, ...own.filter((o) => o.error === undefined)]) if (!byId.has(r.runId)) byId.set(r.runId, r);
+  const runs = [...byId.values()].sort((a, b) => a.runId.localeCompare(b.runId));
+  const lines = runs.map(resumeLine).filter((l): l is string => l !== undefined);
+  return { resumedFrom: runs.map((r) => r.runId), sessionInterrupted: own.length > 0, claimed, lines, errors: [...new Set(errors)] };
+}
+
+interface Sink {
+  append(e: RunEvent): void;
+}
+
+/**
+ * After `run_start`: finishes the answer-route reconciliations the claimed runs left behind, audited in this run's
+ * ledger. Returns one note per replayed or kept directory, prefixed with the interrupted run's id.
+ */
+export function replayClaimed(recovery: Recovery, factoryHome: string, projectId: string, ledger: Sink, runId: string, diagnose?: Diagnose): string[] {
+  const dir = ledgerDirFor(factoryHome, projectId);
+  const notes: string[] = [];
+  for (const run of recovery.claimed) {
+    for (const outcome of replayInterrupted(join(dir, run.runId), ledger, runId, diagnose)) {
+      for (const n of outcome.notes) notes.push(`Interrupted factory run ${run.runId}: ${n}`);
+    }
+  }
+  return notes;
+}
+
+/** The prompt section for the next agent run; undefined when there is nothing to tell. */
+export function resumeSection(lines: readonly string[]): string | undefined {
+  return lines.length === 0 ? undefined : lines.join("\n");
+}

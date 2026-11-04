@@ -7,8 +7,10 @@ import {
   loadSnapshot,
   MANIFEST_FILE,
   reconcileAfter,
+  JOURNAL_FILE,
   reconcileNote,
   Reconciler,
+  replayInterrupted,
   takeSnapshot,
   UNTRACKED_LIMITS,
   type Snapshot,
@@ -618,5 +620,126 @@ describe("fix round 1", () => {
     expect(statSync(copy).mode & 0o777).toBe(0o600);
     expect(statSync(copy).nlink).toBe(1);
     expect(read(copy)).toBe("outside\n");
+  });
+});
+
+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+describe("Task 13: privatizeTree failures after a successful rename (Task 11 minor)", () => {
+  it.skipIf(isWin || isRoot)("an owner-unreadable new file is moved aside, journaled and reported as moved, with the 0600 backup mode", async () => {
+    const r = await repo();
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    const secret = join(r.root, "unreadable.txt");
+    writeFileSync(secret, "only copy\n");
+    chmodSync(secret, 0o000);
+    const res = reconcileAfter(r.root, snap);
+    expect(res.notRestored).toEqual([]);
+    expect(res.moved).toEqual(["unreadable.txt"]);
+    expect(res.warnings).toBeUndefined();
+    const copy = join(bd, "after", "unreadable.txt");
+    expect(statSync(copy).mode & 0o777).toBe(0o600);
+    expect(read(copy)).toBe("only copy\n");
+    expect(read(join(bd, JOURNAL_FILE))).toContain('"op":"moved","path":"unreadable.txt"');
+  });
+
+  it.skipIf(isWin || isRoot)("when the backup cannot be finished (unreadable and hard-linked) the entry is still reported as moved and journaled, with a warning naming the copy", async () => {
+    const r = await repo();
+    mkdirSync(join(r.root, "dist"));
+    const ignored = join(r.root, "dist", "locked.bin");
+    writeFileSync(ignored, "ignored\n");
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    linkSync(ignored, join(r.root, "linked.bin"));
+    chmodSync(ignored, 0o000);
+    try {
+      const res = reconcileAfter(r.root, snap);
+      const copy = join(bd, "after", "linked.bin");
+      expect(res.moved).toEqual(["linked.bin"]);
+      expect(res.notRestored).toEqual([]);
+      expect(res.warnings).toEqual([expect.stringContaining(`linked.bin (set aside to ${copy}, but its backup could not be finished`)]);
+      expect(reconcileNote(res)).toContain("set aside with an incomplete backup:");
+      expect(read(join(bd, JOURNAL_FILE))).toContain('"op":"moved","path":"linked.bin"');
+      // The other link keeps its mode: nothing was chmodded through the shared inode.
+      expect(statSync(ignored).mode & 0o777).toBe(0o000);
+      expect(existsSync(join(r.root, "linked.bin"))).toBe(false);
+    } finally {
+      chmodSync(ignored, 0o644);
+    }
+  });
+});
+
+describe("Task 13: replayInterrupted (startup replay of an interrupted run's reconciles)", () => {
+  const sink = () => {
+    const events: RunEvent[] = [];
+    return { events, ledger: { append: (e: RunEvent) => void events.push(RunEvent.parse(e)) } };
+  };
+
+  it("a reconciling manifest is finished: journaled operations are merged and after/ content is kept", async () => {
+    const r = await repo();
+    const bd = join(r.runDir, "reconcile", "call-a");
+    const snap = takeSnapshot(r.root, bd);
+    writeFileSync(join(r.root, "new.txt"), "only copy\n");
+    writeFileSync(join(r.root, "src", "a.txt"), "runner\n");
+    let ops = 0;
+    expect(() =>
+      reconcileAfter(r.root, snap, {
+        onOperation: () => {
+          if (++ops === 1) throw new Error("killed");
+        },
+      }),
+    ).toThrow("killed");
+    expect(loadSnapshot(bd).status).toBe("reconciling");
+    const s = sink();
+    const out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(out.map((o) => [o.kind, o.dir])).toEqual([["replayed", bd]]);
+    expect(s.events).toEqual([expect.objectContaining({ type: "reconciled", toolCallId: "call-a", moved: ["new.txt"], reverted: ["src/a.txt"] })]);
+    expect(read(join(bd, "after", "new.txt"))).toBe("only copy\n");
+    expect(read(join(r.root, "src", "a.txt"))).toBe("a original\n");
+    expect(loadSnapshot(bd).status).toBe("done");
+    // Done manifests are left alone on a later replay.
+    expect(replayInterrupted(r.runDir, s.ledger, "20261104T130000Z-9")).toEqual([]);
+  });
+
+  it("a pending manifest whose runner changed nothing is audited and its redundant backup removed", async () => {
+    const r = await repo();
+    const bd = join(r.runDir, "reconcile", "call-b");
+    takeSnapshot(r.root, bd);
+    const s = sink();
+    const out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(out).toEqual([{ dir: bd, kind: "replayed", notes: [] }]);
+    expect(s.events).toEqual([expect.objectContaining({ type: "reconciled", toolCallId: "call-b", backupRemoved: true })]);
+    expect(existsSync(bd)).toBe(false);
+  });
+
+  it("a snapshot dir without manifest is removed unless it holds after*/journal content, which is kept and reported", async () => {
+    const r = await repo();
+    const base = join(r.runDir, "reconcile");
+    mkdirSync(join(base, "torn", "before"), { recursive: true });
+    mkdirSync(join(base, "odd", "after"), { recursive: true });
+    writeFileSync(join(base, "odd", "after", "x"), "keep\n");
+    const s = sink();
+    const out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(out.map((o) => [o.kind, o.dir])).toEqual([
+      ["kept", join(base, "odd")],
+      ["removed", join(base, "torn")],
+    ]);
+    expect(existsSync(join(base, "torn"))).toBe(false);
+    expect(read(join(base, "odd", "after", "x"))).toBe("keep\n");
+  });
+
+  it("a stale index.lock left by a SIGKILL is reported as index not checked and left in place", async () => {
+    const r = await repo();
+    const bd = join(r.runDir, "reconcile", "call-c");
+    takeSnapshot(r.root, bd);
+    git(r.root, "update-index", "--add", "--cacheinfo", `100644,${git(r.root, "rev-parse", "HEAD:README.md")},staged.txt`);
+    const lock = join(r.root, ".git", "index.lock");
+    writeFileSync(lock, "");
+    const s = sink();
+    const [out] = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(out?.notes.join("\n")).toContain("index not checked");
+    expect(s.events[0]).toMatchObject({ type: "reconciled", notRestored: [expect.stringContaining("index not checked")] });
+    expect(existsSync(lock)).toBe(true);
+    expect(existsSync(bd)).toBe(true);
   });
 });

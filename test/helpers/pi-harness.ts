@@ -135,6 +135,100 @@ export function runPiPrint(opts: PiPrintOptions): Promise<RunResult> {
   });
 }
 
+/** A session-capable print run: `--session-dir <dir>` (never `--no-session`) and, for `continue`, `--continue`. */
+export type PiSessionOptions = PiPrintOptions & { sessionDir: string; continue?: boolean };
+
+function sessionArgs(opts: PiSessionOptions): PiPrintOptions {
+  return { ...opts, args: [...(opts.continue === true ? ["--continue"] : []), ...(opts.args ?? [])] };
+}
+
+/** `runPiPrint` with a real session dir, so a later run can continue the session (Task 13). */
+export function runPiSession(opts: PiSessionOptions): Promise<RunResult> {
+  return runPiPrint(sessionArgs(opts));
+}
+
+export interface SpawnedPi {
+  readonly child: ChildProcess;
+  /** Resolves once the leader has exited. */
+  readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  stdout(): string;
+  stderr(): string;
+}
+
+/**
+ * The same print-mode session run as `runPiSession`, but returned while it runs so a test can kill it. Stdin is
+ * closed; on POSIX the child leads its own process group (detached) so the whole tree can be killed at once.
+ * The caller must end it with `killPiHard` (or wait for `exited`).
+ */
+export function spawnPiSession(opts: PiSessionOptions): SpawnedPi {
+  const o = sessionArgs(opts);
+  const env = piPrintEnv(o.agentDir, o.env);
+  const args = [o.cli, "-p", "--session-dir", o.sessionDir!];
+  for (const e of o.extensions) args.push("-e", e);
+  args.push(...(o.args ?? []), "--model", o.model ?? "factory-test/faux", o.prompt ?? "go");
+  const child = spawn(process.execPath, args, {
+    cwd: o.cwd,
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: false,
+    detached: process.platform !== "win32",
+    windowsHide: true,
+  });
+  child.stdin!.on("error", () => undefined);
+  child.stdin!.end();
+  let stdout = "";
+  let stderr = "";
+  child.stdout!.setEncoding("utf8").on("data", (d: string) => (stdout += d));
+  child.stderr!.setEncoding("utf8").on("data", (d: string) => (stderr += d));
+  const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve({ code: child.exitCode, signal: child.signalCode });
+    else child.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  return { child, exited, stdout: () => stdout, stderr: () => stderr };
+}
+
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Kills a spawned Pi without a graceful signal, so no shutdown handler runs (Pi 1.4.0 print mode turns SIGTERM
+ * into a clean `session_shutdown`): POSIX `SIGKILL` to the detached process group, then waits until the group is
+ * gone; Windows `taskkill /PID <pid> /T /F` (killProcessTree, which is forced there). Bounded; leaves no orphans.
+ */
+export async function killPiHard(p: SpawnedPi, timeoutMs = 15_000): Promise<void> {
+  const pid = p.child.pid;
+  if (pid === undefined) return;
+  if (process.platform === "win32") {
+    await killProcessTree(p.child);
+  } else {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      // The group is already gone.
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (groupAlive(pid)) {
+      if (Date.now() > deadline) throw new Error(`process group ${pid} still alive ${timeoutMs} ms after SIGKILL`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  const first = await Promise.race([p.exited, late]);
+  clearTimeout(timer);
+  if (first === "timeout") throw new Error(`pi ${pid} did not report its exit ${timeoutMs} ms after the kill`);
+  p.child.stdout?.destroy();
+  p.child.stderr?.destroy();
+}
+
 export type RpcRecord = { type: string } & Record<string, unknown>;
 
 /** Returned by `startPiRpc`'s `onUiRequest` to leave an extension dialog unanswered. */

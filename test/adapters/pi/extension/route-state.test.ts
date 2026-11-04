@@ -335,7 +335,8 @@ describe("registerRouteState (set_route tool, reclassification, prompt)", () => 
     expect(r.isError).not.toBe(true);
     expect(r.content).toEqual([{ type: "text", text: "Route: small — fix a typo" }]);
     expect(currentRoute()).toEqual(small(x.w.project));
-    expect(x.entries).toEqual([{ customType: ROUTE_ENTRY, data: small(x.w.project) }]);
+    // Task 13 (review M5): the entry names the run that wrote it.
+    expect(x.entries).toEqual([{ customType: ROUTE_ENTRY, data: { ...small(x.w.project), runId: "20261104T100000Z-1" } }]);
     expect(x.events).toHaveLength(1);
     expect(x.events[0]).toMatchObject({ type: "route", reason: "set_route", state: small(x.w.project) });
   });
@@ -368,7 +369,7 @@ describe("registerRouteState (set_route tool, reclassification, prompt)", () => 
     const long = `actually delete the database ${TOKEN} ${"y".repeat(800)}`;
     await x.user([{ type: "text", text: long }]);
     expect(currentRoute()).toEqual(small(x.w.project, { needsReclassification: true }));
-    expect(x.entries.at(-1)).toEqual({ customType: ROUTE_ENTRY, data: small(x.w.project, { needsReclassification: true }) });
+    expect(x.entries.at(-1)).toEqual({ customType: ROUTE_ENTRY, data: { ...small(x.w.project, { needsReclassification: true }), runId: "20261104T100000Z-1" } });
     const ev = x.events.at(-1) as { type: string; reason?: string; input?: string; state: Record<string, unknown> };
     expect(ev).toMatchObject({ type: "route", reason: "user input consumed", state: { needsReclassification: true } });
     expect(ev.input).not.toContain(TOKEN);

@@ -241,20 +241,93 @@ export function reconcile(factoryHome: string, projectId: string, selfRunId: str
 
     if (!claim(join(dir, runId, CLAIM_FILE), selfRunId)) continue;
 
-    const run: InterruptedRun = { runId };
-    for (const e of events) {
-      if (e.type === "progress") {
-        run.lastProgress = { taskId: e.taskId, ...(e.phase !== undefined ? { phase: e.phase } : {}), ...(e.item !== undefined ? { item: e.item } : {}) };
-      } else if (e.type === "checkpoint") {
-        run.lastCheckpoint = { taskId: e.taskId, sha: e.sha };
-      } else if (e.type === "route") {
-        const route = asRouteState(e.state);
-        if (route) run.route = route;
-        else delete run.route;
-      }
-    }
+    const run = summarize(runId, events);
     ledger.append({ v: 1, ts: new Date().toISOString(), runId, type: "run_interrupted", detectedBy: selfRunId });
     found.push(run);
+  }
+  return found;
+}
+
+/** The last progress, checkpoint and route of a run's events. */
+function summarize(runId: string, events: RunEvent[]): InterruptedRun {
+  const run: InterruptedRun = { runId };
+  for (const e of events) {
+    if (e.type === "progress") {
+      run.lastProgress = { taskId: e.taskId, ...(e.phase !== undefined ? { phase: e.phase } : {}), ...(e.item !== undefined ? { item: e.item } : {}) };
+    } else if (e.type === "checkpoint") {
+      run.lastCheckpoint = { taskId: e.taskId, sha: e.sha };
+    } else if (e.type === "route") {
+      const route = asRouteState(e.state);
+      if (route) run.route = route;
+      else delete run.route;
+    }
+  }
+  return run;
+}
+
+/** A run id as `runIdFor` makes it (`<yyyymmddThhmmssZ>-<pid>`): anything else read from a session entry is ignored. */
+const RUN_ID = /^\d{8}T\d{6}Z-\d+$/;
+
+/** The `piSession` of a run's `run_start` (its first event), read from the first line only. */
+function piSessionOf(file: string): string | undefined {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+  const nl = text.indexOf("\n");
+  try {
+    const first = parseRunEvent(JSON.parse(nl === -1 ? text : text.slice(0, nl)));
+    return first.known && first.event.type === "run_start" ? first.event.piSession : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Review M5 (Task 8, carry-forward Task 13): the interrupted earlier runs of *this* Pi session, independent of the
+ * `interrupted.claim` marker (another session in the project may have claimed and reported them first). Two runs
+ * are checked: the latest earlier run whose `run_start.piSession` is `piSession`, and `routeRunId`, the run that
+ * wrote the session branch's last `factory-route` entry (when it names a run of this project). Either one counts
+ * as interrupted when it has no `run_end` and is marked `run_interrupted` or its pid is not alive; an unreadable
+ * ledger counts as interrupted too (the caller only flags the route, which fails safe). Nothing is written.
+ */
+export function sessionInterruptedRuns(
+  factoryHome: string,
+  projectId: string,
+  selfRunId: string,
+  opts: { piSession?: string; routeRunId?: string },
+  isAlive: (pid: number) => boolean,
+): InterruptedRun[] {
+  const dir = ledgerDirFor(factoryHome, projectId);
+  if (!existsSync(dir)) return [];
+  const runIds = readdirSync(dir, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && d.name !== selfRunId && RUN_ID.test(d.name))
+    .map((d) => d.name)
+    .sort();
+  const candidates = new Set<string>();
+  if (opts.piSession !== undefined && opts.piSession !== "") {
+    const latest = runIds.filter((r) => piSessionOf(new RunLedger(dir, r).file) === opts.piSession).at(-1);
+    if (latest !== undefined) candidates.add(latest);
+  }
+  if (opts.routeRunId !== undefined && RUN_ID.test(opts.routeRunId) && runIds.includes(opts.routeRunId)) candidates.add(opts.routeRunId);
+  const found: InterruptedRun[] = [];
+  for (const runId of [...candidates].sort()) {
+    const file = new RunLedger(dir, runId).file;
+    if (!existsSync(file)) continue;
+    let events: RunEvent[];
+    try {
+      events = RunLedger.read(file);
+    } catch (e) {
+      found.push({ runId, error: (e as Error).message });
+      continue;
+    }
+    if (events.some((e) => e.type === "run_end")) continue;
+    const marked = events.some((e) => e.type === "run_interrupted");
+    const pid = pidOf(runId, events);
+    if (!marked && pid !== undefined && isAlive(pid)) continue;
+    found.push(summarize(runId, events));
   }
   return found;
 }

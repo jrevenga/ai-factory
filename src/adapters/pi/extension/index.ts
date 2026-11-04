@@ -7,7 +7,9 @@
 // of the session branch (route-state.ts), registers `task_progress` (task-state.ts) and the evidence tools `run_check`,
 // `record_review` and `record_decision` (evidence.ts), and enforces the GatePolicy on every tool call (enforce.ts);
 // allowlisted runners on the answer route are snapshotted before they run and reconciled at their `tool_result`
-// (reconcile.ts, Task 11); `run_end` is written at session_shutdown.
+// (reconcile.ts, Task 11); `run_end` is written at session_shutdown. Before `run_start`, interrupted runs of the project
+// are marked and this session's own interrupted run is found (resume.ts, Task 13): the restored route then starts
+// flagged, the claimed runs' pending reconciliations are finished, and the next agent run gets a resume section.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -36,6 +38,7 @@ import { registerEvidence, type EvidenceSession } from "./evidence.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
 import { Reconciler } from "./reconcile.ts";
+import { recoverRuns, replayClaimed, RESUME_SECTION_KEY, resumeSection } from "./resume.ts";
 import { registerRouteState, type RouteSession } from "./route-state.ts";
 import { storeWritable } from "./store-probe.ts";
 import { registerTaskState, type TaskSession } from "./task-state.ts";
@@ -107,6 +110,21 @@ async function runHandshake(env: NodeJS.ProcessEnv = process.env): Promise<Hands
   return { result, personal: personal.ok ? personal.config : undefined };
 }
 
+/** process.kill(pid, 0): EPERM means the pid exists (another user's process). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function warn(ctx: ExtensionContext, message: string): void {
+  if (ctx.hasUI) ctx.ui.notify(message, "warning");
+  else process.stderr.write(`${message}\n`);
+}
+
 function report(ctx: ExtensionContext, message: string): void {
   // Print and JSON modes have no UI (Pi docs/extensions.md); stderr keeps stdout clean there.
   if (ctx.hasUI) ctx.ui.notify(message, "error");
@@ -136,6 +154,10 @@ interface Session {
   gatedChecks: GatedChecks;
   /** Task 11: answer-route runner snapshots (`<runDir>/reconcile/<toolCallId>`). */
   reconciler: Reconciler;
+  /** Task 13: this Pi session's previous run was interrupted (the restored route starts flagged, ruling 20). */
+  sessionInterrupted: boolean;
+  /** Task 13: what startup recovery tells the person and, once, the next agent run (cleared when injected). */
+  resume: { messages: string[]; section?: string };
 }
 
 function within(child: string, parent: string): boolean {
@@ -221,6 +243,9 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
   const projectId = projectIdFor(projectRoot, sha256hex);
   const runId = runIdFor(new Date(), process.pid);
   const ledger = new RunLedger(ledgerDirFor(factoryHome, projectId), runId);
+  const piSession = ctx.sessionManager.getSessionId();
+  // Task 13: interrupted runs are marked and this session's own one is found before this run's `run_start` exists.
+  const recovery = recoverRuns({ factoryHome, projectId, runId, piSession, entries: ctx.sessionManager.getBranch(), isAlive: pidAlive });
   ledger.append({
     v: 1,
     ts: new Date().toISOString(),
@@ -230,8 +255,11 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     projectId,
     projectRoot,
     factoryVersion: version,
-    piSession: ctx.sessionManager.getSessionId(),
+    piSession,
+    ...(recovery.resumedFrom.length > 0 ? { resumedFrom: recovery.resumedFrom } : {}),
   });
+  const replayNotes = replayClaimed(recovery, factoryHome, projectId, ledger, runId);
+  const section = resumeSection([...recovery.lines, ...replayNotes]);
   return {
     ledger,
     runId,
@@ -251,6 +279,8 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     inFlight: new InFlightCalls(),
     gatedChecks: new GatedChecks(),
     reconciler: new Reconciler(dirname(ledger.file)),
+    sessionInterrupted: recovery.sessionInterrupted,
+    resume: { messages: [...recovery.errors, ...recovery.lines, ...replayNotes], ...(section !== undefined ? { section } : {}) },
   };
 }
 
@@ -335,8 +365,9 @@ export default function factoryExtension(pi: ExtensionAPI): void {
       try {
         const session = openSession(ctx, personal, result.version);
         verifyTools();
-        // Task 13 passes `interrupted: true` when reconciliation finds this session's previous run interrupted.
-        routes.restore(routeSession(session), ctx, { interrupted: false });
+        // Ruling 20 / review M5: a route restored after this session's interrupted run starts flagged.
+        routes.restore(routeSession(session), ctx, { interrupted: session.sessionInterrupted });
+        for (const m of session.resume.messages) warn(ctx, m);
         return { handshake: result, session };
       } catch (e) {
         const sessionError = (e as Error).message;
@@ -349,6 +380,20 @@ export default function factoryExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     await start(ctx);
+  });
+
+  // Task 13: the resume section goes into the next agent run only (sections are mutated, never replaced; A §7.2).
+  pi.on("before_agent_start", async (event) => {
+    const session = await sessionNow();
+    if (session === undefined) return undefined;
+    const section = session.resume.section;
+    if (section !== undefined) {
+      event.systemPromptOptions.sections[RESUME_SECTION_KEY] = section;
+      delete session.resume.section;
+    } else {
+      delete event.systemPromptOptions.sections[RESUME_SECTION_KEY];
+    }
+    return undefined;
   });
 
   pi.on("tool_call", async (event, ctx) => {

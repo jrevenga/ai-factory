@@ -24,6 +24,14 @@ import { asRouteState } from "./ledger.ts";
 
 /** Custom session entry type holding the route state (`pi.appendEntry`). */
 export const ROUTE_ENTRY = "factory-route";
+/**
+ * The data of a `factory-route` entry: the route state and the run that wrote it (Task 13, review M5: the next start
+ * checks whether that run was interrupted). `restoreRoute` re-validates the state and ignores `runId`.
+ */
+export function routeEntryData(state: RouteState, runId: string): RouteState & { runId: string } {
+  return { ...state, runId };
+}
+
 /** Key of the routing rule in `systemPromptOptions.sections` (rendered as a tag of this name). */
 export const ROUTING_SECTION_KEY = "factory-routing";
 export const SET_ROUTE_TOOL = "set_route";
@@ -297,7 +305,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       // Audited and persisted before it takes effect: a route change that cannot be recorded is not made.
       try {
         routeEvent(s, next, "set_route");
-        pi.appendEntry(ROUTE_ENTRY, next);
+        pi.appendEntry(ROUTE_ENTRY, routeEntryData(next, s.runId));
       } catch (e) {
         return toolResult(`set_route failed: the route change could not be recorded (${(e as Error).message})`, currentRoute(), true);
       }
@@ -324,7 +332,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       process.stderr.write(`factory: could not audit the consumed user message: ${(e as Error).message}\n`);
     }
     try {
-      pi.appendEntry(ROUTE_ENTRY, next);
+      pi.appendEntry(ROUTE_ENTRY, routeEntryData(next, s.runId));
     } catch (e) {
       // Review M3: the session entry would restore unflagged; the ledger keeps the flag and this error.
       const message = `could not persist the flagged route as a session entry: ${(e as Error).message}`;
@@ -364,7 +372,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       warn(ctx, r.notice);
       try {
         s.ledger.append({ v: 1, ts: new Date().toISOString(), runId: s.runId, type: "error", where: "route-restore", message: r.notice });
-        pi.appendEntry(ROUTE_ENTRY, r.state);
+        pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId));
       } catch (e) {
         process.stderr.write(`factory: could not record the route restore: ${(e as Error).message}\n`);
       }
@@ -372,7 +380,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
     if (!r.restored) return;
     try {
       routeEvent(s, r.state, "restored from session");
-      if (opts.interrupted && r.notice === undefined) pi.appendEntry(ROUTE_ENTRY, r.state);
+      if (opts.interrupted && r.notice === undefined) pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId));
     } catch (e) {
       process.stderr.write(`factory: could not record the restored route: ${(e as Error).message}\n`);
     }

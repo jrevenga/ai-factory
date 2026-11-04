@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ledgerDirFor, reconcile, RunLedger } from "../../../../src/adapters/pi/extension/ledger.ts";
+import { ledgerDirFor, reconcile, RunLedger, sessionInterruptedRuns } from "../../../../src/adapters/pi/extension/ledger.ts";
 import type { RunEvent } from "../../../../src/core/ledger/events.ts";
 import { deadPid } from "../../../helpers/dead-pid.ts";
 import { makeTmp } from "../../../helpers/tmp.ts";
@@ -225,5 +225,66 @@ describe("reconcile", () => {
     expect(found[0]!.runId).toBe("r-1");
     expect(found[0]!.error).toMatch(/events\.jsonl:2/);
     expect(readFileSync(r.file, "utf8")).not.toContain("run_interrupted");
+  });
+});
+
+describe("sessionInterruptedRuns (Task 13, review M5)", () => {
+  const A = "pi-session-a";
+  const SELF = "20261104T120000Z-99";
+  const r1 = "20261104T100000Z-11";
+  const r2 = "20261104T110000Z-12";
+  const dead = () => false;
+  function run(dir: string, runId: string, piSession: string | undefined, extra: RunEvent[] = []): RunLedger {
+    const l = new RunLedger(dir, runId);
+    l.append({ ...start(runId, 4242), ...(piSession !== undefined ? { piSession } : {}) });
+    for (const e of extra) l.append(e);
+    return l;
+  }
+  const progress = (runId: string): RunEvent => ({ v: 1, ts: TS, runId, type: "progress", taskId: "t1", phase: "implement" });
+  const end = (runId: string): RunEvent => ({ v: 1, ts: TS, runId, type: "run_end", reason: "quit" });
+
+  it("finds this session's interrupted run although another session already claimed and marked it", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    run(dir, r1, A, [progress(r1)]);
+    // Another session in the project starts first and consumes the claim.
+    expect(reconcile(home, PROJECT, "20261104T110500Z-50", dead).map((r) => r.runId)).toEqual([r1]);
+    expect(reconcile(home, PROJECT, SELF, dead)).toEqual([]);
+    const own = sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A }, () => true);
+    expect(own).toEqual([{ runId: r1, lastProgress: { taskId: "t1", phase: "implement" } }]);
+  });
+
+  it("an earlier interrupted run superseded by a later run of the session that ended cleanly does not count; another session's run never does", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    run(dir, r1, A);
+    run(dir, r2, A, [end(r2)]);
+    run(dir, "20261104T113000Z-13", "pi-session-b");
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A }, dead)).toEqual([]);
+  });
+
+  it("the run named by the last route entry is checked too (entries without a piSession match), and a live unmarked run is not interrupted", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    run(dir, r1, undefined);
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A, routeRunId: r1 }, dead).map((r) => r.runId)).toEqual([r1]);
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A, routeRunId: r1 }, () => true)).toEqual([]);
+    // The route entry's run ended cleanly but a later run of this session was killed: still interrupted.
+    run(dir, r2, A);
+    new RunLedger(dir, r1).append(end(r1));
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A, routeRunId: r1 }, dead).map((r) => r.runId)).toEqual([r2]);
+  });
+
+  it("a forged or foreign routeRunId is ignored; an unreadable ledger is reported as an error (the caller flags the route)", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { routeRunId: "../../etc" }, dead)).toEqual([]);
+    run(dir, r1, A);
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { routeRunId: "20261104T000000Z-1" }, dead)).toEqual([]);
+    appendFileSync(new RunLedger(dir, r1).file, "{not json\n");
+    new RunLedger(dir, r1).append(progress(r1));
+    const [r] = sessionInterruptedRuns(home, PROJECT, SELF, { routeRunId: r1 }, dead);
+    expect(r?.runId).toBe(r1);
+    expect(r?.error).toContain("unparseable run ledger line");
   });
 });
