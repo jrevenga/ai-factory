@@ -45,7 +45,13 @@ export const RunEvent = z.discriminatedUnion("type", [
     justification: z.string(),
   }),
   ev("progress", { taskId: z.string(), phase: z.string().optional(), item: z.string().optional() }),
-  ev("checkpoint", { taskId: z.string(), sha: z.string(), kind: z.enum(["commit", "undo-ref"]) }),
+  ev("checkpoint", {
+    taskId: z.string(),
+    sha: z.string(),
+    kind: z.enum(["commit", "undo-ref"]),
+    /** R34: changed secret-path files left out of a checkpoint commit (worktree-relative, redacted). */
+    excluded: z.array(z.string()).optional(),
+  }),
   ev("check", { record: CheckRecord }),
   ev("reconciled", {
     toolCallId: z.string(),

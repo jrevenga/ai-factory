@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { MachinePostChecks, setRoute } from "../../../../src/adapters/pi/extension/enforce.ts";
@@ -91,7 +91,14 @@ async function wired(opts: { taskText?: string | null; session?: boolean; effect
     getAllTools: () => (opts.effectiveTools ? opts.effectiveTools() : tools.map((t) => ({ name: t.name, parameters: t.parameters }))),
   };
   const postChecks = new MachinePostChecks();
-  const session: TaskSession = { ledger: { append: (e) => void events.push(RunEvent.parse(e)) }, runId: RUN_ID, projectRoot: w.project, postChecks };
+  const session: TaskSession = {
+    ledger: { append: (e) => void events.push(RunEvent.parse(e)) },
+    runId: RUN_ID,
+    projectRoot: w.project,
+    home: join(w.dir, "home"),
+    piAgentDir: join(w.dir, "pi agent"),
+    postChecks,
+  };
   const factoryTools = new Set<string>();
   const handle = registerTaskState(pi as never, { session: async () => (opts.session === false ? undefined : session), factoryTools });
   const tool = tools.find((t) => t.name === TASK_PROGRESS_TOOL)!;
@@ -222,8 +229,8 @@ describe("task_progress on feature/project routes", () => {
     expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
   });
 
-  it("does not run repository hooks for checkpoint commits", async () => {
-    if (isWin) return; // hook scripts need a POSIX shell shebang; the hooksPath override is platform independent.
+  // Hook scripts need a POSIX shell shebang; the hooksPath override itself is platform independent.
+  it.skipIf(isWin)("does not run repository hooks for checkpoint commits", async () => {
     const x = await wired();
     setRoute(x.feature);
     const hooks = join(x.project, ".git", "hooks");
@@ -250,6 +257,169 @@ describe("task_progress on feature/project routes", () => {
     expect(r.isError).not.toBe(true);
     expect(git(x.wt, "rev-parse", "HEAD")).toBe(head);
     expect(machineOf(x.taskFile).checkpoint).toBe(head);
+  });
+
+  it.skipIf(isWin)("M6: a repository-config core.hooksPath (husky style, inside the worktree) is overridden too", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    git(x.project, "config", "core.hooksPath", ".husky");
+    const marker = join(x.dir, "husky-ran");
+    mkdirSync(join(x.wt, ".husky"), { recursive: true });
+    for (const name of ["pre-commit", "post-commit"]) {
+      writeFileSync(join(x.wt, ".husky", name), `#!/bin/sh\necho ran > '${marker}'\nexit 1\n`);
+      chmodSync(join(x.wt, ".husky", name), 0o755);
+    }
+    const r = await x.progress({ checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    expect(git(x.wt, "rev-parse", "HEAD")).not.toBe(x.base);
+  });
+
+  it("I1: a symlinked .factory directory is refused and the link target is not written", async () => {
+    const x = await wired({ taskText: null });
+    setRoute(x.feature);
+    const outside = join(x.dir, "outside");
+    mkdirSync(join(outside, "knowledge", "tasks"), { recursive: true });
+    writeFileSync(join(outside, "knowledge", "tasks", "t1.md"), TASK_TEXT);
+    symlinkSync(outside, join(x.wt, ".factory"), isWin ? "junction" : "dir");
+    const r = await x.progress({ phase: "plan", checkpoint: true });
+    expect(r.isError).toBe(true);
+    expect(r.content[0]?.text).toMatch(/symbolic link|outside the worktree/);
+    expect(readFileSync(join(outside, "knowledge", "tasks", "t1.md"), "utf8")).toBe(TASK_TEXT);
+    expect(readdirSync(join(outside, "knowledge", "tasks"))).toEqual(["t1.md"]);
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
+    expect(x.events).toEqual([]);
+  });
+
+  it.skipIf(isWin)("I1: a symlinked task file is refused; the target is unchanged and nothing is copied into the worktree", async () => {
+    const x = await wired({ taskText: null });
+    setRoute(x.feature);
+    const secret = join(x.dir, "secret.txt");
+    writeFileSync(secret, "AWS_SECRET=abc\n");
+    mkdirSync(join(x.wt, ".factory", "knowledge", "tasks"), { recursive: true });
+    symlinkSync(secret, x.taskFile, "file");
+    const r = await x.progress({ phase: "plan", checkpoint: true });
+    expect(r.isError).toBe(true);
+    expect(r.content[0]?.text).toMatch(/regular file/);
+    expect(readFileSync(secret, "utf8")).toBe("AWS_SECRET=abc\n");
+    expect(lstatSync(x.taskFile).isSymbolicLink()).toBe(true);
+    expect(readdirSync(join(x.wt, ".factory", "knowledge", "tasks"))).toEqual(["t1.md"]);
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
+  });
+
+  it("R34: a checkpoint never stores secret-path files in git objects and names them; .env.example is committed", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    // A tracked secret file (committed with the task file before the checkpoint) that is then modified.
+    writeFileSync(join(x.wt, ".npmrc"), "registry=x\n");
+    git(x.wt, "add", "-A");
+    git(x.wt, "commit", "-q", "-m", "tracked npmrc");
+    const committedBase = git(x.wt, "rev-parse", "HEAD");
+    writeFileSync(join(x.wt, ".npmrc"), "//registry/:_authToken=npm_SECRETVALUE1\n");
+    writeFileSync(join(x.wt, ".env"), "TOKEN=supersecret-env\n");
+    mkdirSync(join(x.wt, "certs"));
+    writeFileSync(join(x.wt, "certs", "key.pem"), "-----BEGIN PRIVATE KEY-----\nabc-pem-secret\n");
+    writeFileSync(join(x.wt, ".env.example"), "TOKEN=\n");
+    writeFileSync(join(x.wt, "app.ts"), "export {};\n");
+    const blob = (text: string) => execFileSync("git", ["hash-object", "--stdin"], { cwd: x.wt, input: text, encoding: "utf8", env: GIT_ENV }).trim();
+    const secretBlobs = [blob("//registry/:_authToken=npm_SECRETVALUE1\n"), blob("TOKEN=supersecret-env\n"), blob("-----BEGIN PRIVATE KEY-----\nabc-pem-secret\n")];
+
+    const r = await x.progress({ checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(git(x.wt, "rev-parse", "HEAD~1")).toBe(committedBase);
+    expect(git(x.wt, "show", "--name-only", "--format=", "HEAD").split("\n").sort()).toEqual([".env.example", "app.ts"]);
+    for (const b of secretBlobs) {
+      expect(() => execFileSync("git", ["cat-file", "-e", b], { cwd: x.wt, env: GIT_ENV, stdio: "ignore" })).toThrow();
+    }
+    const text = r.content[0]?.text ?? "";
+    for (const f of [".env", ".npmrc", "certs/key.pem"]) expect(text).toContain(f);
+    const cp = x.events.find((e) => e.type === "checkpoint") as { excluded?: string[] } | undefined;
+    expect(cp?.excluded?.sort()).toEqual([".env", ".npmrc", "certs/key.pem"]);
+    // The secret files stay as they are in the working tree.
+    expect(readFileSync(join(x.wt, ".env"), "utf8")).toBe("TOKEN=supersecret-env\n");
+    expect(git(x.wt, "status", "--porcelain")).toContain("?? .env");
+  });
+
+  it("R34: an already staged secret file is unstaged, and a checkpoint with only secret changes commits nothing", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    git(x.wt, "add", "-A");
+    git(x.wt, "commit", "-q", "-m", "task file");
+    const head = git(x.wt, "rev-parse", "HEAD");
+    writeFileSync(join(x.wt, ".env"), "A=1\n");
+    git(x.wt, "add", ".env");
+    const r = await x.progress({ checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(head);
+    expect(git(x.wt, "diff", "--cached", "--name-only")).toBe("");
+    expect(r.content[0]?.text).toContain(".env");
+  });
+
+  it("M2: a failed commit resets the staged index and says so", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    git(x.project, "config", "--unset", "user.email");
+    git(x.project, "config", "--unset", "user.name");
+    git(x.project, "config", "user.useConfigOnly", "true");
+    writeFileSync(join(x.wt, "app.ts"), "export {};\n");
+    const r = await x.progress({ checkpoint: true });
+    expect(r.isError).toBe(true);
+    expect(r.content[0]?.text).toMatch(/git commit failed/);
+    expect(r.content[0]?.text).toMatch(/index was reset/);
+    expect(git(x.wt, "diff", "--cached", "--name-only")).toBe("");
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
+  });
+
+  it.skipIf(isWin)("M2: a failure after the checkpoint names the checkpoint sha and the pending audit error", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    let appends = 0;
+    // The checkpoint event cannot be audited, and the task file cannot be written afterwards.
+    const origPush = x.events.push.bind(x.events);
+    x.events.push = (...e: RunEvent[]) => {
+      appends++;
+      if (e[0]?.type === "checkpoint") {
+        chmodSync(join(x.wt, ".factory", "knowledge", "tasks"), 0o500);
+        throw new Error("ledger down");
+      }
+      return origPush(...e);
+    };
+    try {
+      const r = await x.progress({ checkpoint: true });
+      const sha = git(x.wt, "rev-parse", "HEAD");
+      expect(sha).not.toBe(x.base);
+      expect(r.isError).toBe(true);
+      const text = r.content[0]?.text ?? "";
+      expect(text).toContain(sha);
+      expect(text).toContain("ledger down");
+      expect(appends).toBe(2);
+      expect(readdirSync(join(x.wt, ".factory", "knowledge", "tasks"))).toEqual(["t1.md"]);
+    } finally {
+      chmodSync(join(x.wt, ".factory", "knowledge", "tasks"), 0o755);
+    }
+  });
+
+  it("M4: a phase or message that holds a secret is rejected before any effect", async () => {
+    const x = await wired();
+    setRoute(x.feature);
+    writeFileSync(join(x.wt, "app.ts"), "export {};\n");
+    const phase = await x.progress({ phase: `deploy token=${TOKEN}`, checkpoint: true });
+    expect(phase.isError).toBe(true);
+    expect(phase.content[0]?.text).toMatch(/secret/);
+    expect(phase.content[0]?.text).not.toContain(TOKEN);
+    const message = await x.progress({ checkpoint: true, message: `uses ${TOKEN}` });
+    expect(message.isError).toBe(true);
+    expect(git(x.wt, "rev-parse", "HEAD")).toBe(x.base);
+    expect(x.events).toEqual([]);
+  });
+
+  it("M5: a refusal after a base reset still reports the reset", async () => {
+    const x = await wired();
+    setRoute({ ...x.feature, base: "f".repeat(40) });
+    const r = await x.progress({ phase: "a · b" });
+    expect(r.isError).toBe(true);
+    expect(r.content[0]?.text).toContain("f".repeat(40));
+    expect(r.content[0]?.text).toContain(x.base);
   });
 
   it("N1: a base that is no longer an ancestor of HEAD is recomputed from HEAD with a notice", async () => {
@@ -306,6 +476,33 @@ describe("task_progress on the small route", () => {
     expect(x.events[1]).toMatchObject({ type: "checkpoint", taskId: "fix-1", sha: ref, kind: "undo-ref" });
     // Small has no task file.
     expect(existsSync(join(x.project, ".factory"))).toBe(false);
+  });
+
+  it("M3: the undo ref keeps a reflog, so an earlier undo point stays reachable", async () => {
+    const x = await wired();
+    setRoute(x.small);
+    writeFileSync(join(x.project, "README.md"), "one\n");
+    await x.progress({ checkpoint: true });
+    const first = git(x.project, "rev-parse", "refs/factory/undo/fix-1");
+    writeFileSync(join(x.project, "README.md"), "two\n");
+    await x.progress({ checkpoint: true });
+    const log = git(x.project, "reflog", "show", "--format=%H", "refs/factory/undo/fix-1").split("\n");
+    expect(log).toContain(first);
+    expect(log[0]).toBe(git(x.project, "rev-parse", "refs/factory/undo/fix-1"));
+  });
+
+  it.skipIf(isWin)("M6: the reference-transaction hook does not run for the undo ref", async () => {
+    const x = await wired();
+    setRoute(x.small);
+    const marker = join(x.dir, "ref-hook-ran");
+    const hook = join(x.project, ".git", "hooks", "reference-transaction");
+    mkdirSync(join(x.project, ".git", "hooks"), { recursive: true });
+    writeFileSync(hook, `#!/bin/sh\necho ran >> '${marker}'\nexit 0\n`);
+    chmodSync(hook, 0o755);
+    writeFileSync(join(x.project, "README.md"), "changed\n");
+    expect((await x.progress({ checkpoint: true })).isError).not.toBe(true);
+    expect(git(x.project, "rev-parse", "--verify", "refs/factory/undo/fix-1")).toMatch(/^[0-9a-f]{40}$/);
+    expect(existsSync(marker)).toBe(false);
   });
 
   it("a small checkpoint on a clean tree points the undo ref at HEAD", async () => {

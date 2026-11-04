@@ -216,6 +216,10 @@ describe("restoreRoute (session entries)", () => {
     expect(stale.state).toEqual(small(w.project, { base: head }));
     expect(stale.notice).toContain("f".repeat(40));
     expect(stale.notice).toContain(head);
+    // After an interrupted run the corrected route is restored flagged (ruling 20) and still carries the notice.
+    const resumed = restoreRoute([custom(ROUTE_ENTRY, small(w.project, { base: "f".repeat(40) }))], w.facts, { interrupted: true });
+    expect(resumed.state).toEqual(small(w.project, { base: head, needsReclassification: true }));
+    expect(resumed.notice).toContain(head);
     // An option-looking base is never passed to git as an option.
     const forged = restoreRoute([custom(ROUTE_ENTRY, small(w.project, { base: "--output=x" }))], w.facts, { interrupted: false });
     expect(forged.state.base).toBe(head);

@@ -2,7 +2,7 @@
 // `ToolAction` with filesystem facts, asks core for the decision, resolves `ask` through the UI (ruling 4),
 // audits every decision as one ledger `gate` event, and runs ruling 8's machine-section post-check at
 // `tool_result`. It fails closed: any exception (facts, policy context, config, ledger) blocks the call.
-import { lstatSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
 import type { RunEvent } from "../../../core/ledger/events.ts";
@@ -232,8 +232,18 @@ export function atomicWrite(file: string, text: string, tag = "restore"): void {
     mode = undefined;
   }
   const tmp = path.join(path.dirname(file), `.${path.basename(file)}.factory-${tag}-${process.pid}-${Date.now()}`);
-  writeFileSync(tmp, text, mode === undefined ? {} : { mode });
-  renameSync(tmp, file);
+  try {
+    writeFileSync(tmp, text, { flag: "wx", ...(mode === undefined ? {} : { mode }) });
+    renameSync(tmp, file);
+  } catch (e) {
+    // Review M2: never leave the temp file behind (a later checkpoint would commit it).
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Not created, or already renamed.
+    }
+    throw e;
+  }
 }
 
 /**

@@ -220,7 +220,7 @@ function routeSession(s: Session): RouteSession {
 }
 
 function taskSession(s: Session): TaskSession {
-  return { ledger: s.ledger, runId: s.runId, projectRoot: s.projectRoot, postChecks: s.postChecks };
+  return { ledger: s.ledger, runId: s.runId, projectRoot: s.projectRoot, home: s.home, piAgentDir: s.piAgentDir, postChecks: s.postChecks };
 }
 
 interface Started {

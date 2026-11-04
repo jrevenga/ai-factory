@@ -275,9 +275,20 @@ export interface GitRun {
   stderr: string;
 }
 
-/** Non-interactive git with its output and status (factory tools that change git state): no shell, bounded. */
-export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS): GitRun {
-  const r = spawnSync("git", args, { cwd, env: gitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, windowsHide: true });
+/**
+ * Non-interactive git with its output and status (factory tools that change git state): no shell, bounded. `input`
+ * is written to git's stdin (e.g. `--pathspec-from-file=-`); without it stdin is closed.
+ */
+export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS, input?: string): GitRun {
+  const r = spawnSync("git", args, {
+    cwd,
+    env: gitEnv(),
+    encoding: "utf8",
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    ...(input === undefined ? {} : { input }),
+    timeout: timeoutMs,
+    windowsHide: true,
+  });
   const stderr = r.error !== undefined ? `${r.stderr ?? ""}${r.error.message}` : (r.stderr ?? "");
   return { status: r.error !== undefined ? null : r.status, stdout: r.stdout ?? "", stderr };
 }
