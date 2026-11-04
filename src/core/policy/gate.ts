@@ -36,8 +36,15 @@ export type ToolAction =
        * is a write target; every other fact is checked for secrets and the secret-dir guard. A missing pathArg fact
        * asks `outside-root-write`; a missing inputPath or path-like readArg fact asks `secrets`. A non-path-like readArg
        * without a fact is treated as a word, not a file — so the extension must supply facts for existing files.
+       * Each fact carries `directory` (R37, R43): a `nonDirPaths`/`stagePaths` entry whose fact is not `false` makes
+       * its segment unknown.
        */
       pathFacts: PathFacts[];
+      /**
+       * R41: whether the repository at the command's cwd tracks a secret path (`git ls-files` filtered with
+       * `isSecretPath`). Required when the classification has `trackedContent`; undefined then asks `secrets`.
+       */
+      trackedSecret?: boolean;
     }
   | { kind: "factory"; tool: string }
   | { kind: "unknown"; tool: string };
@@ -127,15 +134,41 @@ function hasSegment(p: string, name: string, platform: PathPlatform): boolean {
 const HOME_SECRET_DIRS = [".aws", ".config/gh", ".config/gcloud", ".codex", ".docker", ".kube", ".ssh", ".gnupg", ".azure"];
 
 /**
+ * R27: `dir` is `target` or below it, comparing case-folded on every platform (case-insensitive volumes open
+ * `~/.AWS` as `~/.aws`). Only for the secret-directory guard: write-root containment stays case-sensitive on posix.
+ */
+function containsFolded(target: string, dir: string, platform: PathPlatform): boolean {
+  const a = platform === "win32" ? path.win32 : path.posix;
+  if (target === "" || !a.isAbsolute(target) || !a.isAbsolute(dir)) return false;
+  const rel = a.relative(target.toLowerCase(), dir.toLowerCase());
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${a.sep}`) && !a.isAbsolute(rel));
+}
+
+/**
  * R23: a read target that is home, piAgentDir, a listed home secret dir, or an ancestor of any of them. A recursive
- * reader (the grep tool) given such a directory would read the secrets inside it.
+ * reader (the grep tool) given such a directory would read the secrets inside it. R27: case-folded on posix too.
  */
 function guardsSecretDir(fact: PathFacts, ctx: GateContext): boolean {
   const { platform } = fact;
   const a = platform === "win32" ? path.win32 : path.posix;
   const guarded = [ctx.home, ctx.piAgentDir, ...HOME_SECRET_DIRS.map((d) => a.join(ctx.home, ...d.split("/")))];
   const targets = [fact.resolved, fact.input];
-  return guarded.some((g) => under({ input: g, resolved: g, platform }, targets, ctx) !== undefined);
+  return guarded.some(
+    (g) => under({ input: g, resolved: g, platform }, targets, ctx) !== undefined || targets.some((t) => containsFolded(t, g, platform)),
+  );
+}
+
+/**
+ * R41: a repository path selected by git syntax that names a secret, checked without filesystem resolution relative
+ * to the project root and to home (a repository at home holds `.aws/credentials`, `.ssh/...`).
+ */
+function logicalSecret(p: string, ctx: GateContext): boolean {
+  const platform: PathPlatform = WIN_ABSOLUTE.test(ctx.home) ? "win32" : "posix";
+  const a = platform === "win32" ? path.win32 : path.posix;
+  const sctx = { home: ctx.home, piAgentDir: ctx.piAgentDir, platform };
+  const rel = p.replace(/^\/+/, "");
+  if (rel === "") return false;
+  return [ctx.projectRoot, ctx.home].some((base) => isSecretPath(a.join(base, rel), sctx));
 }
 
 /** Ruling 7: inside `.factory/`, only this task's knowledge files and new decision files may be written. */
@@ -262,23 +295,34 @@ function answerRouteDeny(c: CommandClassification, ctx: GateContext): string | u
 }
 
 /**
- * R37: a `git add` path that names a directory, or whose kind is unknown, can stage secret files: its segment is
- * `unknown` (not allowlisted). A path without any fact is left to the missing-input rule (asks `secrets`).
+ * R37/R43: a path that must be a file but names a directory, or whose kind is unknown, makes its segment `unknown`
+ * (not allowlisted): a staged directory can sweep secret files into git objects (R37); a directory operand of diff,
+ * cp or a rewriting runner reads or writes descendants the facts do not cover (R43). A path without any fact is left
+ * to the missing-input rules (a path-like one asks; a plain word that does not exist is not a directory).
  */
-function demoteSweepingStages(c: CommandClassification, facts: PathFacts[]): CommandClassification {
+function demoteDirectoryOperands(c: CommandClassification, facts: PathFacts[]): CommandClassification {
   const unknownClass = (cls: CommandClass): CommandClass => (severity(cls) < severity("unknown") ? "unknown" : cls);
   let out = c;
-  for (const p of c.segments.flatMap((s) => s.stagePaths ?? [])) {
-    const own = facts.filter((f) => f.input === p);
-    if (own.length === 0 || own.every((f) => f.directory === false)) continue;
-    out = {
-      ...out,
-      class: unknownClass(out.class),
-      allowlisted: false,
-      reasons: [...out.reasons, `git add ${p} names a directory (or a path of unknown kind) and can stage secret files (R37)`],
-      segments: out.segments.map((s) => (s.stagePaths?.includes(p) ? { ...s, class: unknownClass(s.class), allowlisted: false } : s)),
-    };
-  }
+  c.segments.forEach((seg, i) => {
+    const checks = [
+      ...(seg.stagePaths ?? []).map((p) => ({ p, why: `git add ${p} names a directory (or a path of unknown kind) and can stage secret files (R37)` })),
+      ...(seg.nonDirPaths ?? []).map((p) => ({
+        p,
+        why: `${seg.argv[0] ?? ""} operand ${p} is a directory (or of unknown kind): its descendants are read or written without facts (R43)`,
+      })),
+    ];
+    for (const { p, why } of checks) {
+      const own = facts.filter((f) => f.input === p);
+      if (own.length === 0 || own.every((f) => f.directory === false)) continue;
+      out = {
+        ...out,
+        class: unknownClass(out.class),
+        allowlisted: false,
+        reasons: [...out.reasons, why],
+        segments: out.segments.map((s, j) => (j === i ? { ...s, class: unknownClass(s.class), allowlisted: false } : s)),
+      };
+    }
+  });
   return out;
 }
 
@@ -291,7 +335,7 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   if (action.tool === "powershell") {
     return result("ask", "PowerShell commands are not classified in Phase 2 (ruling 3)", { class: "unknown" });
   }
-  const c = demoteSweepingStages(classifyCommandLine(action.command, { projectCommands: ctx.projectCommands }), action.pathFacts);
+  const c = demoteDirectoryOperands(classifyCommandLine(action.command, { projectCommands: ctx.projectCommands }), action.pathFacts);
   const base = { class: c.class };
   const noRoots = ctx.route.route === "answer" || ctx.route.needsReclassification;
   const noRootsReason = ctx.route.needsReclassification ? RECLASSIFY : DECLARE;
@@ -322,6 +366,16 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   // Hard gates ask (every fact, read or write, is checked for secrets).
   const secret = action.pathFacts.find((f) => classifyPath(f, pathContext(ctx, ctx.route.writeRoots, ctx.tmpRoots)).secret);
   if (secret) return result("ask", `the command touches a secret path: ${secret.input}`, { ...base, hardGate: "secrets" });
+  // R41: git syntax that selects a secret path's content (`HEAD:.env`, `:0:.env`, `-L 1,2:.env`, a pathspec).
+  const logical = c.logicalPaths.find((p) => logicalSecret(p, ctx));
+  if (logical !== undefined) {
+    return result("ask", `the git command selects the content of a secret path: ${logical} (R41)`, { ...base, hardGate: "secrets" });
+  }
+  // R41: content-printing git (diff, show, blame, log with patches) prints every tracked file it touches.
+  if (c.trackedContent && action.trackedSecret !== false) {
+    const why = action.trackedSecret === true ? "the repository tracks a secret path" : "whether the repository tracks a secret path is unknown";
+    return result("ask", `the git command prints tracked file contents and ${why} (R41)`, { ...base, hardGate: "secrets" });
+  }
   // R24: in bash a pipeline turns names into contents, so every read fact (not write targets) gets the guard.
   const secretDir = action.pathFacts.find((f) => !writeInputs.has(f.input) && guardsSecretDir(f, ctx));
   if (secretDir) {

@@ -541,12 +541,13 @@ describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
     const unattended = { ...w.over, mode: "unattended" as const };
     const first = call("bash", { command: "sleep 1 && cat out/up/.aws/credentials" });
     expect(await enforce(first, { cwd: w.root }, w.deps(w.feature, unattended))).toBeUndefined();
-    const second = await enforce(call("bash", { command: "cp -r evil out" }), { cwd: w.root }, w.deps(w.feature, unattended));
+    // Fix round 4: an allowlisted mutating command (a recursive copy of a directory is unknown under R43).
+    const second = await enforce(call("bash", { command: "mkdir out" }), { cwd: w.root }, w.deps(w.feature, unattended));
     expect(second?.block).toBe(true);
     expect(second?.reason).toContain("re-issue");
     w.inFlight.done(first.toolCallId);
-    // Sequential execution: once the first call has finished, the copy is decided on its own merits.
-    expect(await enforce(call("bash", { command: "cp -r evil out" }), { cwd: w.root }, w.deps(w.feature, unattended))).toBeUndefined();
+    // Sequential execution: once the first call has finished, the write is decided on its own merits.
+    expect(await enforce(call("bash", { command: "mkdir out" }), { cwd: w.root }, w.deps(w.feature, unattended))).toBeUndefined();
   });
 
   it("R31 (N1): nested calls of a running parent follow the same rule among themselves", async () => {

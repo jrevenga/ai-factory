@@ -19,8 +19,21 @@ describe("GATE_CORPUS", () => {
     it(`${JSON.stringify(entry.cmd)} -> ${entry.expect} (${entry.why})`, () => {
       const r = classifyCommandLine(entry.cmd, NO_PROJECT);
       expect(r.class, r.reasons.join("; ")).toBe(entry.expect);
+      const f = entry.facts;
+      if (f === undefined) return;
+      if (f.pathArgs) expect(r.pathArgs, "pathArgs").toEqual(f.pathArgs);
+      if (f.inputPaths) expect(r.inputPaths, "inputPaths").toEqual(f.inputPaths);
+      if (f.readArgs) expect(r.readArgs, "readArgs").toEqual(f.readArgs);
+      if (f.logicalPaths) expect(r.logicalPaths, "logicalPaths").toEqual(f.logicalPaths);
+      if (f.trackedContent !== undefined) expect(r.trackedContent, "trackedContent").toBe(f.trackedContent);
+      if (f.nonDirPaths) expect(r.segments.flatMap((s) => s.nonDirPaths ?? []), "nonDirPaths").toEqual(f.nonDirPaths);
     });
   }
+
+  it("covers every review finding with facts or a gate outcome (fix round 4)", () => {
+    expect(GATE_CORPUS.filter((e) => e.gate !== undefined).length).toBeGreaterThanOrEqual(40);
+    expect(GATE_CORPUS.filter((e) => e.facts !== undefined).length).toBeGreaterThanOrEqual(40);
+  });
 });
 
 describe("severity", () => {
@@ -124,7 +137,9 @@ describe("isPathLikeArg (R25)", () => {
 describe("classifyCommandLine: readArgs (R25)", () => {
   it("covers read-only and local-write segments only", () => {
     expect(classify("cat ~/.aws/credentials").readArgs).toEqual(["~/.aws/credentials"]);
-    expect(classify("head -n ~/.aws/credentials x").readArgs).toEqual(["~/.aws/credentials", "x"]);
+    expect(classify("head -n 5 ~/.aws/credentials x").readArgs).toEqual(["~/.aws/credentials", "x"]);
+    // R40: `-n` takes a count, so its value is not a file (the old fixture `head -n <secret>` was not a read).
+    expect(classify("head -n ~/.aws/credentials x").readArgs).toEqual(["x"]);
     expect(classify("npm test").readArgs).toEqual(["test"]);
     expect(classify("ls src > /tmp/o").readArgs).toEqual(["src"]);
     expect(classify("foo ./bar").readArgs).toEqual([]);
@@ -147,8 +162,9 @@ describe("classifyCommandLine: inputPaths", () => {
     expect(classify("echo $(x)").inputPaths).toEqual([]);
   });
 
-  it("reports git -C directories of read-only git as read paths (R24)", () => {
+  it("reports git -C directories as read paths (R24); git -C is unknown (R41)", () => {
     const r = classify("git -C ../other status");
+    expect(r.class).toBe("unknown");
     expect(r.inputPaths).toEqual(["../other"]);
     expect(r.pathArgs).toEqual([]);
     expect(classify("git -C ../other add .").inputPaths).toEqual([]);
@@ -477,5 +493,146 @@ describe("classifyCommandLine: staging that can sweep secrets (R37)", () => {
       expect(classify(cmd).class, cmd).toBe("unknown");
     }
     expect(classify("git stash push -m wip")).toMatchObject({ class: "local-write", allowlisted: true });
+  });
+});
+
+describe("classifyCommandLine: option grammar (R40)", () => {
+  // One unmodelled option per allowlisted program or git subcommand: each must be `unknown`, never allowlisted.
+  const families = [
+    "ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "grep x", "fd x", "tree", "pwd", "which", "whereis", "type",
+    "file", "stat", "du", "df", "echo", "printf", "true", "false", "basename", "dirname", "realpath", "readlink", "date", "sleep",
+    "diff", "cmp", "jq .", "find .", "git status", "git log", "git diff", "git show", "git rev-parse", "git ls-files", "git blame",
+    "git describe", "git fetch", "git stash push", "git restore --staged", "git commit -m x", "git add", "git branch", "git tag",
+    "git config --get", "git remote", "cp a", "mv a", "mkdir", "touch", "tee", "rm", "rmdir", "sed -i", "curl https://x",
+    "wget https://x", "gh api", "vitest", "jest", "tsc", "eslint", "prettier --check", "pytest", "go test", "cargo test",
+    "uv run pytest", "npx --no-install vitest", "npm exec --no -- jest",
+  ];
+  for (const fam of families) {
+    it(`${fam} with an unmodelled option is unknown`, () => {
+      const r = classify(`${fam} --zz-unmodelled b`);
+      expect(r.class, r.reasons.join("; ")).toBe("unknown");
+      expect(r.allowlisted).toBe(false);
+    });
+  }
+
+  it("parses short bundles letter by letter: a value option takes the rest of the bundle or the next word", () => {
+    expect(classify("du -sX auth .").readArgs).toEqual(["auth", "."]);
+    expect(classify("du -sXauth .").readArgs).toEqual(["auth", "."]);
+    expect(classify("du --exclude-from=auth .").readArgs).toEqual(["auth", "."]);
+    expect(classify("du --exclude-from auth .").readArgs).toEqual(["auth", "."]);
+    expect(classify("git ls-files -z -X auth").readArgs).toEqual(["auth"]);
+    expect(classify("ls -la src").readArgs).toEqual(["src"]);
+    expect(classify("ls -l -- -a").readArgs).toEqual(["-a"]);
+  });
+
+  it("an unmodelled letter anywhere in a bundle is unknown", () => {
+    for (const cmd of ["ls -laj", "cat -nQ x", "wc -lO x", "diff -qj a b", "git ls-files -zQ"]) expect(classify(cmd).class, cmd).toBe("unknown");
+  });
+
+  it("a value option without its value is unknown", () => {
+    for (const cmd of ["head -n", "sort -k", "du -X", "git log -n"]) expect(classify(cmd).class, cmd).toBe("unknown");
+  });
+
+  it("-- ends options: later dash-prefixed words are operands and count toward limits", () => {
+    expect(classify("uniq -- -a").class).toBe("read-only");
+    expect(classify("uniq -- -a -b").class).toBe("unknown");
+    expect(classify("tr -- -a").readArgs).toEqual([]);
+    expect(classify("cat -- --zz").readArgs).toEqual(["--zz"]);
+  });
+
+  it("opaque values and opaque operands are not read facts", () => {
+    expect(classify("echo ~/.aws/credentials").readArgs).toEqual([]);
+    expect(classify("basename /h/.aws/credentials").readArgs).toEqual([]);
+    expect(classify("grep -e a/b src/x.ts").readArgs).toEqual(["src/x.ts"]);
+    expect(classify("grep a/b src/x.ts").readArgs).toEqual(["src/x.ts"]);
+    expect(classify("tr a/ b/").readArgs).toEqual([]);
+  });
+
+  it("an option after the first operand is still reported as a possible file (POSIX option order)", () => {
+    expect(classify("cat a.txt -n").readArgs).toEqual(["a.txt", "-n"]);
+    expect(classify("head x -n 5").readArgs).toEqual(["x", "-n", "5"]);
+  });
+
+  it("write commands reject an option after an operand (it would be a write target under POSIX option order)", () => {
+    for (const cmd of ["cp a b -f", "mv a b -f", "mkdir a -p", "touch a -c", "tee a -a", "rm a -f", "rmdir a -p"]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+    expect(classify("cp -f a b").class).toBe("local-write");
+  });
+
+  it("read-path option values become read facts", () => {
+    expect(classify("date -r ~/.aws/credentials").readArgs).toEqual(["~/.aws/credentials"]);
+    expect(classify("grep --exclude-from=pats x a.txt").readArgs).toEqual(["pats", "a.txt"]);
+    expect(classify("find . -newer ~/.aws/credentials").readArgs).toEqual([".", "~/.aws/credentials"]);
+    expect(classify("realpath --relative-to=/h/x y").readArgs).toEqual(["/h/x", "y"]);
+  });
+
+  it("go flags use single-dash long names", () => {
+    expect(classify("go test -run TestX -count=1 ./...").class).toBe("local-write");
+    expect(classify("go test -exec=x ./...").class).toBe("unknown");
+    expect(classify("go test -toolexec x ./...").class).toBe("unknown");
+    expect(classify("go build -o=bin/x ./cmd").pathArgs).toEqual(["bin/x"]);
+  });
+
+  it("runner options that write files outside the project are unknown", () => {
+    for (const cmd of [
+      "vitest run --outputFile=../x.json",
+      "jest --outputFile ../x.json",
+      "eslint -o ../x.txt .",
+      "tsc --outDir ../x",
+      "pytest --junitxml=../x.xml",
+      "prettier --check --cache-location=../x .",
+      "cargo build --target-dir ../x",
+      "cargo test -- --logfile ../x",
+    ]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+  });
+
+  it("eslint --fix and prettier --write report their operands as writes that must be files (R43)", () => {
+    const e = classify("eslint --fix src/a.ts");
+    expect(e.pathArgs).toEqual(["src/a.ts"]);
+    expect(e.segments[0]!.nonDirPaths).toEqual(["src/a.ts"]);
+    expect(classify("prettier --write src").segments[0]!.nonDirPaths).toEqual(["src"]);
+  });
+});
+
+describe("classifyCommandLine: git content (R41)", () => {
+  it("reports logical paths for rev:path, :path, :N:path and -L forms", () => {
+    expect(classify("git show HEAD^:config/.env").logicalPaths).toEqual(["config/.env"]);
+    expect(classify("git show main:./a/b").logicalPaths).toEqual(["./a/b"]);
+    expect(classify("git log -L :fn:src/a.ts").logicalPaths).toEqual(["src/a.ts"]);
+    expect(classify("git diff HEAD -- .env").logicalPaths).toEqual(["HEAD", ".env"]);
+  });
+
+  it("flags content-printing git commands only", () => {
+    for (const cmd of ["git diff", "git diff --cached", "git show", "git log -p", "git log --patch", "git log -S x", "git log -G x", "git log --cc", "git log -u", "git blame a.ts", "git status -v"]) {
+      expect(classify(cmd).trackedContent, cmd).toBe(true);
+    }
+    for (const cmd of ["git status", "git log --oneline", "git log --stat", "git rev-parse HEAD", "git ls-files", "git describe --tags", "ls"]) {
+      expect(classify(cmd).trackedContent, cmd).toBe(false);
+    }
+  });
+
+  it("git -C stays a hard class when the subcommand is one, and is unknown otherwise", () => {
+    expect(classify("git -C ../x push").class).toBe("remote-mutating");
+    expect(classify("git -C ../x reset --hard").class).toBe("destructive");
+    expect(classify("git -C ../x log").class).toBe("unknown");
+  });
+
+  it("git fetch accepts remote and branch names only (no refspec writes, no URLs)", () => {
+    expect(classify("git fetch origin main").class).toBe("read-only");
+    expect(classify("git fetch --prune origin").class).toBe("read-only");
+    expect(classify("git fetch origin main:main").class).toBe("unknown");
+    expect(classify("git fetch https://h/r").class).toBe("unknown");
+  });
+});
+
+describe("classifyCommandLine: gh api read grammar (R40)", () => {
+  it("allows GET options and keeps mutations remote", () => {
+    expect(classify("gh api repos/o/r --jq .name").class).toBe("read-only");
+    expect(classify("gh api --paginate repos/o/r/pulls").class).toBe("read-only");
+    expect(classify("gh api repos/o/r --zz").class).toBe("unknown");
+    expect(classify("gh api -f a=b repos/o/r").class).toBe("remote-mutating");
   });
 });

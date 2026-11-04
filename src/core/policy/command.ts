@@ -49,6 +49,15 @@ export interface SegmentClassification {
    * non-directory: staging a directory can sweep secret files into git objects.
    */
   stagePaths?: string[];
+  /**
+   * R43: operands the gate requires to be known non-directories (a directory operand of diff or cp, or of a runner
+   * that rewrites its operands, reads or writes descendants the facts do not cover); otherwise the segment is unknown.
+   */
+  nonDirPaths?: string[];
+  /** R41: repository paths selected by git syntax (`rev:path`, `:path`, `-L range:path`, pathspecs). */
+  logicalPaths?: string[];
+  /** R41: the segment prints tracked file contents (git diff/show/blame, log with patches, status -v). */
+  trackedContent?: boolean;
 }
 
 export interface CommandClassification {
@@ -65,6 +74,13 @@ export interface CommandClassification {
    * file whose content the program prints, whatever option introduces it; the gate secret-checks them.
    */
   readArgs: string[];
+  /**
+   * R41: repository paths that git syntax selects (no filesystem resolution): the gate checks each with
+   * `isSecretPath` relative to the project root and home.
+   */
+  logicalPaths: string[];
+  /** R41: some segment prints tracked file contents; the gate needs the extension's `trackedSecret` fact. */
+  trackedContent: boolean;
   allowlisted: boolean;
 }
 
@@ -77,6 +93,11 @@ interface Verdict {
   readPaths?: string[];
   /** R37: explicit `git add` paths (see SegmentClassification.stagePaths). */
   stagePaths?: string[];
+  /** R40: the grammar's read facts; undefined falls back to `extractReadArgs` for read-only/local-write segments. */
+  readArgs?: string[];
+  nonDirPaths?: string[];
+  logicalPaths?: string[];
+  trackedContent?: boolean;
 }
 
 const readOnly = (reason: string): Verdict => ({ class: "read-only", allowlisted: true, reasons: [reason], pathArgs: [] });
@@ -128,82 +149,205 @@ function positionals(args: readonly string[]): string[] {
   return args.filter((a) => a === "-" || !a.startsWith("-"));
 }
 
+// --- option grammar parser (R40) ---
+
 interface ParsedOption {
+  /** `-x`, `--name` (go flags: `-name`), or `-NUM`. */
   name: string;
+  kind: R.Opt;
   value?: string;
+  /** argv index of the option word. */
+  index: number;
+  /** Seen after the first operand (a POSIX parser would take the word as an operand). */
+  late: boolean;
+  word: string;
 }
 
-type OptionLookup = (name: string) => { value: boolean } | undefined;
-type ParseResult = { ok: true; options: ParsedOption[]; positionals: string[] } | { ok: false; option: string };
+interface ParsedOperand {
+  word: string;
+  index: number;
+  /** After `--`. */
+  afterDoubleDash: boolean;
+}
 
-/** getopt-style parser: unrecognized options fail so the caller can return `unknown`. */
-function parseOptions(args: readonly string[], short: OptionLookup, long: OptionLookup): ParseResult {
+type Parsed = { ok: true; options: ParsedOption[]; operands: ParsedOperand[] } | { ok: false; reason: string };
+
+/**
+ * Parses `args` against `g`. Unknown options, options rejected by the grammar, a flag given a value and a value
+ * option without its value all fail, so the caller returns `unknown`.
+ */
+function parseArgs(args: readonly string[], g: R.Grammar): Parsed {
   const options: ParsedOption[] = [];
-  const pos: string[] = [];
-  let endOfOptions = false;
+  const operands: ParsedOperand[] = [];
+  const fail = (reason: string): Parsed => ({ ok: false, reason });
+  const rejected = (name: string, kind: R.Opt) => (typeof kind === "object" ? `${name} ${kind.reject}` : undefined);
+  let end = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (endOfOptions || a === "-" || !a.startsWith("-")) {
-      pos.push(a);
-    } else if (a === "--") {
-      endOfOptions = true;
-    } else if (a.startsWith("--")) {
-      const eq = a.indexOf("=");
-      const name = eq < 0 ? a : a.slice(0, eq);
-      const spec = long(name);
-      if (!spec) return { ok: false, option: a };
-      if (!spec.value) {
-        if (eq >= 0) return { ok: false, option: a };
-        options.push({ name });
+    const seenOperand = operands.length > 0;
+    if (end || g.noOptions || a === "-" || !a.startsWith("-") || (g.order === "posix" && seenOperand)) {
+      operands.push({ word: a, index: i, afterDoubleDash: end });
+      continue;
+    }
+    if (a === "--") {
+      end = true;
+      continue;
+    }
+    if (seenOperand && g.order === "strict") return fail(`option ${a} after an operand (it could be taken as an output operand)`);
+    const late = seenOperand;
+    if (g.numeric === true && /^-[0-9]+$/.test(a)) {
+      options.push({ name: "-NUM", kind: "opaque", value: a.slice(1), index: i, late, word: a });
+      continue;
+    }
+    if (g.goFlags === true || a.startsWith("--")) {
+      const raw = g.goFlags === true && a.startsWith("--") ? a.slice(1) : a;
+      const eq = raw.indexOf("=");
+      const name = eq < 0 ? raw : raw.slice(0, eq);
+      const kind = g.long === undefined ? undefined : lookup(g.long, name);
+      if (kind === undefined) return fail(`unrecognized option ${a} (R40: options outside the grammar are unknown)`);
+      const r = rejected(name, kind);
+      if (r !== undefined) return fail(r);
+      if (kind === "flag") {
+        if (eq >= 0) return fail(`${name} takes no value`);
+        options.push({ name, kind, index: i, late, word: a });
+      } else if (kind === "opt-opaque") {
+        options.push({ name, kind, ...(eq >= 0 ? { value: raw.slice(eq + 1) } : {}), index: i, late, word: a });
       } else {
-        const value = eq >= 0 ? a.slice(eq + 1) : args[++i];
-        if (value === undefined) return { ok: false, option: a };
-        options.push({ name, value });
+        const value = eq >= 0 ? raw.slice(eq + 1) : args[++i];
+        if (value === undefined) return fail(`${name} without a value`);
+        options.push({ name, kind, value, index: i, late, word: a });
       }
-    } else {
-      for (let j = 1; j < a.length; j++) {
-        const c = a[j]!;
-        const spec = short(c);
-        if (!spec) return { ok: false, option: a };
-        if (!spec.value) {
-          options.push({ name: `-${c}` });
-          continue;
-        }
-        const rest = a.slice(j + 1);
-        const value = rest !== "" ? rest : args[++i];
-        if (value === undefined) return { ok: false, option: a };
-        options.push({ name: `-${c}`, value });
+      continue;
+    }
+    for (let j = 1; j < a.length; j++) {
+      const c = a[j]!;
+      const name = `-${c}`;
+      const kind = g.short === undefined ? undefined : lookup(g.short, c);
+      if (kind === undefined) return fail(`unrecognized option ${name}${a.length > 2 ? ` in ${a}` : ""} (R40: options outside the grammar are unknown)`);
+      const r = rejected(name, kind);
+      if (r !== undefined) return fail(r);
+      if (kind === "flag") {
+        options.push({ name, kind, index: i, late, word: a });
+        continue;
+      }
+      const rest = a.slice(j + 1);
+      if (kind === "opt-opaque") {
+        options.push({ name, kind, ...(rest !== "" ? { value: rest } : {}), index: i, late, word: a });
         break;
       }
+      const value = rest !== "" ? rest : args[++i];
+      if (value === undefined) return fail(`${name} without a value`);
+      options.push({ name, kind, value, index: i, late, word: a });
+      break;
     }
   }
-  return { ok: true, options, positionals: pos };
+  return { ok: true, options, operands };
 }
 
-function parseWithSpec(args: readonly string[], spec: R.OptionSpec): ParseResult {
-  return parseOptions(
-    args,
-    (c) => (spec.shortBool.includes(c) ? { value: false } : spec.shortValue.includes(c) ? { value: true } : undefined),
-    (n) => (spec.longBool.includes(n) ? { value: false } : spec.longValue.includes(n) ? { value: true } : undefined),
-  );
+interface GrammarFacts {
+  readArgs: string[];
+  pathArgs: string[];
+  nonDirPaths: string[];
+  /** Operands after the leading (pattern/filter) ones, `-` included. */
+  operands: string[];
+}
+
+function pushUnique(out: string[], w: string): void {
+  if (w !== "" && w !== "-" && !out.includes(w)) out.push(w);
+}
+
+/** The facts of a successful parse, or why the operands are outside the grammar. */
+function grammarFacts(p: Extract<Parsed, { ok: true }>, g: R.Grammar): GrammarFacts | { error: string } {
+  const given = (n: string) => p.options.some((o) => o.name === n);
+  const leadCount = g.leading !== undefined && !(g.leading.unless ?? []).some(given) ? g.leading.count : 0;
+  const leading = p.operands.slice(0, leadCount);
+  const rest = p.operands.slice(leadCount);
+  const bad = g.leadingReject !== undefined ? leading.find((o) => g.leadingReject!.pattern.test(o.word)) : undefined;
+  if (bad !== undefined) return { error: g.leadingReject!.reason };
+  if (g.max !== undefined && rest.length > g.max) {
+    return { error: g.max === 0 ? "operands are not allowlisted" : `more than ${g.max} operand(s): an extra operand can be an output file` };
+  }
+  const off = g.pattern !== undefined ? rest.find((o) => !g.pattern!.test(o.word)) : undefined;
+  if (off !== undefined) return { error: `operand ${off.word} is outside the allowlisted form` };
+  const tail = g.afterDoubleDash !== undefined ? rest.find((o) => o.afterDoubleDash && !g.afterDoubleDash!.test(o.word)) : undefined;
+  if (tail !== undefined) return { error: `argument ${tail.word} after -- is not allowlisted` };
+
+  type Item = { index: number; read?: string; write?: string };
+  const items: Item[] = [];
+  for (const o of p.options) {
+    if (o.kind === "read-path" && o.value !== undefined) items.push({ index: o.index, read: o.value });
+    else if (o.kind === "write-path" && o.value !== undefined) items.push({ index: o.index, read: o.value, write: o.value });
+    // A POSIX-order parser (BSD, POSIXLY_CORRECT) takes the words after the first operand as file operands.
+    if (o.late && g.operands !== "opaque") {
+      items.push({ index: o.index, read: o.word });
+      if (o.value !== undefined) items.push({ index: o.index, read: o.value });
+    }
+  }
+  for (const o of rest) {
+    if (g.operands === "read-path") items.push({ index: o.index, read: o.word });
+    else if (g.operands === "write-path") items.push({ index: o.index, read: o.word, write: o.word });
+  }
+  items.sort((x, y) => x.index - y.index);
+  const readArgs: string[] = [];
+  const pathArgs: string[] = [];
+  for (const it of items) {
+    if (it.read !== undefined) pushUnique(readArgs, it.read);
+    if (it.write !== undefined) pushUnique(pathArgs, it.write);
+  }
+  const nonDirPaths: string[] = [];
+  if (g.nonDirOperands === true) for (const o of rest) pushUnique(nonDirPaths, o.word);
+  return { readArgs, pathArgs, nonDirPaths, operands: rest.map((o) => o.word) };
+}
+
+type GrammarResult = { ok: true; parsed: Extract<Parsed, { ok: true }>; facts: GrammarFacts } | { ok: false; reason: string };
+
+function applyGrammar(name: string, args: readonly string[], g: R.Grammar): GrammarResult {
+  const parsed = parseArgs(args, g);
+  if (!parsed.ok) return { ok: false, reason: `${name}: ${parsed.reason}` };
+  const facts = grammarFacts(parsed, g);
+  if ("error" in facts) return { ok: false, reason: `${name}: ${facts.error}` };
+  return { ok: true, parsed, facts };
+}
+
+/** Grammar facts as verdict fields (empty lists omitted). */
+function factFields(f: GrammarFacts): Pick<Verdict, "readArgs" | "nonDirPaths"> {
+  return { readArgs: f.readArgs, ...(f.nonDirPaths.length > 0 ? { nonDirPaths: f.nonDirPaths } : {}) };
 }
 
 // --- per-command rules ---
 
-function classifyReadOnly(name: string, args: readonly string[], rule: R.ReadOnlyRule): Verdict {
-  const why = `${name} with this option ${rule.denyReason ?? R.DEFAULT_DENY_REASON}`;
-  if (rule.denyLong && hasLong(args, rule.denyLong)) return unknown(why);
-  if (rule.denyShort && hasShort(args, rule.denyShort)) return unknown(why);
-  if (rule.maxPositionals !== undefined && positionals(args).length > rule.maxPositionals) {
-    return unknown(`${name} with an output file argument`);
-  }
-  return readOnly(`${name} is read-only`);
+function classifyGrammar(name: string, args: readonly string[], g: R.Grammar): Verdict {
+  const r = applyGrammar(name, args, g);
+  if (!r.ok) return unknown(r.reason);
+  return { ...readOnly(`${name} is read-only`), ...factFields(r.facts) };
 }
 
+/** find's expression grammar (R40): global options, start points, then primaries from the tables. */
 function classifyFind(args: readonly string[]): Verdict {
   if (args.some((a) => R.FIND_DESTRUCTIVE_PREDICATES.has(a))) return destructive("find -delete removes files");
-  if (args.some((a) => R.FIND_UNKNOWN_PREDICATES.has(a))) return unknown("find predicate executes a command or writes a file");
-  return readOnly("find without action predicates is read-only");
+  const reads: string[] = [];
+  let i = 0;
+  while (i < args.length) {
+    const kind = lookup(R.FIND_GLOBAL, args[i]!);
+    if (kind === undefined && !/^-O[0-3]$/.test(args[i]!)) break;
+    i += kind === "opaque" ? 2 : 1;
+  }
+  while (i < args.length && !args[i]!.startsWith("-")) pushUnique(reads, args[i++]!);
+  while (i < args.length) {
+    const a = args[i]!;
+    if (R.FIND_FLAGS.has(a)) {
+      i++;
+      continue;
+    }
+    const kind = lookup(R.FIND_VALUES, a) ?? (R.FIND_NEWER_FILE.test(a) ? "read-path" : R.FIND_NEWER_TIME.test(a) ? "opaque" : undefined);
+    if (kind === undefined) return unknown(`find: unrecognized expression ${a} (R40: primaries outside the grammar are unknown)`);
+    if (typeof kind === "object") return unknown(`find ${a} ${kind.reject}`);
+    const value = args[i + 1];
+    if (value === undefined) return unknown(`find ${a} without a value`);
+    if (kind === "read-path") pushUnique(reads, value);
+    i += 2;
+  }
+  return { ...readOnly("find without action predicates is read-only"), readArgs: reads };
 }
 
 /** Absolute, home-relative or parent-relative spellings (posix or Windows) that can point outside the work tree. */
@@ -223,7 +367,8 @@ export function isPathLikeArg(w: string): boolean {
  * R25: every word that may name a file read by the command: non-flag words, every word after `--`, the value of
  * `--opt=value`, and for a short cluster `-xVALUE` both the text after the first letter and, when a path character
  * (`/`, `\`, `~`, `.`) appears later in the cluster, the text from it (`-rf/x` → `f/x`, `/x`). Over-reporting is
- * intended: a word that is not a file costs only a fact.
+ * intended: a word that is not a file costs only a fact. R40: used only for segments without a grammar (exact-argv
+ * runners, project-declared commands); grammar-parsed programs report their read facts precisely.
  */
 export function extractReadArgs(args: readonly string[]): string[] {
   const out: string[] = [];
@@ -272,29 +417,58 @@ function classifyGit(args: readonly string[]): Verdict {
   const sub = args[i];
   if (sub === undefined) return unknown("git without a subcommand");
   const v = classifyGitSubcommand(sub, args.slice(i + 1));
-  if (dirs.length > 0 && v.stagePaths !== undefined) {
-    return unknown("git -C with git add: the staged paths resolve against another directory and cannot be checked (R37)", dirs);
+  if (dirs.length === 0) return v;
+  // Hard classes keep their class (they ask anyway); everything else is unknown (R41).
+  if (isHard(v.class)) return { ...v, pathArgs: [...dirs, ...v.pathArgs] };
+  const u = unknown("git -C runs git in another directory, against which its operands resolve; the facts do not model that (R41)");
+  if (v.class === "read-only") u.readPaths = dirs;
+  else u.pathArgs = dirs;
+  return u;
+}
+
+/** R41: the repository path a git word selects: `rev:path`, `:path`, `:N:path`, or the word itself (a pathspec). */
+function logicalPath(w: string): string {
+  if (w.startsWith(":")) {
+    const rest = w.slice(1);
+    return /^[0-3]:/.test(rest) ? rest.slice(2) : rest;
   }
-  if (dirs.length > 0) {
-    if (v.class === "read-only") v.readPaths = [...dirs, ...(v.readPaths ?? [])];
-    else v.pathArgs = [...dirs, ...v.pathArgs];
+  const i = w.indexOf(":");
+  return i < 0 ? w : w.slice(i + 1);
+}
+
+/** R40/R41: an allowlisted read-only git subcommand parsed against its grammar, with logical paths and content. */
+function classifyGitRead(sub: string, rest: readonly string[], g: R.Grammar): Verdict {
+  const r = applyGrammar(`git ${sub}`, rest, g);
+  if (!r.ok) return unknown(r.reason);
+  // git diff falls back to --no-index on its own when a path lies outside the work tree.
+  if (sub === "diff" && r.facts.operands.some(mayLeaveWorkTree)) {
+    return unknown("git diff with a path that may lie outside the work tree compares arbitrary files (implicit --no-index)");
   }
-  return v;
+  const logical: string[] = [];
+  const items: { index: number; path: string }[] = [];
+  for (const o of r.parsed.options) {
+    // `-L <start>,<end>:<file>` / `-L :<funcname>:<file>`: the file follows the last colon.
+    if (o.name === "-L" && o.value !== undefined) items.push({ index: o.index, path: o.value.slice(o.value.lastIndexOf(":") + 1) });
+  }
+  for (const o of r.parsed.operands) items.push({ index: o.index, path: logicalPath(o.word) });
+  items.sort((x, y) => x.index - y.index);
+  for (const it of items) pushUnique(logical, it.path);
+  const opts = r.parsed.options.map((o) => o.name);
+  const content =
+    R.GIT_CONTENT_SUBCOMMANDS.has(sub) ||
+    (sub === "log" && opts.some((n) => R.GIT_LOG_CONTENT.has(n))) ||
+    (sub === "status" && opts.some((n) => n === "-v" || n === "--verbose"));
+  return {
+    ...readOnly(`git ${sub} is read-only`),
+    ...factFields(r.facts),
+    ...(logical.length > 0 ? { logicalPaths: logical } : {}),
+    ...(content ? { trackedContent: true } : {}),
+  };
 }
 
 function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
-  const readDeny = lookup(R.GIT_READ_ONLY, sub);
-  if (readDeny) {
-    const shortDeny = lookup(R.GIT_READ_ONLY_SHORT, sub);
-    if ((readDeny.length > 0 && hasLong(rest, readDeny)) || (shortDeny !== undefined && hasShort(rest, shortDeny))) {
-      return unknown(`git ${sub} with an option that writes, runs code, reads a named file or leaves the repository`);
-    }
-    // git diff falls back to --no-index on its own when a path lies outside the work tree.
-    if (sub === "diff" && positionals(rest).some(mayLeaveWorkTree)) {
-      return unknown("git diff with a path that may lie outside the work tree compares arbitrary files (implicit --no-index)");
-    }
-    return readOnly(`git ${sub} is read-only`);
-  }
+  const read = lookup(R.GIT_READ_GRAMMARS, sub);
+  if (read) return classifyGitRead(sub, rest, read);
   switch (sub) {
     case "branch": {
       if (hasShort(rest, "dD") || hasLong(rest, ["--delete"])) return destructive("git branch -d/-D deletes a branch");
@@ -346,20 +520,29 @@ function classifyGitSubcommand(sub: string, rest: readonly string[]): Verdict {
       return create ? localWrite("git checkout -b is allowlisted") : destructive("git checkout may discard working tree changes");
     }
     case "stash": {
-      if (rest[0] === "list") return readOnly("git stash list is read-only");
+      if (rest[0] === "list") {
+        // `git stash list` takes log options, `--output=<file>` included (finding 2).
+        return rest.length === 1 ? { ...readOnly("git stash list is read-only"), readArgs: [] } : unknown("git stash list with arguments takes log options, which can write files (R41)");
+      }
       if (rest[0] === "push") {
         const opts = rest.slice(1);
         if (hasShort(opts, R.GIT_STASH_UNTRACKED_SHORT) || hasLong(opts, R.GIT_STASH_UNTRACKED_LONG)) {
           return unknown("git stash with untracked or ignored files stores them in git objects, secret files included (R37)");
         }
-        return localWrite("git stash push is allowlisted");
+        const r = applyGrammar("git stash push", opts, R.GIT_STASH_PUSH_GRAMMAR);
+        if (!r.ok) return unknown(r.reason);
+        return { ...localWrite("git stash push is allowlisted"), ...factFields(r.facts) };
       }
       if (rest[0] === "drop" || rest[0] === "clear") return destructive(`git stash ${rest[0]} discards stashed work`);
       return unknown("git stash other than push/list");
     }
     case "restore": {
       if (hasShort(rest, "W") || hasLong(rest, ["--worktree"])) return destructive("git restore --worktree discards changes");
-      if (hasShort(rest, "S") || hasLong(rest, ["--staged"])) return localWrite("git restore --staged is allowlisted");
+      if (hasShort(rest, "S") || hasLong(rest, ["--staged"])) {
+        const r = applyGrammar("git restore --staged", rest, R.GIT_RESTORE_STAGED_GRAMMAR);
+        if (!r.ok) return unknown(r.reason);
+        return { ...localWrite("git restore --staged is allowlisted"), ...factFields(r.facts) };
+      }
       return destructive("git restore discards working tree changes");
     }
     case "reset":
@@ -419,21 +602,25 @@ function classifyGitAdd(rest: readonly string[]): Verdict {
 /** R37: `git commit` is allowlisted without `-a`/`--all`, without pathspecs and with listed options only. */
 function classifyGitCommit(rest: readonly string[]): Verdict {
   if (hasLong(rest, ["--amend"])) return destructive("git commit --amend rewrites history");
-  const parsed = parseWithSpec(rest, R.GIT_COMMIT_SPEC);
-  if (!parsed.ok) return unknown(`git commit ${parsed.option} may stage or read files (R37)`);
-  if (parsed.positionals.length > 0) return unknown("git commit with pathspecs stages those paths, secret files included (R37)");
-  return localWrite("git commit is allowlisted");
+  const parsed = parseArgs(rest, R.GIT_COMMIT_GRAMMAR);
+  if (!parsed.ok) return unknown(`git commit: ${parsed.reason}; it may stage or read files (R37)`);
+  if (parsed.operands.length > 0) return unknown("git commit with pathspecs stages those paths, secret files included (R37)");
+  return { ...localWrite("git commit is allowlisted"), readArgs: [] };
 }
 
+/** An allowlisted runner (ruling 18) parsed against its grammar (R40). */
 function classifyBin(bin: string, rest: readonly string[]): Verdict {
-  if (R.ANY_ARGS_RUNNERS.has(bin)) return localWrite(`${bin} is an allowlisted runner`);
-  if (bin === "prettier") {
-    if (rest.some((a) => R.PRETTIER_WRITE.includes(a))) return localWrite("prettier --write is allowlisted", positionals(rest));
-    return rest.some((a) => R.PRETTIER_REQUIRED.includes(a))
-      ? localWrite("prettier --check is allowlisted")
-      : unknown("prettier without --check or --write");
-  }
-  return unknown(`${bin} is not an allowlisted runner`);
+  const g = lookup(R.RUNNER_GRAMMARS, bin);
+  if (g === undefined) return unknown(`${bin} is not an allowlisted runner`);
+  const r = applyGrammar(bin, rest, g);
+  if (!r.ok) return unknown(r.reason);
+  const names = r.parsed.options.map((o) => o.name);
+  if (bin === "prettier" && !names.some((n) => R.PRETTIER_REQUIRED.includes(n))) return unknown("prettier without --check or --write");
+  const rewrites = (lookup(R.RUNNER_REWRITE, bin) ?? []).some((n) => names.includes(n));
+  if (!rewrites) return { ...localWrite(`${bin} is an allowlisted runner`), readArgs: r.facts.readArgs };
+  // `prettier --write` / `eslint --fix` rewrite each operand (a directory: every file below it, R43).
+  const targets = r.facts.operands.filter((o) => o !== "-");
+  return { ...localWrite(`${bin} rewrites its operands`, targets), readArgs: r.facts.readArgs, ...(targets.length > 0 ? { nonDirPaths: targets } : {}) };
 }
 
 function classifyPackageManager(name: string, args: readonly string[]): Verdict {
@@ -461,41 +648,30 @@ function classifyNpx(args: readonly string[]): Verdict {
 function classifyGo(args: readonly string[]): Verdict {
   const sub = args[0];
   if (sub === undefined || !R.GO_SUBCOMMANDS.has(sub)) return unknown(`go ${sub ?? ""} is not allowlisted`.trim());
-  const rest = args.slice(1);
-  const flagName = (a: string): string => (a.startsWith("--") ? a.slice(1) : a);
-  if (rest.some((a) => R.GO_DENY.some((d) => flagName(a) === d || flagName(a).startsWith(`${d}=`)))) {
-    return unknown("go option runs another program");
-  }
-  const outputs: string[] = [];
-  for (let i = 0; i < rest.length; i++) {
-    const f = flagName(rest[i]!);
-    if (f === "-o" && rest[i + 1] !== undefined) outputs.push(rest[i + 1]!);
-    else if (f.startsWith("-o=")) outputs.push(f.slice(3));
-  }
-  return localWrite(`go ${sub} is allowlisted`, outputs);
+  const r = applyGrammar(`go ${sub}`, args.slice(1), R.GO_GRAMMAR);
+  if (!r.ok) return unknown(r.reason);
+  return { ...localWrite(`go ${sub} is allowlisted`, r.facts.pathArgs), readArgs: r.facts.readArgs };
 }
 
 function classifyCargo(args: readonly string[]): Verdict {
   const sub = args[0];
   if (sub === undefined || !R.CARGO_SUBCOMMANDS.has(sub)) return unknown("cargo subcommand is not allowlisted");
-  if (args.some((a) => R.CARGO_DENY.some((d) => a === d || a.startsWith(`${d}=`) || (d === "-Z" && a.startsWith("-Z"))))) {
-    return unknown("cargo option injects configuration");
-  }
-  return localWrite(`cargo ${sub} is allowlisted`);
+  const r = applyGrammar(`cargo ${sub}`, args.slice(1), R.CARGO_GRAMMAR);
+  if (!r.ok) return unknown(r.reason);
+  return { ...localWrite(`cargo ${sub} is allowlisted`), readArgs: r.facts.readArgs };
 }
 
-function classifyPathCommand(name: string, args: readonly string[], spec: R.OptionSpec, allowlisted: boolean): Verdict {
-  const parsed = parseWithSpec(args, spec);
-  if (!parsed.ok) return unknown(`${name}: unrecognized option ${parsed.option}`, positionals(args));
-  const targets = parsed.options.filter((o) => R.TARGET_DIRECTORY_OPTIONS.has(o.name) && o.value !== undefined).map((o) => o.value!);
-  return localWrite(`${name} writes local files`, [...targets, ...parsed.positionals], allowlisted);
+function classifyPathCommand(name: string, args: readonly string[], g: R.Grammar, allowlisted: boolean): Verdict {
+  const r = applyGrammar(name, args, g);
+  if (!r.ok) return unknown(r.reason, positionals(args));
+  return { ...localWrite(`${name} writes local files`, r.facts.pathArgs, allowlisted), ...factFields(r.facts) };
 }
 
 function classifyRm(args: readonly string[]): Verdict {
   if (hasShort(args, "rR") || hasLong(args, ["--recursive", "--no-preserve-root"])) {
     return destructive("recursive rm", positionals(args));
   }
-  return classifyPathCommand("rm", args, R.RM_SPEC, false);
+  return classifyPathCommand("rm", args, R.RM_GRAMMAR, false);
 }
 
 function isPlainSubstitution(script: string): boolean {
@@ -517,49 +693,70 @@ function classifySed(args: readonly string[]): Verdict {
     }
   }
   if (!inPlace) return unknown("sed without -i");
-  const parsed = parseWithSpec(remaining, R.SED_SPEC);
-  if (!parsed.ok) return unknown(`sed: unrecognized option ${parsed.option}`);
+  const parsed = parseArgs(remaining, R.SED_GRAMMAR);
+  if (!parsed.ok) return unknown(`sed: ${parsed.reason}`);
   const scripts = parsed.options.filter((o) => o.name === "-e").map((o) => o.value!);
-  const files = [...parsed.positionals];
+  const files = parsed.operands.map((o) => o.word);
   if (scripts.length === 0 && files.length > 0) scripts.push(files.shift()!);
   if (scripts.length !== 1 || !isPlainSubstitution(scripts[0]!)) return unknown("sed script other than one plain s/re/repl/flags");
   if (files.length === 0) return unknown("sed -i without files");
-  return localWrite("sed -i with a plain substitution is allowlisted", files);
+  return { ...localWrite("sed -i with a plain substitution is allowlisted", files), readArgs: [...files] };
+}
+
+/** R42: the local files a curl/wget data option sends (`@file`, `name=@file`, `name=<file`, `name@file`). */
+function dataFileRefs(name: string, value: string): string[] {
+  const out: string[] = [];
+  if (value.startsWith("@")) out.push(value.slice(1));
+  const form = /=([@<])([^;]*)/.exec(value);
+  if (form !== null && (name === "-F" || name === "--form")) out.push(form[2]!);
+  if (name === "--data-urlencode" && !value.startsWith("@")) {
+    const at = value.indexOf("@");
+    if (at > 0 && !value.slice(0, at).includes("=")) out.push(value.slice(at + 1));
+  }
+  return out.filter((f) => f !== "" && f !== "-");
 }
 
 function classifyNet(name: "curl" | "wget", args: readonly string[]): Verdict {
   const spec = name === "curl" ? R.CURL_SPEC : R.WGET_SPEC;
-  const effects = new Map<string, R.NetEffect>();
-  const parsed = parseOptions(
-    args,
-    (c) => {
-      const s = lookup(spec.short, c);
-      if (s) effects.set(`-${c}`, s.effect);
-      return s;
-    },
-    (n) => {
-      const s = lookup(spec.long, n);
-      if (s) effects.set(n, s.effect);
-      return s;
-    },
-  );
-  if (!parsed.ok) return unknown(`${name}: unrecognized option ${parsed.option}`);
+  const grammar: R.Grammar = {
+    short: Object.fromEntries(Object.entries(spec.short).map(([k, s]) => [k, s.value ? "opaque" : "flag"])),
+    long: Object.fromEntries(Object.entries(spec.long).map(([k, s]) => [k, s.value ? "opaque" : "flag"])),
+    operands: "opaque",
+  };
+  const parsed = parseArgs(args, grammar);
+  if (!parsed.ok) return unknown(`${name}: ${parsed.reason} (R42: options outside the minimal grammar are unknown)`);
+  const effect = (o: ParsedOption): R.NetEffect | undefined =>
+    (o.name.startsWith("--") ? lookup(spec.long, o.name) : lookup(spec.short, o.name.slice(1)))?.effect;
   let mutate = false;
-  let config = false;
+  let fileRef: string | undefined;
+  let cookieFile = false;
   let badMethod = false;
   let cwdWrite = false;
   let outputGiven = false;
   let outDir: string | undefined;
   const writes: string[] = [];
-  const urls = [...parsed.positionals];
+  const reads: string[] = [];
+  const urls = parsed.operands.map((o) => o.word);
   for (const o of parsed.options) {
     const value = o.value ?? "";
-    switch (effects.get(o.name)) {
+    switch (effect(o)) {
+      case "safe":
+        if (value.startsWith("@")) fileRef ??= o.name;
+        if (o.name === "--url") urls.push(value);
+        break;
+      case "cookie":
+        if (!value.includes("=")) cookieFile = true;
+        break;
       case "mutate":
         mutate = true;
         break;
-      case "config":
-        config = true;
+      case "mutate-data":
+        mutate = true;
+        for (const f of dataFileRefs(o.name, value)) pushUnique(reads, f);
+        break;
+      case "mutate-file":
+        mutate = true;
+        if (value !== ".") pushUnique(reads, value);
         break;
       case "method": {
         const m = value.toUpperCase();
@@ -580,12 +777,11 @@ function classifyNet(name: "curl" | "wget", args: readonly string[]): Verdict {
       case "write-file":
         if (value !== "-") writes.push(value);
         break;
-      default:
-        if (o.name === "--url") urls.push(value);
     }
   }
-  if (mutate) return remote(`${name} sends data or uses a mutating method`);
-  if (config) return unknown(`${name} reads options from a config file or executes commands`);
+  if (mutate) return { ...remote(`${name} sends data or uses a mutating method`), readArgs: reads };
+  if (fileRef !== undefined) return unknown(`${name} ${fileRef} with an @-prefixed value reads the named file (R42)`);
+  if (cookieFile) return unknown(`${name} -b/--cookie with a file name reads cookies from it (R42)`);
   if (badMethod) return unknown(`${name} with an unrecognized method`);
   if (urls.length === 0 || urls.some((u) => !R.NET_URL.test(u))) return unknown(`${name} without an http(s) URL`);
   if (name === "wget" && !outputGiven && !parsed.options.some((o) => o.name === "--spider")) cwdWrite = true;
@@ -595,8 +791,8 @@ function classifyNet(name: "curl" | "wget", args: readonly string[]): Verdict {
     if (outDir !== undefined) pathArgs.push(`${outDir}/${w}`);
   }
   if (cwdWrite || (outDir !== undefined && writes.length > 0)) pathArgs.push(outDir ?? ".");
-  if (pathArgs.length > 0) return localWrite(`${name} writes a local file`, pathArgs, false);
-  return readOnly(`${name} fetch to stdout is read-only`);
+  if (pathArgs.length > 0) return { ...localWrite(`${name} writes a local file`, pathArgs, false), readArgs: [] };
+  return { ...readOnly(`${name} fetch to stdout is read-only`), readArgs: [] };
 }
 
 function classifyGh(args: readonly string[]): Verdict {
@@ -617,7 +813,10 @@ function classifyGh(args: readonly string[]): Verdict {
     else if (a.startsWith("--") && "--method".startsWith(a.split("=")[0]!)) method = "";
     if (method !== undefined && method.toUpperCase() !== "GET") return remote("gh api with a non-GET method");
   }
-  return readOnly("gh api GET is read-only");
+  if (idx > 0) return unknown("gh options before api are not in the rule tables");
+  const r = applyGrammar("gh api", rest, R.GH_API_GRAMMAR);
+  if (!r.ok) return unknown(r.reason);
+  return { ...readOnly("gh api GET is read-only"), readArgs: [] };
 }
 
 function classifyByName(name: string, args: readonly string[]): Verdict {
@@ -626,10 +825,10 @@ function classifyByName(name: string, args: readonly string[]): Verdict {
   if (R.ALWAYS_UNKNOWN.has(name)) return unknown(`${name} runs or alters another command`);
 
   if (R.RECURSIVE_READERS.has(name)) return unknown(`${name} searches directories recursively and can read secrets (R23)`);
-  const rule = lookup(R.READ_ONLY_COMMANDS, name);
-  if (rule) return classifyReadOnly(name, args, rule);
+  const grammar = lookup(R.READ_ONLY_GRAMMARS, name);
+  if (grammar) return classifyGrammar(name, args, grammar);
   if (R.PACKAGE_MANAGERS.has(name)) return classifyPackageManager(name, args);
-  if (R.ANY_ARGS_RUNNERS.has(name) || name === "prettier") return classifyBin(name, args);
+  if (lookup(R.RUNNER_GRAMMARS, name) !== undefined) return classifyBin(name, args);
   if (R.DESTRUCTIVE_COMMANDS.has(name) || R.DESTRUCTIVE_PREFIXES.some((p) => name.startsWith(p))) {
     const outputs = name === "dd" ? args.filter((a) => a.startsWith("of=")).map((a) => a.slice(3)) : [];
     return destructive(`${name} is destructive`, outputs);
@@ -650,9 +849,11 @@ function classifyByName(name: string, args: readonly string[]): Verdict {
     case "npx":
       return classifyNpx(args);
     case "uv":
-      if (startsWithArgs(args, R.UV_ALLOWLIST_PREFIX) || R.UV_ALLOWLIST_EXACT.some((t) => argvEqual(t, args))) {
-        return localWrite(`uv ${args.slice(0, 2).join(" ")} is allowlisted`);
+      if (startsWithArgs(args, R.UV_ALLOWLIST_PREFIX)) {
+        const v = classifyBin("pytest", args.slice(R.UV_ALLOWLIST_PREFIX.length));
+        return v.class === "local-write" ? { ...v, reasons: ["uv run pytest is allowlisted"] } : v;
       }
+      if (R.UV_ALLOWLIST_EXACT.some((t) => argvEqual(t, args))) return localWrite(`uv ${args.join(" ")} is allowlisted`);
       return unknown("uv invocation is not allowlisted");
     case "go":
       return classifyGo(args);
@@ -661,17 +862,17 @@ function classifyByName(name: string, args: readonly string[]): Verdict {
     case "make":
       return args.length === 1 && R.MAKE_TARGETS.has(args[0]!) ? localWrite(`make ${args[0]} is allowlisted`) : unknown("make invocation is not allowlisted");
     case "mkdir":
-      return classifyPathCommand(name, args, R.MKDIR_SPEC, true);
+      return classifyPathCommand(name, args, R.MKDIR_GRAMMAR, true);
     case "touch":
-      return classifyPathCommand(name, args, R.TOUCH_SPEC, true);
+      return classifyPathCommand(name, args, R.TOUCH_GRAMMAR, true);
     case "tee":
-      return classifyPathCommand(name, args, R.TEE_SPEC, true);
+      return classifyPathCommand(name, args, R.TEE_GRAMMAR, true);
     case "cp":
-      return classifyPathCommand(name, args, R.CP_SPEC, true);
+      return classifyPathCommand(name, args, R.CP_GRAMMAR, true);
     case "mv":
-      return classifyPathCommand(name, args, R.MV_SPEC, true);
+      return classifyPathCommand(name, args, R.MV_GRAMMAR, true);
     case "rmdir":
-      return classifyPathCommand(name, args, R.RMDIR_SPEC, false);
+      return classifyPathCommand(name, args, R.RMDIR_GRAMMAR, false);
     case "rm":
       return classifyRm(args);
     case "sed":
@@ -712,12 +913,13 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
     v = name === undefined ? unknown("empty command word") : classifyByName(name, seg.argv.slice(1));
     const declared = ctx.projectCommands.some((pc) => argvEqual(pc, seg.argv));
     if (declared && !isHard(v.class)) {
+      // The grammar's facts stay (content and directory checks); read facts fall back to the over-approximation.
+      const { readArgs: _grammarReads, ...facts } = v;
       v = {
+        ...facts,
         class: v.class === "read-only" ? "read-only" : "local-write",
         allowlisted: true,
         reasons: ["project-declared command"],
-        pathArgs: v.pathArgs,
-        ...(v.readPaths ? { readPaths: v.readPaths } : {}),
       };
     } else if (name !== argv0 && !isHard(v.class)) {
       v = unknown(`command word \`${argv0}\` is not a canonical command name (path, case or extension)`, v.pathArgs);
@@ -739,7 +941,8 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
     if (r.op !== "<") cls = maxClass(cls, "local-write");
   }
   const allowlisted = v.allowlisted && (cls === "read-only" || cls === "local-write");
-  return { class: cls, allowlisted, reasons, pathArgs, inputPaths, ...(v.stagePaths !== undefined ? { stagePaths: v.stagePaths } : {}) };
+  const { readPaths: _readPaths, ...rest } = v;
+  return { ...rest, class: cls, allowlisted, reasons, pathArgs, inputPaths };
 }
 
 /**
@@ -781,6 +984,8 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
       pathArgs: [],
       inputPaths: [],
       readArgs: [],
+      logicalPaths: [],
+      trackedContent: false,
       allowlisted: false,
     };
   }
@@ -792,6 +997,8 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
   const pathArgs: string[] = [];
   const inputPaths: string[] = [];
   const readArgs: string[] = [];
+  const logicalPaths: string[] = [];
+  let trackedContent = false;
   const last = tok.segments.length - 1;
   tok.segments.forEach((seg, i) => {
     const v = classifySegment(seg, ctx);
@@ -805,16 +1012,24 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
       v.allowlisted = false;
       v.reasons = [...v.reasons, ...linkReasons];
     }
-    const segReadArgs = v.class === "read-only" || v.class === "local-write" ? extractReadArgs(seg.argv.slice(1)) : [];
+    // R40: a grammar's read facts are exact (any class: a remote curl upload reports its file); segments without a
+    // grammar fall back to the R25 over-approximation when read-only or local-write.
+    const segReadArgs = v.readArgs ?? (v.class === "read-only" || v.class === "local-write" ? extractReadArgs(seg.argv.slice(1)) : []);
+    const nonEmpty = (k: "stagePaths" | "nonDirPaths" | "logicalPaths") => (v[k] !== undefined && v[k].length > 0 ? { [k]: [...v[k]] } : {});
     segments.push({
       argv: seg.argv,
       class: v.class,
       allowlisted: v.allowlisted,
       pathArgs: [...v.pathArgs],
       inputPaths: [...v.inputPaths],
-      readArgs: segReadArgs,
-      ...(v.stagePaths !== undefined && v.stagePaths.length > 0 ? { stagePaths: [...v.stagePaths] } : {}),
+      readArgs: [...segReadArgs],
+      ...nonEmpty("stagePaths"),
+      ...nonEmpty("nonDirPaths"),
+      ...nonEmpty("logicalPaths"),
+      ...(v.trackedContent === true ? { trackedContent: true } : {}),
     });
+    for (const p of v.logicalPaths ?? []) if (!logicalPaths.includes(p)) logicalPaths.push(p);
+    trackedContent ||= v.trackedContent === true;
     cls = maxClass(cls, v.class);
     if (isHard(v.class) && (hard === undefined || severity(v.class) > severity(hard))) hard = v.class;
     allowlisted &&= v.allowlisted;
@@ -824,7 +1039,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
     for (const p of v.inputPaths) if (!inputPaths.includes(p)) inputPaths.push(p);
     for (const w of segReadArgs) if (!readArgs.includes(w)) readArgs.push(w);
   });
-  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, readArgs, allowlisted };
+  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, readArgs, logicalPaths, trackedContent, allowlisted };
   if (hard !== undefined) result.hardClass = hard;
   return result;
 }

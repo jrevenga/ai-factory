@@ -542,7 +542,11 @@ describe("evaluateGate: commands", () => {
   it("R24: a git -C directory is a read fact checked for secrets", () => {
     expect(evaluateGate(bash("git -C ~/ status", [["~/", "/h"]]), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
     expect(evaluateGate(bash("git -C ~/ status"), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
-    expect(evaluateGate(bash("git -C ../other status", [["../other", "/w/other"]]), ctx({ route: ANSWER })).decision).toBe("allow");
+  });
+
+  it("R41: git -C is unknown (operands would resolve against another directory): denied on the answer route", () => {
+    expect(evaluateGate(bash("git -C ../other status", [["../other", "/w/other"]]), ctx({ route: ANSWER })).decision).toBe("deny");
+    expect(evaluateGate(bash("git -C ../other status", [["../other", "/w/other"]]), ctx(UNATTENDED))).toMatchObject({ decision: "ask", class: "unknown" });
   });
 
   it("R24: git stash list is read-only and runs on the answer route", () => {
@@ -553,19 +557,22 @@ describe("evaluateGate: commands", () => {
     expect(evaluateGate(bash("mkdir /tmp/h", [["/tmp/h"]]), ctx(UNATTENDED)).decision).toBe("allow");
   });
 
-  it("R25: a path-like read argument whose fact is a secret asks, whatever option names it", () => {
-    // `head -n` takes a count; the classification is read-only, so only readArgs can catch the file.
+  it("R25/R40: a file named by a read-path option value whose fact is a secret asks, separate, attached or long", () => {
+    // Fix round 4: the old fixtures (`head -n <secret>`, `cut -d<secret>`) named a count or a delimiter, not a file.
     const c = ctx({ route: ANSWER, mode: "unattended" });
-    expect(evaluateGate(bash("head -n ~/.aws/credentials x", [["~/.aws/credentials"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
-    expect(evaluateGate(bash("sort -k1 --field-separator=/h/.aws/credentials x", [["/h/.aws/credentials"]]), c)).toMatchObject({
-      decision: "ask",
-      hardGate: "secrets",
-    });
-    expect(evaluateGate(bash("cut -d/h/.ssh/id_rsa x", [["/h/.ssh/id_rsa"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("du -X ~/.aws/credentials x", [["~/.aws/credentials"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("du -sX/h/.aws/credentials x", [["/h/.aws/credentials"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("date --reference=/h/.ssh/id_rsa", [["/h/.ssh/id_rsa"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("R40: an opaque option value is not a read argument (no fact needed)", () => {
+    const c = ctx({ route: ANSWER, mode: "unattended" });
+    expect(evaluateGate(bash("cut -d/ -f1 x"), c).decision).toBe("allow");
+    expect(evaluateGate(bash("head -n ~/.aws/credentials x"), c).decision).toBe("allow");
   });
 
   it("R25: a path-like read argument without a fact asks (secrets), on the answer route too", () => {
-    expect(evaluateGate(bash("head -n ~/.aws/credentials x"), ctx({ route: ANSWER }))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("du -X ~/.aws/credentials x"), ctx({ route: ANSWER }))).toMatchObject({ decision: "ask", hardGate: "secrets" });
     expect(evaluateGate(bash("cat ./notes.txt"), ctx())).toMatchObject({ decision: "ask", hardGate: "secrets" });
   });
 
@@ -697,5 +704,85 @@ describe("evaluateGate: git staging (R37)", () => {
 
   it("git add of an explicit path without a fact asks `secrets`", () => {
     expect(evaluateGate(staged("git add notes", []), ctx(UNATTENDED))).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+});
+
+describe("evaluateGate: secret-directory guard folds case on posix (R27)", () => {
+  it("the grep tool on a mixed-case home, credentials or agent directory asks", () => {
+    for (const target of ["/h/.AWS", "/H/.aws", "/H", "/h/.SSH", "/h/.Ssh", "/h/.Pi/Agent", "/h/.CONFIG/gh", "/h/.Docker"]) {
+      const r = evaluateGate({ kind: "read", tool: "grep", path: fact(target) }, ctx({ route: ANSWER, mode: "unattended" }));
+      expect(r, target).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    }
+  });
+
+  it("command read facts on mixed-case secret directories ask", () => {
+    const c = ctx({ route: ANSWER, mode: "unattended" });
+    expect(evaluateGate(bash("ls /h/.AWS", [["/h/.AWS"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(evaluateGate(bash("ls x", [["x", "/H/.ssh"]]), c)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("write-root containment stays case-sensitive on posix", () => {
+    expect(evaluateGate(write("/W/proj/a.txt"), ctx())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+    expect(evaluateGate(bash("touch /W/proj/a.txt", [["/W/proj/a.txt"]]), ctx())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+  });
+
+  it("does not fold unrelated names into a guard", () => {
+    expect(evaluateGate({ kind: "read", tool: "grep", path: fact("/h/.AWS-notes") }, ctx()).decision).toBe("allow");
+  });
+});
+
+describe("evaluateGate: git content selection (R41)", () => {
+  const git = (command: string, trackedSecret?: boolean): ToolAction => ({
+    kind: "command",
+    tool: "bash",
+    command,
+    pathFacts: [],
+    ...(trackedSecret === undefined ? {} : { trackedSecret }),
+  });
+
+  it("a logical secret path in rev:path, :path, :N:path or -L asks secrets, whatever the tracked-secret fact", () => {
+    for (const command of ["git show HEAD:.env", "git show :.env", "git show :0:.env", "git diff HEAD:.env HEAD:notes.txt", "git log -L 1,2:.env", "git show HEAD:.ssh/id_rsa", "git show HEAD:.aws/credentials"]) {
+      for (const over of [{}, { route: ANSWER }]) {
+        expect(evaluateGate(git(command, false), ctx(over)), command).toMatchObject({ decision: "ask", hardGate: "secrets" });
+      }
+    }
+  });
+
+  it("a content-printing git command asks secrets when the repository tracks a secret, or when that is unknown", () => {
+    for (const command of ["git diff HEAD", "git show HEAD", "git log -p -1", "git blame README.md"]) {
+      expect(evaluateGate(git(command, true), ctx({ route: ANSWER })), command).toMatchObject({ decision: "ask", hardGate: "secrets" });
+      expect(evaluateGate(git(command), ctx({ route: ANSWER })), command).toMatchObject({ decision: "ask", hardGate: "secrets" });
+      expect(evaluateGate(git(command, false), ctx({ route: ANSWER })), command).toMatchObject({ decision: "allow" });
+    }
+  });
+
+  it("git commands that print no file content need no tracked-secret fact", () => {
+    for (const command of ["git status", "git log --oneline -5", "git rev-parse HEAD", "git ls-files"]) {
+      expect(evaluateGate(git(command), ctx({ route: ANSWER })).decision, command).toBe("allow");
+    }
+  });
+});
+
+describe("evaluateGate: directory operands (R43)", () => {
+  const cmd = (command: string, facts: PathFacts[]): ToolAction => ({ kind: "command", tool: "bash", command, pathFacts: facts });
+  const f = (input: string, directory: boolean | undefined): PathFacts => ({ ...fact(input), exists: true, ...(directory === undefined ? {} : { directory }) });
+
+  it("diff with a directory operand (or one of unknown kind) is unknown", () => {
+    for (const d of [true, undefined]) {
+      expect(evaluateGate(cmd("diff a b", [f("a", d), f("b", false)]), ctx(UNATTENDED)), String(d)).toMatchObject({ decision: "ask", class: "unknown" });
+      expect(evaluateGate(cmd("diff a b", [f("a", d), f("b", false)]), ctx({ route: ANSWER })).decision).toBe("deny");
+    }
+    expect(evaluateGate(cmd("diff a b", [f("a", false), f("b", false)]), ctx({ route: ANSWER }))).toMatchObject({ decision: "allow", class: "read-only" });
+  });
+
+  it("cp with a directory source or destination is unknown; a file-to-file copy stays allowlisted", () => {
+    expect(evaluateGate(cmd("cp safe.txt out", [f("safe.txt", false), f("out", true)]), ctx(UNATTENDED))).toMatchObject({ decision: "ask", class: "unknown" });
+    expect(evaluateGate(cmd("cp -R src out", [f("src", true), f("out", false)]), ctx(UNATTENDED))).toMatchObject({ decision: "ask", class: "unknown" });
+    expect(evaluateGate(cmd("cp a.txt b.txt", [f("a.txt", false), f("b.txt", false)]), ctx(UNATTENDED))).toMatchObject({ decision: "allow" });
+  });
+
+  it("the reason names the directory operand", () => {
+    const r = evaluateGate(cmd("diff a b", [f("a", true), f("b", false)]), ctx(UNATTENDED));
+    expect(r.reason).toContain("R43");
   });
 });
