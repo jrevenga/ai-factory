@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
 import { acquireLock, borrowerLeasePath, isPidAlive, Locked, LockLost, ownerFilePath, readLockHolder, writerGroupsPath } from "../../../src/adapters/store/lock.ts";
 import { deadPid } from "../../helpers/dead-pid.ts";
-import { WRITER_TOKEN_ENV } from "../../../src/adapters/platform/process.ts";
+import { processGroupAlive, recordedProcessGroups, stopRecordedProcessGroups, WRITER_TOKEN_ENV } from "../../../src/adapters/platform/process.ts";
 import { isolatedEnv } from "../../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
@@ -333,4 +333,47 @@ describe("borrower lease and writer groups (R17 amended)", () => {
     expect(existsSync(join(writerGroupsPath(paths), String(sleeper.pid)))).toBe(false);
     await lock.release();
   });
+
+  it.skipIf(process.platform === "win32")(
+    "schedule (R21-P1): a live tokenless descendant whose recorded leader exited → Locked naming the group, record kept, never signalled",
+    async () => {
+      const fixture = fileURLToPath(new URL("../../fixtures/proc/tokenless-descendant.mjs", import.meta.url));
+      const pidFile = join(tmp.dir, "descendant.pid");
+      const termFile = join(tmp.dir, "descendant.sigterm");
+      // The recorded group leader carries the token; its descendant was started with a clean environment.
+      const leader = spawn(process.execPath, [fixture, pidFile, termFile], { detached: true, stdio: "ignore", env: { ...process.env, [WRITER_TOKEN_ENV]: "tok-d" } });
+      children.push(leader);
+      const pgid = leader.pid as number;
+      await new Promise((r) => leader.once("exit", r)); // the leader is gone; its group is not
+      const descendant = Number(await readFile(pidFile, "utf8"));
+      try {
+        expect(processGroupAlive(pgid)).toBe(true);
+        await mkdir(writerGroupsPath(paths), { recursive: true });
+        await writeFile(join(writerGroupsPath(paths), String(pgid)), "tok-d");
+
+        const err = await acquireLock(paths).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(Locked);
+        expect((err as Error).message).toContain(`process group ${pgid}`);
+        expect((err as Error).message).toContain(join(writerGroupsPath(paths), String(pgid)));
+        expect(existsSync(paths.lock)).toBe(false);
+        expect(await recordedProcessGroups(writerGroupsPath(paths))).toEqual([pgid]);
+
+        if (process.platform === "linux") {
+          // Lender cleanup: no positive identity → not signalled, record kept, reported as surviving.
+          expect(await stopRecordedProcessGroups(writerGroupsPath(paths))).toEqual([pgid]);
+          await new Promise((r) => setTimeout(r, 300));
+          expect(isPidAlive(descendant)).toBe(true);
+          expect(existsSync(termFile)).toBe(false);
+          expect(await recordedProcessGroups(writerGroupsPath(paths))).toEqual([pgid]);
+        }
+      } finally {
+        if (isPidAlive(descendant)) process.kill(descendant, "SIGKILL");
+      }
+      // Once the writer is gone, the record is cleaned and the lock is available again.
+      for (let i = 0; i < 50 && processGroupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 50));
+      const lock = await acquireLock(paths);
+      expect(await recordedProcessGroups(writerGroupsPath(paths))).toEqual([]);
+      await lock.release();
+    },
+  );
 });

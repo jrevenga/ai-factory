@@ -32,6 +32,7 @@
 import lockfile from "proper-lockfile";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
+import { join } from "node:path";
 import { writeJsonAtomic } from "../platform/json-file.ts";
 import type { FactoryPaths } from "../platform/paths.ts";
 import { liveRecordedProcessGroups, recordProcessGroupsIn } from "../platform/process.ts";
@@ -170,11 +171,16 @@ async function inUseByWriter(paths: FactoryPaths): Promise<Locked | undefined> {
   if (process.platform === "win32") return undefined;
   const alive = await liveRecordedProcessGroups(writerGroupsPath(paths));
   if (alive.length === 0) return undefined;
-  const which = alive.length === 1 ? `process group ${alive[0]}` : `process groups ${alive.join(", ")}`;
+  const one = alive.length === 1;
+  const which = one ? `process group ${alive[0]}` : `process groups ${alive.join(", ")}`;
+  const records = alive.map((g) => join(writerGroupsPath(paths), String(g))).join(", ");
+  // R21-P1: the factory never signals a group here; recovery is the user's (manual).
   return new Locked(
     paths.lock,
     undefined,
-    `${which} started by an interrupted factory process (npm or Pi) ${alive.length === 1 ? "is" : "are"} still running and may be writing; let ${alive.length === 1 ? "it" : "them"} end or stop ${alive.length === 1 ? "it" : "them"} (kill -TERM -<group>)`,
+    `${which}, recorded by an interrupted factory install, update or rollback (npm or Pi), ${one ? "is" : "are"} still running and may be writing. ` +
+      `Let ${one ? "it" : "them"} finish, or check with \`ps -o pid,pgid,args -g <group>\` and stop ${one ? "it" : "them"} with \`kill -TERM -- -<group>\`. ` +
+      `If a group is not a factory installer (its id was reused by another program), remove its record (${records}) instead`,
   );
 }
 

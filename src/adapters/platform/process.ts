@@ -17,9 +17,12 @@
 // R20: such a child starts through the writer gate (writer-gate.mjs), which runs the real command only
 // once its group is recorded, so no writer exists unrecorded even if we are killed right after spawn.
 // Each recorded group gets a random token, stored in its entry and set as FACTORY_WRITER_TOKEN in the
-// environment of every process of the group. Cleanup and acquirers check it before trusting a pgid:
-// on Linux a live group none of whose members carries the token is not ours (its pgid was reused) and
-// is never signalled; elsewhere no cheap check exists, so a live recorded group is assumed to be ours.
+// environment of every process of the group. A live recorded group always keeps the lock unavailable
+// (R21-P1); the token only decides whether we may signal it. On Linux a member carrying the token is
+// positive identity evidence. A live group without one is unverified, not foreign: an installer may
+// have started a same-group descendant with a clean environment, or the pgid may have been reused. It
+// is never signalled, its record is kept, and acquirers refuse naming it for manual recovery. Other
+// POSIX systems have no cheap check, so a live recorded group there is assumed to be ours (documented).
 // Windows: no gate and no registry; non-detached children die with their parent's job object.
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -229,25 +232,33 @@ function linuxGroupMembers(pgid: number): number[] | undefined {
 }
 
 /**
- * Whether recorded group `pgid` with identity `token` is ours and alive: "gone" (no process left),
- * "foreign" (Linux: alive, but no member carries the token: the pgid was reused), "ours" (Linux: a
- * member carries it), or "unknown" (alive; no cheap identity check on this platform).
+ * The state of recorded group `pgid` with identity `token`:
+ * - "gone": no process of the group is left (its record may be removed);
+ * - "ours": Linux, a member carries the token (positive identity: it may be signalled);
+ * - "assumed": alive on a POSIX system without a cheap identity check (assumed ours: may be signalled);
+ * - "unverified": Linux, alive but no member carries the token. That does not prove the pgid was reused
+ *   (a same-group descendant may run with a clean environment), so it is never signalled and its record
+ *   is kept: the lock stays unavailable until it ends or the user recovers manually (R21-P1).
  */
-function writerGroupStatus(pgid: number, token: string, platform: NodeJS.Platform): "gone" | "foreign" | "ours" | "unknown" {
+type WriterGroupStatus = "gone" | "ours" | "assumed" | "unverified";
+
+function writerGroupStatus(pgid: number, token: string, platform: NodeJS.Platform): WriterGroupStatus {
   if (!processGroupAlive(pgid)) return "gone";
-  if (platform !== "linux" || token === "") return "unknown";
+  if (platform !== "linux") return "assumed";
   const members = linuxGroupMembers(pgid);
-  if (members === undefined) return "unknown";
-  if (members.length === 0) return "gone";
+  if (token === "" || members === undefined) return "unverified";
   for (const pid of members) {
     try {
       if (readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`${WRITER_TOKEN_ENV}=${token}`)) return "ours";
     } catch {
-      // another user's process, or exited: cannot be ours
+      // another user's process, or exited: no evidence either way
     }
   }
-  return "foreign";
+  return "unverified";
 }
+
+/** Whether `status` is positive identity evidence (or the documented non-Linux assumption) allowing a signal. */
+const maySignal = (status: WriterGroupStatus): boolean => status === "ours" || status === "assumed";
 
 async function entryToken(dir: string, pgid: number): Promise<string> {
   try {
@@ -258,16 +269,15 @@ async function entryToken(dir: string, pgid: number): Promise<string> {
 }
 
 /**
- * The recorded groups that are still alive and ours (or cannot be told apart from ours); entries of
- * gone or foreign groups are removed. Used by acquirers: any result keeps the lock unavailable.
+ * The recorded groups that are still alive, whatever their identity evidence (R21-P1); only entries of
+ * groups that are gone are removed. Used by acquirers: any result keeps the lock unavailable.
  */
 export async function liveRecordedProcessGroups(dir: string, platform: NodeJS.Platform = process.platform): Promise<number[]> {
   if (platform === "win32") return [];
   const live: number[] = [];
   for (const pgid of await recordedProcessGroups(dir)) {
-    const status = writerGroupStatus(pgid, await entryToken(dir, pgid), platform);
-    if (status === "ours" || status === "unknown") live.push(pgid);
-    else await rm(join(dir, String(pgid)), { force: true });
+    if (writerGroupStatus(pgid, await entryToken(dir, pgid), platform) === "gone") await rm(join(dir, String(pgid)), { force: true });
+    else live.push(pgid);
   }
   return live;
 }
@@ -285,10 +295,11 @@ export async function recordedProcessGroups(dir: string): Promise<number[]> {
 }
 
 /**
- * POSIX: stops every group recorded in `dir` that is still alive and ours (SIGTERM, SIGKILL after the
- * grace period, awaited; see writerGroupStatus) and removes the entries of groups that are gone or foreign. An entry whose group could not be
- * torn down is kept, so the lock stays unavailable. Returns the pgids still alive. No-op on Windows,
- * where children die with their parent's job object instead.
+ * POSIX: stops every recorded group that is alive and may be signalled ("ours" on Linux, "assumed"
+ * elsewhere; SIGTERM, SIGKILL after the grace period, awaited) and removes the entries of groups that
+ * are gone. An unverified group is never signalled and keeps its entry, as does a group that could not
+ * be torn down, so the lock stays unavailable. Returns the pgids still alive. No-op on Windows, where
+ * children die with their parent's job object instead.
  */
 export async function stopRecordedProcessGroups(dir: string, platform: NodeJS.Platform = process.platform): Promise<number[]> {
   if (platform === "win32") return [];
@@ -296,8 +307,11 @@ export async function stopRecordedProcessGroups(dir: string, platform: NodeJS.Pl
   for (const pgid of await recordedProcessGroups(dir)) {
     try {
       const status = writerGroupStatus(pgid, await entryToken(dir, pgid), platform);
-      // A foreign group (reused pgid) is never signalled; "unknown" is assumed ours (no cheap check).
-      if (status === "ours" || status === "unknown") await killGroup(pgid);
+      if (status === "unverified") {
+        survivors.push(pgid);
+        continue;
+      }
+      if (maySignal(status)) await killGroup(pgid);
       await rm(join(dir, String(pgid)), { force: true });
     } catch {
       survivors.push(pgid);

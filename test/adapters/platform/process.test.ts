@@ -381,17 +381,17 @@ describe.runIf(!isWindows)("writer gate (R20, POSIX)", () => {
     await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it.runIf(process.platform === "linux")("identity (Linux): a recorded group whose members do not carry its token is not ours: never signalled, entry dropped", async () => {
+  it.runIf(process.platform === "linux")("identity (Linux): a live recorded group without its token is unverified: still live, never signalled, entry kept (R21-P1)", async () => {
     const dir = join(tmp.dir, "writers");
-    const foreign = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
-    spawnedPids.push(foreign.pid as number);
+    const unverified = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    spawnedPids.push(unverified.pid as number);
     await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, String(foreign.pid)), "our-token");
-    expect(await liveRecordedProcessGroups(dir)).toEqual([]);
-    expect(await stopRecordedProcessGroups(dir)).toEqual([]);
-    expect(killProbe(foreign.pid as number)).toBe("alive");
-    expect(await recordedProcessGroups(dir)).toEqual([]);
-    foreign.kill("SIGKILL");
+    await writeFile(join(dir, String(unverified.pid)), "our-token");
+    expect(await liveRecordedProcessGroups(dir)).toEqual([unverified.pid]);
+    expect(await stopRecordedProcessGroups(dir)).toEqual([unverified.pid]);
+    expect(killProbe(unverified.pid as number)).toBe("alive");
+    expect(await recordedProcessGroups(dir)).toEqual([unverified.pid]);
+    unverified.kill("SIGKILL");
   });
 
   it("identity: a live recorded group whose members carry its token is reported live", async () => {
