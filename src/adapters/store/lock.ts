@@ -17,10 +17,25 @@
 // commit point. Once either is lost the borrowed lock is compromised (`lost` aborts, `compromised` is
 // set), so the borrower stops its subprocesses and commits nothing. A borrower whose lender is gone at
 // start never takes the lock itself (LockLost): the journal is left for `factory rollback`.
+//
+// R17 amended: the lock never becomes reusable while a writer lives.
+// - Borrower lease: the borrower writes `<home>/factory.lock.borrower.json` and refreshes its mtime like
+//   an owner refreshes the lock directory. An acquirer that gets the lock directory but finds a fresh
+//   lease gives the directory back (Locked). So the lock is held until the LAST of lender and borrower
+//   is done: a borrower whose lender died aborts its transaction but keeps the lease until it has
+//   stopped its own subprocesses, and only then releases. Publication and journal deletion therefore
+//   never race another holder. The borrower writes the lease first and then re-checks the lender, so an
+//   acquirer either sees the lease or the borrower sees the acquirer's directory and aborts.
+// - Writer groups: while any lock is held, every bounded child's process group is recorded under
+//   `<home>/factory.lock.writers/` (adapters/platform/process.ts). An acquirer refuses the lock while
+//   a recorded group is alive (an installer orphaned by killed factory processes) and cleans dead entries.
 import lockfile from "proper-lockfile";
-import { mkdir, readFile, rm, stat } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
+import { join } from "node:path";
 import { writeJsonAtomic } from "../platform/json-file.ts";
 import type { FactoryPaths } from "../platform/paths.ts";
+import { processGroupAlive, recordedProcessGroups, recordProcessGroupsIn } from "../platform/process.ts";
 
 const DEFAULT_STALE_MS = 10_000;
 const DEFAULT_UPDATE_MS = 5_000;
@@ -29,11 +44,13 @@ export class Locked extends Error {
   readonly path: string;
   /** The holder's pid from the owner file, or undefined if it has not written one (yet). */
   readonly pid: number | undefined;
-  constructor(path: string, pid: number | undefined) {
+  constructor(path: string, pid: number | undefined, detail?: string) {
     super(
-      pid === undefined
-        ? `Another factory process holds the factory lock ${path}: an install, update or rollback is in progress. Wait for it to finish and retry.`
-        : `Another factory process (pid ${pid}) holds the factory lock ${path}: an install, update or rollback is in progress. Wait for it to finish and retry.`,
+      detail !== undefined
+        ? `The factory lock ${path} is still in use: ${detail}. Wait for them to finish and retry.`
+        : pid === undefined
+          ? `Another factory process holds the factory lock ${path}: an install, update or rollback is in progress. Wait for it to finish and retry.`
+          : `Another factory process (pid ${pid}) holds the factory lock ${path}: an install, update or rollback is in progress. Wait for it to finish and retry.`,
     );
     this.name = "Locked";
     this.path = path;
@@ -104,6 +121,68 @@ export function ownerFilePath(paths: FactoryPaths): string {
   return `${paths.lock}.owner.json`;
 }
 
+/** The borrower's lease (R17 amended): the lock stays held while it is fresh. */
+export function borrowerLeasePath(paths: FactoryPaths): string {
+  return `${paths.lock}.borrower.json`;
+}
+
+/** Registry of writer process groups started under the lock (one empty file per pgid). */
+export function writerGroupsPath(paths: FactoryPaths): string {
+  return `${paths.lock}.writers`;
+}
+
+interface Lease {
+  pid: number | undefined;
+  lenderPid: number | undefined;
+  id: string | undefined;
+  /** Whether its mtime is younger than its own `staleMs`. */
+  fresh: boolean;
+}
+
+async function readLease(paths: FactoryPaths): Promise<Lease | undefined> {
+  const file = borrowerLeasePath(paths);
+  let text: string;
+  let mtimeMs: number;
+  try {
+    [text, mtimeMs] = await Promise.all([readFile(file, "utf8"), stat(file).then((st) => st.mtimeMs)]);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw e;
+  }
+  let parsed: { pid?: unknown; lenderPid?: unknown; id?: unknown; staleMs?: unknown } = {};
+  try {
+    parsed = JSON.parse(text) as typeof parsed;
+  } catch {
+    // unreadable (e.g. caught mid-write): judged by its mtime alone
+  }
+  const int = (v: unknown): number | undefined => (typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined);
+  const staleMs = int(parsed.staleMs) ?? DEFAULT_STALE_MS;
+  return { pid: int(parsed.pid), lenderPid: int(parsed.lenderPid), id: typeof parsed.id === "string" ? parsed.id : undefined, fresh: Date.now() - mtimeMs < staleMs };
+}
+
+/**
+ * Why the lock, although its directory was just acquired, is still in use by a writer: a fresh borrower
+ * lease, or a recorded writer process group that is alive. Stale leases and dead entries are removed.
+ */
+async function inUseByWriter(paths: FactoryPaths): Promise<Locked | undefined> {
+  const lease = await readLease(paths);
+  if (lease?.fresh) return new Locked(paths.lock, lease.pid);
+  if (lease !== undefined) await rm(borrowerLeasePath(paths), { force: true });
+  if (process.platform === "win32") return undefined;
+  const alive: number[] = [];
+  for (const pgid of await recordedProcessGroups(writerGroupsPath(paths))) {
+    if (processGroupAlive(pgid)) alive.push(pgid);
+    else await rm(join(writerGroupsPath(paths), String(pgid)), { force: true });
+  }
+  if (alive.length === 0) return undefined;
+  const which = alive.length === 1 ? `process group ${alive[0]}` : `process groups ${alive.join(", ")}`;
+  return new Locked(
+    paths.lock,
+    undefined,
+    `${which} started by an interrupted factory process (npm or Pi) ${alive.length === 1 ? "is" : "are"} still running and may be writing; let ${alive.length === 1 ? "it" : "them"} end or stop ${alive.length === 1 ? "it" : "them"} (kill -TERM -<group>)`,
+  );
+}
+
 interface LockDirId {
   ino: string;
   birthtimeMs: string;
@@ -170,7 +249,11 @@ export async function readLockHolder(
   paths: FactoryPaths,
   tuning: LockTuning = {},
 ): Promise<{ path: string; pid: number | undefined; at: string | undefined } | undefined> {
-  if (!(await lockfile.check(paths.home, baseOptions(paths, tuning)))) return undefined;
+  if (!(await lockfile.check(paths.home, baseOptions(paths, tuning)))) {
+    // The lender is gone but its borrower still holds the lease (R17 amended).
+    const lease = await readLease(paths);
+    return lease?.fresh ? { path: paths.lock, pid: lease.pid, at: undefined } : undefined;
+  }
   const owner = await readOwner(paths);
   return { path: paths.lock, pid: owner?.pid, at: owner?.at };
 }
@@ -203,8 +286,17 @@ async function lenderLoss(paths: FactoryPaths, ownerPid: number, dir: LockDirId)
   }
 }
 
-function borrowedLock(paths: FactoryPaths, ownerPid: number, dir: LockDirId, tuning: LockTuning): Lock {
+function borrowedLock(paths: FactoryPaths, ownerPid: number, dir: LockDirId, tuning: LockTuning, leaseId: string, stopRecording: () => void): Lock {
   const controller = new AbortController();
+  const stale = tuning.stale ?? DEFAULT_STALE_MS;
+  const leaseTimer = setInterval(
+    () => {
+      const now = new Date();
+      void utimes(borrowerLeasePath(paths), now, now).catch(() => {});
+    },
+    Math.max(500, Math.min(tuning.update ?? DEFAULT_UPDATE_MS, Math.floor(stale / 2))),
+  );
+  leaseTimer.unref();
   let lost: LockLost | undefined;
   const check = async (): Promise<void> => {
     if (lost) return;
@@ -236,8 +328,22 @@ function borrowedLock(paths: FactoryPaths, ownerPid: number, dir: LockDirId, tun
     },
     async release() {
       clearInterval(timer);
+      clearInterval(leaseTimer);
+      stopRecording();
+      // The last holder releases: our lease goes, whatever became of the lender.
+      if ((await readLease(paths))?.id === leaseId) await rm(borrowerLeasePath(paths), { force: true });
     },
   };
+}
+
+/** Writes this borrower's lease, then re-checks the lender (see the header). Undefined when the borrow must be refused. */
+async function takeLease(paths: FactoryPaths, ownerPid: number, tuning: LockTuning): Promise<{ dir: LockDirId; id: string } | undefined> {
+  const id = randomBytes(8).toString("hex");
+  await writeJsonAtomic(borrowerLeasePath(paths), { pid: process.pid, lenderPid: ownerPid, id, at: new Date().toISOString(), staleMs: tuning.stale ?? DEFAULT_STALE_MS });
+  const dir = await borrowable(paths, ownerPid, tuning);
+  if (dir !== undefined) return { dir, id };
+  if ((await readLease(paths))?.id === id) await rm(borrowerLeasePath(paths), { force: true });
+  return undefined;
 }
 
 export async function acquireLock(
@@ -247,8 +353,8 @@ export async function acquireLock(
 ): Promise<Lock> {
   await mkdir(paths.home, { recursive: true });
   if (opts.ownerPid !== undefined) {
-    const dir = await borrowable(paths, opts.ownerPid, tuning);
-    if (dir !== undefined) return borrowedLock(paths, opts.ownerPid, dir, tuning);
+    const taken = (await borrowable(paths, opts.ownerPid, tuning)) === undefined ? undefined : await takeLease(paths, opts.ownerPid, tuning);
+    if (taken !== undefined) return borrowedLock(paths, opts.ownerPid, taken.dir, tuning, taken.id, recordProcessGroupsIn(writerGroupsPath(paths)));
     if (await lockfile.check(paths.home, baseOptions(paths, tuning))) {
       throw new Locked(paths.lock, (await readOwner(paths).catch(() => undefined))?.pid);
     }
@@ -277,6 +383,19 @@ export async function acquireLock(
     throw e;
   }
 
+  // R17 amended: the directory may be free while a borrower or an orphaned installer still writes.
+  let busy: Locked | undefined;
+  try {
+    busy = await inUseByWriter(paths);
+  } catch (checkError) {
+    await releaseLock();
+    throw checkError;
+  }
+  if (busy !== undefined) {
+    await releaseLock();
+    throw busy;
+  }
+
   const owner = { pid: process.pid, at: new Date().toISOString() };
   let ownDir: LockDirId;
   try {
@@ -294,6 +413,7 @@ export async function acquireLock(
   }
 
   let released = false;
+  const stopRecording = recordProcessGroupsIn(writerGroupsPath(paths));
   return {
     path: paths.lock,
     pid: process.pid,
@@ -311,11 +431,17 @@ export async function acquireLock(
       }
     },
     async release() {
+      stopRecording();
       if (compromised) throw compromised;
       if (released) return;
       released = true;
       const current = await readOwner(paths);
       if (current?.pid === owner.pid && current.at === owner.at) await rm(ownerFilePath(paths), { force: true });
+      // The lease of our borrower once it has exited (a live borrower keeps holding the lock).
+      const lease = await readLease(paths);
+      if (lease !== undefined && lease.lenderPid === process.pid && (lease.pid === undefined || !isPidAlive(lease.pid))) {
+        await rm(borrowerLeasePath(paths), { force: true });
+      }
       await releaseLock();
     },
   };

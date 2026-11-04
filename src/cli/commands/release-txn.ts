@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { npm } from "../../adapters/platform/npm.ts";
 import type { FactoryPaths } from "../../adapters/platform/paths.ts";
-import { acquireLock, Locked, type Lock } from "../../adapters/store/lock.ts";
+import { acquireLock, Locked, writerGroupsPath, type Lock } from "../../adapters/store/lock.ts";
 import { liveSessions } from "../../adapters/store/sessions.ts";
 import type { StateDocProblem } from "../../adapters/store/state-store.ts";
 import { cloneTag, lsRemoteTags } from "../../adapters/vcs/git.ts";
@@ -19,8 +19,8 @@ export interface ReleaseDeps {
   lsRemoteTags: typeof lsRemoteTags;
   cloneTag: typeof cloneTag;
   npm: typeof npm;
-  /** Runs `node <args>` with the terminal's output and resolves to its exit code. */
-  runNode: (args: string[], env: NodeJS.ProcessEnv) => Promise<number>;
+  /** Runs `node <args>` with the terminal's output and resolves to its exit code, then stops the `writerGroups` it recorded. */
+  runNode: (args: string[], env: NodeJS.ProcessEnv, opts?: { writerGroups?: string }) => Promise<number>;
   liveSessions: typeof liveSessions;
   acquireLock: typeof acquireLock;
   /** Version of the running Node.js. */
@@ -182,7 +182,7 @@ export async function installAndApply(
   held.live();
   const args = [globalCli, "_apply-release", "--reason", apply.reason, "--from", apply.from, "--parent-lock", String(process.pid), "--yes"];
   try {
-    return await deps.runNode(args, env);
+    return await deps.runNode(args, env, { writerGroups: writerGroupsPath(ctx.paths) });
   } catch (e) {
     throw new Error(`Could not start the installed factory CLI ${globalCli}: ${msg(e)}`, { cause: e });
   }

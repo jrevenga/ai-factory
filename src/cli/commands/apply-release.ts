@@ -42,6 +42,7 @@ export interface ApplyDeps {
   migrations: readonly Migration[];
   clearTxn: typeof clearTxn;
   acquireLock: typeof acquireLock;
+  writeState: typeof writeState;
 }
 
 export interface ApplyContext {
@@ -224,7 +225,7 @@ async function migrate(paths: FactoryPaths, manifest: ReleaseManifest, registry:
 export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promise<void> {
   const { paths, env, manifest, io, pi } = ctx;
   const root = ctx.root ?? PACKAGE_ROOT;
-  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, clearTxn, acquireLock, ...ctx.deps };
+  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, clearTxn, acquireLock, writeState, ...ctx.deps };
   const now = ctx.now();
 
   let lock: Lock | undefined;
@@ -264,7 +265,7 @@ export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promi
     const previous = migratedState === undefined ? await readState(paths) : FactoryState.parse(migratedState);
     const entry = { version: manifest.factory, at: now.toISOString(), reason: opts.reason, ...(opts.from === undefined ? {} : { from: opts.from }) };
     await live();
-    await writeState(paths, {
+    await deps.writeState(paths, {
       ...previous,
       schema: 1,
       version: manifest.factory,

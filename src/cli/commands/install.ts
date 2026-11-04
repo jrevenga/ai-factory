@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { npm } from "../../adapters/platform/npm.ts";
 import { runSupervised } from "../../adapters/platform/process.ts";
-import { acquireLock, Locked, type Lock } from "../../adapters/store/lock.ts";
+import { acquireLock, Locked, writerGroupsPath, type Lock } from "../../adapters/store/lock.ts";
 import { npmInstallSpec } from "../../core/release/manifest.ts";
 import { MIGRATIONS } from "../../core/state/migrations.ts";
 import { applyPreflight, applyRelease, ApplyFailed, ApplyRefused, TXN_PENDING_MESSAGE, type ApplyContext } from "./apply-release.ts";
@@ -21,8 +21,11 @@ export interface InstallDeps {
   /** Real path of this CLI's entry file. */
   cliPath: string;
   npm: typeof npm;
-  /** Runs `node <args>` with the terminal's output and resolves to its exit code; `interactive` also passes the terminal's stdin. */
-  runNode: (args: string[], env: NodeJS.ProcessEnv, opts?: { interactive?: boolean }) => Promise<number>;
+  /**
+   * Runs `node <args>` with the terminal's output and resolves to its exit code; `interactive` also passes
+   * the terminal's stdin; `writerGroups` is the lock's writer-group registry, stopped after the child exits.
+   */
+  runNode: (args: string[], env: NodeJS.ProcessEnv, opts?: { interactive?: boolean; writerGroups?: string }) => Promise<number>;
   requirements: typeof requirementChecks;
 }
 
@@ -49,10 +52,11 @@ function ownCliPath(): string {
  * `node <args>` for a factory CLI that borrows our lock, with output going straight to the terminal (no
  * shell). stdin is closed unless `interactive`, which hands the terminal to a factory CLI that has a
  * question to ask (never to Pi). A signal sent to us meanwhile stops the child and awaits it before we
- * go on to release the lock (R17); the result is then 128 + the signal number.
+ * go on to release the lock (R17); the result is then 128 + the signal number. However the child ends,
+ * the installer process groups it recorded in `writerGroups` are stopped before this resolves.
  */
-export function runNodeInherited(args: string[], env: NodeJS.ProcessEnv, opts: { interactive?: boolean } = {}): Promise<number> {
-  return runSupervised(process.execPath, args, { env, stdin: opts.interactive === true ? "inherit" : "ignore" });
+export function runNodeInherited(args: string[], env: NodeJS.ProcessEnv, opts: { interactive?: boolean; writerGroups?: string } = {}): Promise<number> {
+  return runSupervised(process.execPath, args, { env, stdin: opts.interactive === true ? "inherit" : "ignore", writerGroups: opts.writerGroups });
 }
 
 export async function install(ctx: ApplyContext, opts: InstallOptions, overrides: Partial<InstallDeps> = {}): Promise<number> {
@@ -206,7 +210,7 @@ async function bootstrapLocked(ctx: ApplyContext, opts: InstallOptions, deps: In
   // R15: the global CLI may have to confirm the proposed profile, so it gets the terminal when one is there.
   const interactive = io.isTTY && !opts.yes && opts.profile === undefined;
   try {
-    return await deps.runNode(args, env, { interactive });
+    return await deps.runNode(args, env, { interactive, writerGroups: writerGroupsPath(paths) });
   } catch (e) {
     io.err(`Could not start the globally installed factory CLI ${globalCli}: ${msg(e)}`);
     return 1;

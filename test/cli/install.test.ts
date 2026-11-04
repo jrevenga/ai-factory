@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RunResult } from "../../src/adapters/platform/process.ts";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
 import { PiRuntime } from "../../src/adapters/pi/runtime.ts";
-import { acquireLock, readLockHolder } from "../../src/adapters/store/lock.ts";
+import { acquireLock, readLockHolder, writerGroupsPath } from "../../src/adapters/store/lock.ts";
 import type { ApplyContext } from "../../src/cli/commands/apply-release.ts";
 import type { DoctorCheck } from "../../src/cli/commands/doctor.ts";
 import { install, isNpxPath, type InstallDeps } from "../../src/cli/commands/install.ts";
@@ -281,7 +281,7 @@ describe("install", () => {
     const c = ctx();
     c.io = { ...c.io, isTTY };
     await install(c, opts, deps({ cliPath: NPX_CLI, runNode: async (_args, _env, o) => (seen.push(o), 0) }));
-    expect(seen).toEqual([{ interactive }]);
+    expect(seen).toEqual([{ interactive, writerGroups: writerGroupsPath(paths) }]);
   });
 
   it("under npx, a failed global npm install → exit 1 and the global CLI is not run", async () => {

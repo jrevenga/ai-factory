@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { UnsafeCmdArgument } from "../../../src/adapters/platform/cmd-quote.ts";
-import { ProcessTeardownFailed, runBounded, runSupervised, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
+import { ProcessTeardownFailed, recordedProcessGroups, recordProcessGroupsIn, runBounded, runSupervised, stopRecordedProcessGroups, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
 const FIXTURES = fileURLToPath(new URL("../../fixtures/proc/", import.meta.url));
@@ -158,7 +158,7 @@ describe("runBounded", () => {
     expect(process.listenerCount("SIGINT")).toBe(before);
   });
 
-  it.runIf(!isWindows)("POSIX: a parent SIGTERM tears down active children and then re-raises the signal", async () => {
+  it.runIf(!isWindows).each(["SIGTERM", "SIGHUP"] as const)("POSIX: a parent %s tears down active children and then re-raises the signal", async (sig) => {
     const pidFile = join(tmp.dir, "grandchild.pid");
     const runner = spawn(process.execPath, ["--import", "jiti/register", fixture("signal-runner.ts"), pidFile], {
       cwd: REPO,
@@ -174,9 +174,9 @@ describe("runBounded", () => {
       await waitForFile(pidFile);
       const { leader, grandchild } = await readTreePids(pidFile);
       expect(killProbe(grandchild)).toBe("alive");
-      runner.kill("SIGTERM");
+      runner.kill(sig);
       const result = await exited;
-      expect(result, output).toEqual({ code: null, signal: "SIGTERM" });
+      expect(result, output).toEqual({ code: null, signal: sig });
       expect(killProbe(grandchild)).toBe("ESRCH");
       expect(killProbe(leader)).toBe("ESRCH");
     } finally {
@@ -289,5 +289,40 @@ describe("runSupervised (R17)", () => {
     expect(await running).toBe(143);
     expect(killed).toBeTypeOf("number");
     expect(killProbe(killed as number)).toBe("ESRCH");
+  });
+});
+
+describe.runIf(!isWindows)("writer process groups (R17 amended, POSIX)", () => {
+  it("records each child's process group while a registry is active and removes it once the group is gone", async () => {
+    const dir = join(tmp.dir, "writers");
+    const stop = recordProcessGroupsIn(dir);
+    let seen: number[] = [];
+    try {
+      const run = runBounded(process.execPath, ["-e", "setTimeout(() => {}, 300)"]);
+      seen = await recordedProcessGroups(dir);
+      await run;
+    } finally {
+      stop();
+    }
+    expect(seen).toHaveLength(1);
+    expect(await recordedProcessGroups(dir)).toEqual([]);
+    await runBounded(process.execPath, ["-e", ""]);
+    expect(await recordedProcessGroups(dir)).toEqual([]); // no registry active any more
+  });
+
+  it("stopRecordedProcessGroups stops live groups (even one ignoring SIGTERM) and removes every entry", async () => {
+    const dir = join(tmp.dir, "writers");
+    const pidFile = join(tmp.dir, "stubborn.pid");
+    const leader = spawn(process.execPath, [fixture("ignore-term.mjs"), pidFile], { detached: true, stdio: "ignore" });
+    await waitForFile(pidFile);
+    const pid = await readPid(pidFile);
+    spawnedPids.push(pid);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, String(pid)), "");
+    await writeFile(join(dir, "999999999"), ""); // a group that is long gone
+    expect(await stopRecordedProcessGroups(dir)).toEqual([]);
+    expect(killProbe(pid)).toBe("ESRCH");
+    expect(await recordedProcessGroups(dir)).toEqual([]);
+    leader.unref();
   });
 });

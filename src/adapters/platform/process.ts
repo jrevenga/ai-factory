@@ -7,7 +7,16 @@
 // Windows (plan ruling 14): teardown is an awaited, bounded `taskkill /PID <pid> /T /F` while the leader
 // is alive; descendants outliving a normally exited leader are not detected in Phase 1.
 // A teardown that fails rejects the run with ProcessTeardownFailed instead of leaving it pending.
+//
+// Writer groups (controller ruling R17, amended): while a factory lock is held, each POSIX child's
+// process group is recorded as an empty file `<registry>/<pgid>` (written right after spawn, removed
+// once the group is gone). A lender stops every recorded group after its borrower exits, and an
+// acquirer refuses the lock while one is alive, so the lock never becomes reusable while an installer
+// (npm, Pi) started in its own group may still write.
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { readdir, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { assertCmdSafe, quoteCmdArgs } from "./cmd-quote.ts";
 
 export interface RunOptions {
@@ -158,6 +167,59 @@ export function killProcessTree(child: ChildProcess, deps: Partial<ProcessDeps> 
   return terminateTree(child, { ...DEFAULT_DEPS, ...deps });
 }
 
+// Registries of writer process groups currently in use by this process (one per held lock); the most
+// recent one records new children.
+const registries: string[] = [];
+
+/** Records the process groups of children started from now on in `dir` until the returned function is called. */
+export function recordProcessGroupsIn(dir: string): () => void {
+  registries.push(dir);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    const i = registries.lastIndexOf(dir);
+    if (i !== -1) registries.splice(i, 1);
+  };
+}
+
+/** POSIX: true while any process of group `pgid` exists (never signals pgid ≤ 1). */
+export function processGroupAlive(pgid: number): boolean {
+  return Number.isInteger(pgid) && pgid > 1 && groupAlive(pgid);
+}
+
+/** The pgids recorded in a writer-group registry (missing directory → none). */
+export async function recordedProcessGroups(dir: string): Promise<number[]> {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
+  return names.filter((n) => /^\d+$/.test(n)).map(Number).filter((n) => n > 1);
+}
+
+/**
+ * POSIX: stops every group recorded in `dir` that is still alive (SIGTERM, SIGKILL after the grace
+ * period, awaited) and removes the entries of groups that are gone. An entry whose group could not be
+ * torn down is kept, so the lock stays unavailable. Returns the pgids still alive. No-op on Windows,
+ * where children die with their parent's job object instead.
+ */
+export async function stopRecordedProcessGroups(dir: string, platform: NodeJS.Platform = process.platform): Promise<number[]> {
+  if (platform === "win32") return [];
+  const survivors: number[] = [];
+  for (const pgid of await recordedProcessGroups(dir)) {
+    try {
+      if (groupAlive(pgid)) await killGroup(pgid);
+      await rm(join(dir, String(pgid)), { force: true });
+    } catch {
+      survivors.push(pgid);
+    }
+  }
+  return survivors;
+}
+
 /** Exit code a shell reports for a process ended by `sig`. */
 const SUPERVISED_SIGNALS = [
   ["SIGINT", 130],
@@ -171,6 +233,8 @@ export interface SupervisedOptions {
   env?: NodeJS.ProcessEnv;
   /** "inherit" hands the terminal's stdin to the child (a factory CLI with a question to ask); default "ignore". */
   stdin?: "inherit" | "ignore";
+  /** Writer-group registry of the lock the child borrows: its recorded groups are stopped once it exits. */
+  writerGroups?: string;
 }
 
 /**
@@ -182,6 +246,10 @@ export interface SupervisedOptions {
  * signal handlers tear down its bounded subprocesses (runBounded), then SIGKILL if it is still running
  * after SUPERVISED_STOP_MS. Windows: an awaited `taskkill /T /F` of the child's tree.
  * Otherwise resolves to the child's exit code (1 when it was ended by a signal).
+ *
+ * However the child ended (normally, by a signal, killed), the process groups it recorded in
+ * `writerGroups` (installers started in their own groups) are stopped and awaited before the promise
+ * resolves, so nothing the child started can still write once the caller releases the lock.
  */
 export function runSupervised(cmd: string, args: string[], opts: SupervisedOptions = {}, deps: Partial<ProcessDeps> = {}): Promise<number> {
   const d: ProcessDeps = { ...DEFAULT_DEPS, ...deps };
@@ -221,8 +289,19 @@ export function runSupervised(cmd: string, args: string[], opts: SupervisedOptio
       reject(e);
     });
     child.once("exit", (code, signal) => {
-      detach();
-      resolve(received !== undefined ? received.code : (code ?? (signal ? 1 : 0)));
+      const result = received !== undefined ? received.code : (code ?? (signal ? 1 : 0));
+      const groups = opts.writerGroups === undefined ? Promise.resolve([]) : stopRecordedProcessGroups(opts.writerGroups, d.platform);
+      // Signals keep being absorbed until the writer groups are gone too.
+      void groups.then(
+        () => {
+          detach();
+          resolve(result);
+        },
+        () => {
+          detach();
+          resolve(result);
+        },
+      );
     });
   });
 }
@@ -236,6 +315,7 @@ const active = new Set<ActiveChild>();
 const SIGNALS = [
   ["SIGINT", 130],
   ["SIGTERM", 143],
+  ["SIGHUP", 129],
 ] as const;
 let installed: { sig: NodeJS.Signals; listener: () => void }[] | undefined;
 
@@ -303,12 +383,33 @@ export function runBounded(cmd: string, args: string[], opts: RunOptions = {}, d
     let orphans = false;
     let settled = false;
 
+    // Writer-group registry entry (POSIX: the child leads its own group), removed once the group is gone.
+    const registry = d.platform !== "win32" && child.pid !== undefined ? registries[registries.length - 1] : undefined;
+    const entryFile = registry === undefined ? undefined : join(registry, String(child.pid));
+    let recordError: unknown;
+    if (entryFile !== undefined && registry !== undefined) {
+      try {
+        mkdirSync(registry, { recursive: true });
+        writeFileSync(entryFile, "");
+      } catch (e) {
+        recordError = e;
+      }
+    }
+
     const finish = (outcome: { result: RunResult } | { error: unknown }) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", onAbort);
       untrack(entry);
+      // A group that could not be torn down may still write: keep its entry so the lock stays held.
+      if (entryFile !== undefined && !("error" in outcome && outcome.error instanceof ProcessTeardownFailed)) {
+        try {
+          rmSync(entryFile, { force: true });
+        } catch {
+          // left behind: a later acquirer removes it once the group is gone
+        }
+      }
       if ("error" in outcome) reject(outcome.error);
       else resolve(outcome.result);
     };
@@ -359,6 +460,12 @@ export function runBounded(cmd: string, args: string[], opts: RunOptions = {}, d
 
     child.stdin.on("error", () => {});
     child.stdin.end(opts.input ?? "");
+    if (recordError !== undefined) {
+      // An unrecorded writer could outlive us unnoticed: do not let it run.
+      const error = recordError;
+      void terminate().then(() => finish({ error }));
+      return;
+    }
     if (opts.signal?.aborted) onAbort();
     else opts.signal?.addEventListener("abort", onAbort, { once: true });
   });

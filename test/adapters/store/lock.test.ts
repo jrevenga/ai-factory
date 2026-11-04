@@ -1,10 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
-import { acquireLock, isPidAlive, Locked, LockLost, ownerFilePath, readLockHolder } from "../../../src/adapters/store/lock.ts";
+import { acquireLock, borrowerLeasePath, isPidAlive, Locked, LockLost, ownerFilePath, readLockHolder, writerGroupsPath } from "../../../src/adapters/store/lock.ts";
 import { deadPid } from "../../helpers/dead-pid.ts";
 import { isolatedEnv } from "../../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
@@ -236,17 +237,14 @@ describe("borrowed lock lifetime (R17)", () => {
     const owner = await acquireLock(paths);
     const borrowed = await acquireLock(paths, { ownerPid: process.pid }, POLL);
     await owner.release();
-    const other = await acquireLock(paths); // a concurrent rollback took the lock (same pid, new directory)
-    try {
-      await expect(borrowed.verify()).rejects.toBeInstanceOf(LockLost);
-      await until(async () => (borrowed.lost.aborted ? true : undefined), 5_000);
-      expect(borrowed.lost.reason).toBeInstanceOf(LockLost);
-      expect(borrowed.compromised).toBeInstanceOf(LockLost);
-      await borrowed.release(); // stops the watchdog; never touches the other holder's lock
-      expect((await readLockHolder(paths))?.pid).toBe(process.pid);
-    } finally {
-      await other.release();
-    }
+    await mkdir(paths.lock); // another directory now stands where the lent one was
+    await expect(borrowed.verify()).rejects.toBeInstanceOf(LockLost);
+    await until(async () => (borrowed.lost.aborted ? true : undefined), 5_000);
+    expect(borrowed.lost.reason).toBeInstanceOf(LockLost);
+    expect(borrowed.compromised).toBeInstanceOf(LockLost);
+    await borrowed.release(); // stops the watchdog; never touches the other directory
+    expect(existsSync(paths.lock)).toBe(true);
+    await rm(paths.lock, { recursive: true, force: true });
   });
 
   it("detects a lender that died (SIGKILL) while its stale lock directory is still in place", async () => {
@@ -270,5 +268,67 @@ describe("borrowed lock lifetime (R17)", () => {
     await mkdir(paths.lock);
     await expect(lock.verify()).rejects.toBeInstanceOf(LockLost);
     await rm(paths.lock, { recursive: true, force: true });
+  });
+});
+
+describe("borrower lease and writer groups (R17 amended)", () => {
+  it("while the borrower's lease is fresh nobody can take the lock, even after the lender's lock is gone", async () => {
+    const lender = await acquireLock(paths);
+    const borrowed = await acquireLock(paths, { ownerPid: process.pid });
+    expect(existsSync(borrowerLeasePath(paths))).toBe(true);
+    await lender.release(); // the lender ends first; its borrower (alive) keeps the lease
+    expect(existsSync(borrowerLeasePath(paths))).toBe(true);
+    const err = await acquireLock(paths).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Locked);
+    expect((err as Locked).pid).toBe(process.pid);
+    expect(existsSync(paths.lock)).toBe(false); // the refused acquirer gave the lock directory back
+    await borrowed.release(); // the last holder releases
+    expect(existsSync(borrowerLeasePath(paths))).toBe(false);
+    await (await acquireLock(paths)).release();
+  });
+
+  it("the borrower refreshes its lease like an owner, so it never goes stale while the borrower runs", async () => {
+    const lender = await acquireLock(paths, {}, FAST);
+    const borrowed = await acquireLock(paths, { ownerPid: process.pid }, FAST);
+    await lender.release();
+    await new Promise((r) => setTimeout(r, FAST.stale + 700));
+    await expect(acquireLock(paths, {}, FAST)).rejects.toBeInstanceOf(Locked);
+    await borrowed.release();
+  });
+
+  it("a stale lease (its borrower stopped refreshing) does not block, and is removed", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(borrowerLeasePath(paths), JSON.stringify({ pid: process.pid, lenderPid: process.pid, staleMs: 2000 }));
+    const old = new Date(Date.now() - 60_000);
+    await utimes(borrowerLeasePath(paths), old, old);
+    const lock = await acquireLock(paths);
+    expect(existsSync(borrowerLeasePath(paths))).toBe(false);
+    await lock.release();
+  });
+
+  it("the lender's release removes the lease of a borrower that has exited", async () => {
+    const lender = await acquireLock(paths);
+    const dead = await deadPid();
+    await writeFile(borrowerLeasePath(paths), JSON.stringify({ pid: dead, lenderPid: process.pid, staleMs: 10_000 }));
+    await lender.release();
+    expect(existsSync(borrowerLeasePath(paths))).toBe(false);
+    await (await acquireLock(paths)).release();
+  });
+
+  it.skipIf(process.platform === "win32")("a recorded writer process group that is still alive blocks the lock; dead entries are cleaned", async () => {
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    children.push(sleeper);
+    await mkdir(writerGroupsPath(paths), { recursive: true });
+    await writeFile(join(writerGroupsPath(paths), String(sleeper.pid)), "");
+    const err = await acquireLock(paths).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Locked);
+    expect((err as Error).message).toContain(`process group ${sleeper.pid}`);
+    expect(existsSync(paths.lock)).toBe(false);
+    const exited = new Promise((r) => sleeper.once("exit", r));
+    sleeper.kill("SIGKILL");
+    await exited;
+    const lock = await acquireLock(paths);
+    expect(existsSync(join(writerGroupsPath(paths), String(sleeper.pid)))).toBe(false);
+    await lock.release();
   });
 });

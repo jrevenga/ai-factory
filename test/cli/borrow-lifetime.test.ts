@@ -1,22 +1,24 @@
-// R17: a borrowed factory lock lives only as long as its lender holds it. Real processes: lender.ts
-// takes the lock and hands over to borrower.ts (the real applyRelease) through the CLI's runner.
+// R17 (amended): a borrowed factory lock never becomes reusable while any writer of the borrowing tree
+// lives. Real processes: lender.ts takes the lock and hands over to borrower.ts (the real applyRelease)
+// through the CLI's runner; the borrower's fake Pi runs installer.mjs through the real runBounded, in
+// its own process group, like npm and Pi.
 //
 // Platform semantics differ, and each is asserted where it applies:
-// - POSIX: SIGTERM reaches the lender's handler, which stops and awaits the borrower before releasing;
-//   after SIGKILL the borrower notices on its own (watchdog) and commits nothing.
+// - POSIX: SIGINT/SIGTERM/SIGHUP reach the lender's handler, which stops and awaits the borrower and
+//   every installer group the borrower recorded before it releases; a borrower whose lender was
+//   SIGKILLed aborts on its own, stops its installer, and keeps the lock (its lease) until then.
 // - Windows: Node's SIGTERM and SIGKILL are both TerminateProcess, so no lender handler runs. libuv puts
 //   every non-detached child in a KILL_ON_JOB_CLOSE job held only by its parent (src/win/process.c), so
-//   the borrower is killed together with its lender, before it can print or commit anything; its own
-//   children die the same way with it. The borrower's watchdog is covered on Windows by the lock tests.
+//   the borrower is killed together with its lender, and its installer (in the borrower's job) with it.
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
-import { acquireLock, isPidAlive, Locked } from "../../src/adapters/store/lock.ts";
-import { beginTxn, readTxn } from "../../src/adapters/store/transaction.ts";
+import { acquireLock, borrowerLeasePath, isPidAlive, Locked } from "../../src/adapters/store/lock.ts";
+import { readTxn } from "../../src/adapters/store/transaction.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
 
@@ -36,6 +38,7 @@ beforeEach(async () => {
   paths = factoryPaths(env);
 });
 afterEach(async () => {
+  // Only processes this test started: the lender, and the borrower/installer pids they reported.
   for (const c of children.splice(0)) if (c.exitCode === null && c.signalCode === null) c.kill("SIGKILL");
   for (const pid of pids.splice(0)) if (isPidAlive(pid)) process.kill(pid, "SIGKILL");
   await tmp.cleanup();
@@ -51,106 +54,147 @@ async function until<T>(fn: () => T | undefined | Promise<T | undefined>, timeou
   }
 }
 
+type Mode = "honor-abort" | "ignore-abort" | "stubborn";
+
 interface Started {
   lender: ChildProcess;
   borrowerPid: number;
+  installerPid: number;
   output: () => string;
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
-/** Starts the lender and resolves once its borrower is blocked inside the Pi package install. */
-async function lendAndBlock(mode: "honor-abort" | "ignore-abort" | "slow-term"): Promise<Started> {
-  const lender = spawn(process.execPath, ["--import", "jiti/register", LENDER, mode], { env, stdio: ["ignore", "pipe", "pipe"] });
+/** Starts the lender (optionally as a process-group leader) and resolves once the borrower's installer runs. */
+async function lendAndBlock(mode: Mode, opts: { ownGroup?: boolean } = {}): Promise<Started> {
+  const lender = spawn(process.execPath, ["--import", "jiti/register", LENDER, mode], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: opts.ownGroup === true,
+  });
   children.push(lender);
   let output = "";
   lender.stdout?.on("data", (d: Buffer) => (output += d.toString()));
   lender.stderr?.on("data", (d: Buffer) => (output += d.toString()));
   const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => lender.once("exit", (code, signal) => r({ code, signal })));
-  await until(() => (existsSync(join(paths.home, "blocked")) ? true : undefined), 20_000, `the borrower to block (${output})`);
+  await until(() => (existsSync(join(paths.home, "blocked")) ? true : undefined), 20_000, `the borrower's installer to start (${output})`);
   const borrowerPid = Number(readFileSync(join(paths.home, "borrower.pid"), "utf8"));
-  pids.push(borrowerPid);
-  return { lender, borrowerPid, output: () => output, exit };
+  const installerPid = Number(readFileSync(join(paths.home, "installer.pid"), "utf8"));
+  pids.push(installerPid, borrowerPid);
+  return { lender, borrowerPid, installerPid, output: () => output, exit };
 }
 
-describe("borrowed lock lifetime (R17)", () => {
-  /** Windows: the borrower dies with its terminated lender, without printing (it never got to run again). */
-  async function expectKilledWithLender(s: Started): Promise<void> {
-    await until(() => (isPidAlive(s.borrowerPid) ? undefined : true), 5_000, "the borrower to die with its lender");
-    expect(s.output()).not.toContain("borrower:");
-  }
+const gone = (pid: number) => (isPidAlive(pid) ? undefined : true);
 
-  it("a lender sent SIGTERM stops the borrower and waits for it to exit before releasing the lock", async () => {
-    const s = await lendAndBlock("slow-term");
+/** Lender output: the installer was already dead when the lender released (the line order proves "before"). */
+function expectInstallerStoppedBeforeRelease(out: string): void {
+  const stopped = out.indexOf("lender: installer alive=false");
+  expect(out, out).not.toContain("lender: installer alive=true");
+  expect(stopped, out).toBeGreaterThanOrEqual(0);
+  expect(out.indexOf("lender: released"), out).toBeGreaterThan(stopped);
+}
+
+/** Windows: the borrower and its installer die with their terminated lender, the borrower without printing. */
+async function expectKilledWithLender(s: Started): Promise<void> {
+  await until(() => gone(s.borrowerPid), 5_000, "the borrower to die with its lender");
+  await until(() => gone(s.installerPid), 5_000, "the installer to die with the borrower");
+  expect(s.output()).not.toContain("borrower:");
+}
+
+/** Waits for the lock (the borrower's lease, then the dead lender's stale directory) to become free. */
+async function takeLockWhenFree(timeoutMs: number) {
+  return until(
+    () =>
+      acquireLock(paths, {}, FAST).catch((e: unknown) => {
+        if (e instanceof Locked) return undefined;
+        throw e;
+      }),
+    timeoutMs,
+    "the lock to become free",
+  );
+}
+
+describe("borrowed lock lifetime (R17 amended)", () => {
+  it("a lender sent SIGTERM stops the borrower and its (SIGTERM-ignoring) installer before releasing the lock", async () => {
+    const s = await lendAndBlock("stubborn");
     s.lender.kill("SIGTERM");
     const { code } = await s.exit;
     if (isWindows) {
-      // TerminateProcess: no handler runs in the lender; the job object takes the borrower down with it.
       await expectKilledWithLender(s);
-      expect(s.output()).not.toContain("lender: released");
-      expect(existsSync(paths.state)).toBe(false);
-      expect((await readTxn(paths))?.id).toBe("lender-txn");
-      return;
+    } else {
+      expect(code).toBe(143);
+      expect(isPidAlive(s.borrowerPid)).toBe(false);
+      expect(isPidAlive(s.installerPid)).toBe(false);
+      expect(s.output()).toContain("lender: child exited 143");
+      expectInstallerStoppedBeforeRelease(s.output());
+      expect(existsSync(borrowerLeasePath(paths))).toBe(false);
     }
-    expect(isPidAlive(s.borrowerPid)).toBe(false);
-    const out = s.output();
-    const exiting = out.indexOf("borrower: exiting after SIGTERM");
-    const childExited = out.indexOf("lender: child exited 143");
-    const released = out.indexOf("lender: released");
-    expect(exiting, out).toBeGreaterThanOrEqual(0);
-    expect(childExited, out).toBeGreaterThan(exiting);
-    expect(released, out).toBeGreaterThan(childExited);
-    expect(code).toBe(143);
-    // Nothing was committed; the journal stays for "factory rollback".
     expect(existsSync(paths.state)).toBe(false);
     expect((await readTxn(paths))?.id).toBe("lender-txn");
   });
 
-  it("a lender killed with SIGKILL makes the borrower stop its install and abort on its own", async () => {
+  it.skipIf(isWindows)("terminal-group SIGHUP (lender and borrower) leaves no installer alive and no release before the tree is gone", async () => {
+    const s = await lendAndBlock("stubborn", { ownGroup: true });
+    process.kill(-(s.lender.pid as number), "SIGHUP"); // what a closing terminal sends its foreground group
+    const { code } = await s.exit;
+    expect(code).toBe(129);
+    expect(isPidAlive(s.borrowerPid)).toBe(false);
+    expect(isPidAlive(s.installerPid)).toBe(false);
+    expectInstallerStoppedBeforeRelease(s.output());
+    expect(existsSync(borrowerLeasePath(paths))).toBe(false);
+    await (await acquireLock(paths)).release();
+    expect((await readTxn(paths))?.id).toBe("lender-txn");
+  });
+
+  it.skipIf(isWindows)("a borrower killed outright: the lender stops the installer group it recorded before releasing", async () => {
+    const s = await lendAndBlock("honor-abort");
+    process.kill(s.borrowerPid, "SIGKILL");
+    const { code } = await s.exit;
+    expect(code).toBe(1);
+    expect(isPidAlive(s.installerPid)).toBe(false);
+    expectInstallerStoppedBeforeRelease(s.output());
+    expect(existsSync(borrowerLeasePath(paths))).toBe(false); // the lender removed its dead borrower's lease
+    await (await acquireLock(paths)).release();
+  });
+
+  it("a lender killed with SIGKILL: the borrower stops its installer, aborts on its own and only then frees the lock", async () => {
     const s = await lendAndBlock("honor-abort");
     s.lender.kill("SIGKILL");
     await s.exit;
-    if (isWindows) await expectKilledWithLender(s);
-    else {
-      await until(() => (isPidAlive(s.borrowerPid) ? undefined : true), 10_000, "the borrower to exit");
+    if (isWindows) {
+      await expectKilledWithLender(s);
+    } else {
+      await until(() => gone(s.borrowerPid), 10_000, "the borrower to exit");
+      expect(isPidAlive(s.installerPid)).toBe(false);
       expect(s.output()).toContain("is no longer held for this process");
+      expect(existsSync(borrowerLeasePath(paths))).toBe(false);
     }
     expect(existsSync(paths.state)).toBe(false);
     expect(existsSync(paths.config)).toBe(false);
     expect((await readTxn(paths))?.id).toBe("lender-txn");
   });
 
-  it("after the lender is killed and a concurrent rollback takes the lock, the borrower never overwrites its state or journal", async () => {
+  it("schedule: lender killed while the borrower still writes → a concurrent rollback is refused until the borrower has finished", async () => {
     const s = await lendAndBlock("ignore-abort");
     s.lender.kill("SIGKILL");
     await s.exit;
-    if (isWindows) await expectKilledWithLender(s);
-    // The concurrent rollback: takes the lock once the dead lender's lock is stale, then commits.
-    const rollback = await until(
-      () =>
-        acquireLock(paths, {}, FAST).catch((e: unknown) => {
-          if (e instanceof Locked) return undefined;
-          throw e;
-        }),
-      15_000,
-      "the stale lock to be taken over",
-    );
-    try {
-      const rolledBack = `${JSON.stringify({ schema: 1, version: "0.0.8", installedAt: "2026-10-01T00:00:00.000Z", source: "x", piVersion: "1.4.0", piCli: "/old/cli.js", history: [] }, null, 2)}\n`;
-      await writeFile(paths.state, rolledBack);
-      await rm(paths.txn, { force: true });
-      await beginTxn(paths, { id: "rollback-txn", kind: "rollback", from: "0.1.0", to: "0.0.8", snapshot: "rollback-txn" });
-      const journal = readFileSync(paths.txn, "utf8");
-      await writeFile(join(paths.home, "go"), ""); // the borrower's install now finishes
-      await until(() => (isPidAlive(s.borrowerPid) ? undefined : true), 10_000, "the borrower to exit");
-      if (!isWindows) {
-        expect(s.output()).toContain("borrower: failed");
-        expect(s.output()).toContain("is no longer held for this process");
-      }
-      expect(readFileSync(paths.state, "utf8")).toBe(rolledBack);
-      expect(readFileSync(paths.txn, "utf8")).toBe(journal);
-      expect(existsSync(paths.config)).toBe(false);
-    } finally {
-      await rollback.release();
+    if (isWindows) {
+      // The borrowing tree died with the lender; the rollback gets the lock once the lender's lock is stale.
+      await expectKilledWithLender(s);
+      await (await takeLockWhenFree(15_000)).release();
+    } else {
+      // Long after the dead lender's lock went stale, the borrower (still installing) keeps the lock.
+      await new Promise((r) => setTimeout(r, FAST.stale + 1000));
+      const refused = await acquireLock(paths, {}, FAST).catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(Locked);
+      expect((refused as Locked).pid).toBe(s.borrowerPid);
+      await writeFile(join(paths.home, "go"), ""); // the installer finishes; the borrower reaches its commit check
+      await until(() => gone(s.borrowerPid), 10_000, "the borrower to exit");
+      expect(s.output()).toContain("borrower: failed");
+      expect(s.output()).toContain("is no longer held for this process");
+      await (await takeLockWhenFree(5_000)).release();
     }
+    expect(existsSync(paths.state)).toBe(false);
+    expect(existsSync(paths.config)).toBe(false);
+    expect((await readTxn(paths))?.id).toBe("lender-txn");
   });
 });
