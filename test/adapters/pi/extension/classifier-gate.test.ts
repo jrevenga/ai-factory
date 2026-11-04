@@ -171,6 +171,22 @@ describe("tracked-secret fact (R41)", () => {
     expect(decide("git show HEAD^:.env", w, answer)).toMatchObject({ decision: "ask", hardGate: "secrets" });
   });
 
+  it("fix round 5: without a tracked secret, --no-index behind an option value and a bare -U still do not run (N1, N2)", async () => {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    const { small, answer } = contexts(w);
+    for (const cmd of ["git diff --src-prefix --no-index a b", "git diff --line-prefix --no-index src out", "git diff -U --no-index a b", "git diff --unified --no-index a b"]) {
+      expect(decide(cmd, w, small), cmd).toMatchObject({ decision: "ask" });
+      expect(decide(cmd, w, answer).decision, cmd).toBe("deny");
+    }
+    for (const cmd of ["git show -U HEAD:.env", "git diff -U HEAD:.env HEAD:notes.txt"]) {
+      expect(decide(cmd, w, answer), cmd).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    }
+    // Nothing secret is tracked: a stat-only show and --check are allowed.
+    expect(decide("git show --stat", w, answer).decision).toBe("allow");
+    expect(decide("git log --check", w, answer).decision).toBe("allow");
+  });
+
   it("is true when a secret path is tracked, from a subdirectory too", async () => {
     const w = await makeWorld(true);
     worlds.push(w);

@@ -172,6 +172,26 @@ interface ParsedOperand {
 
 type Parsed = { ok: true; options: ParsedOption[]; operands: ParsedOperand[] } | { ok: false; reason: string };
 
+/** How an option takes its value: none, optional (attached or after `=` only), or required (attached or next word). */
+function arity(kind: R.Opt): "none" | "optional" | "required" {
+  if (kind === "flag") return "none";
+  if (kind === "opt-opaque") return "optional";
+  if (typeof kind === "object" && "pattern" in kind && kind.optional === true) return "optional";
+  return "required";
+}
+
+/** Why `name` (with `value`) makes the command `unknown`, or undefined. */
+function refusal(name: string, kind: R.Opt, value: string | undefined): string | undefined {
+  if (typeof kind !== "object") return undefined;
+  if ("reject" in kind) return `${name} ${kind.reject}`;
+  return value !== undefined && !kind.pattern.test(value) ? `${name}=${value} ${kind.reason}` : undefined;
+}
+
+/** R40 echo: a word made only of the grammar's flag letters (`-n`, `-neE`) is an option; anything else is text. */
+function isFlagCluster(a: string, g: R.Grammar): boolean {
+  return /^-[^-]/.test(a) && [...a.slice(1)].every((c) => g.short !== undefined && lookup(g.short, c) === "flag");
+}
+
 /**
  * Parses `args` against `g`. Unknown options, options rejected by the grammar, a flag given a value and a value
  * option without its value all fail, so the caller returns `unknown`.
@@ -180,12 +200,12 @@ function parseArgs(args: readonly string[], g: R.Grammar): Parsed {
   const options: ParsedOption[] = [];
   const operands: ParsedOperand[] = [];
   const fail = (reason: string): Parsed => ({ ok: false, reason });
-  const rejected = (name: string, kind: R.Opt) => (typeof kind === "object" ? `${name} ${kind.reject}` : undefined);
   let end = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
     const seenOperand = operands.length > 0;
-    if (end || g.noOptions || a === "-" || !a.startsWith("-") || (g.order === "posix" && seenOperand)) {
+    const text = g.unknownAsText === true && !isFlagCluster(a, g);
+    if (end || g.noOptions || text || a === "-" || !a.startsWith("-") || (g.order === "posix" && seenOperand)) {
       operands.push({ word: a, index: i, afterDoubleDash: end });
       continue;
     }
@@ -205,18 +225,13 @@ function parseArgs(args: readonly string[], g: R.Grammar): Parsed {
       const name = eq < 0 ? raw : raw.slice(0, eq);
       const kind = g.long === undefined ? undefined : lookup(g.long, name);
       if (kind === undefined) return fail(`unrecognized option ${a} (R40: options outside the grammar are unknown)`);
-      const r = rejected(name, kind);
+      const takes = arity(kind);
+      if (takes === "none" && eq >= 0) return fail(`${name} takes no value`);
+      const value = eq >= 0 ? raw.slice(eq + 1) : takes === "required" ? args[++i] : undefined;
+      if (takes === "required" && value === undefined) return fail(`${name} without a value`);
+      const r = refusal(name, kind, value);
       if (r !== undefined) return fail(r);
-      if (kind === "flag") {
-        if (eq >= 0) return fail(`${name} takes no value`);
-        options.push({ name, kind, index: i, late, word: a });
-      } else if (kind === "opt-opaque") {
-        options.push({ name, kind, ...(eq >= 0 ? { value: raw.slice(eq + 1) } : {}), index: i, late, word: a });
-      } else {
-        const value = eq >= 0 ? raw.slice(eq + 1) : args[++i];
-        if (value === undefined) return fail(`${name} without a value`);
-        options.push({ name, kind, value, index: i, late, word: a });
-      }
+      options.push({ name, kind, ...(value !== undefined ? { value } : {}), index: i, late, word: a });
       continue;
     }
     for (let j = 1; j < a.length; j++) {
@@ -224,20 +239,20 @@ function parseArgs(args: readonly string[], g: R.Grammar): Parsed {
       const name = `-${c}`;
       const kind = g.short === undefined ? undefined : lookup(g.short, c);
       if (kind === undefined) return fail(`unrecognized option ${name}${a.length > 2 ? ` in ${a}` : ""} (R40: options outside the grammar are unknown)`);
-      const r = rejected(name, kind);
-      if (r !== undefined) return fail(r);
-      if (kind === "flag") {
+      const takes = arity(kind);
+      if (takes === "none") {
+        const r = refusal(name, kind, undefined);
+        if (r !== undefined) return fail(r);
         options.push({ name, kind, index: i, late, word: a });
         continue;
       }
+      // A value option takes the rest of the bundle; a required one otherwise takes the next word.
       const rest = a.slice(j + 1);
-      if (kind === "opt-opaque") {
-        options.push({ name, kind, ...(rest !== "" ? { value: rest } : {}), index: i, late, word: a });
-        break;
-      }
-      const value = rest !== "" ? rest : args[++i];
-      if (value === undefined) return fail(`${name} without a value`);
-      options.push({ name, kind, value, index: i, late, word: a });
+      const value = rest !== "" ? rest : takes === "required" ? args[++i] : undefined;
+      if (takes === "required" && value === undefined) return fail(`${name} without a value`);
+      const r = refusal(name, kind, value);
+      if (r !== undefined) return fail(r);
+      options.push({ name, kind, ...(value !== undefined ? { value } : {}), index: i, late, word: a });
       break;
     }
   }
@@ -269,6 +284,8 @@ function grammarFacts(p: Extract<Parsed, { ok: true }>, g: R.Grammar): GrammarFa
   }
   const off = g.pattern !== undefined ? rest.find((o) => !g.pattern!.test(o.word)) : undefined;
   if (off !== undefined) return { error: `operand ${off.word} is outside the allowlisted form` };
+  const first = g.firstOperand !== undefined ? rest[0] : undefined;
+  if (first !== undefined && !g.firstOperand!.pattern.test(first.word)) return { error: `${first.word}: ${g.firstOperand!.reason}` };
   const tail = g.afterDoubleDash !== undefined ? rest.find((o) => o.afterDoubleDash && !g.afterDoubleDash!.test(o.word)) : undefined;
   if (tail !== undefined) return { error: `argument ${tail.word} after -- is not allowlisted` };
 
@@ -287,6 +304,7 @@ function grammarFacts(p: Extract<Parsed, { ok: true }>, g: R.Grammar): GrammarFa
     if (g.operands === "read-path") items.push({ index: o.index, read: o.word });
     else if (g.operands === "write-path") items.push({ index: o.index, read: o.word, write: o.word });
   }
+  if (first !== undefined && g.firstOperand!.nonDir === true) items.push({ index: first.index, read: first.word });
   items.sort((x, y) => x.index - y.index);
   const readArgs: string[] = [];
   const pathArgs: string[] = [];
@@ -296,6 +314,7 @@ function grammarFacts(p: Extract<Parsed, { ok: true }>, g: R.Grammar): GrammarFa
   }
   const nonDirPaths: string[] = [];
   if (g.nonDirOperands === true) for (const o of rest) pushUnique(nonDirPaths, o.word);
+  if (first !== undefined && g.firstOperand!.nonDir === true) pushUnique(nonDirPaths, first.word);
   return { readArgs, pathArgs, nonDirPaths, operands: rest.map((o) => o.word) };
 }
 
@@ -341,8 +360,9 @@ function classifyFind(args: readonly string[]): Verdict {
     }
     const kind = lookup(R.FIND_VALUES, a) ?? (R.FIND_NEWER_FILE.test(a) ? "read-path" : R.FIND_NEWER_TIME.test(a) ? "opaque" : undefined);
     if (kind === undefined) return unknown(`find: unrecognized expression ${a} (R40: primaries outside the grammar are unknown)`);
-    if (typeof kind === "object") return unknown(`find ${a} ${kind.reject}`);
     const value = args[i + 1];
+    const refused = refusal(`find ${a}`, kind, value);
+    if (refused !== undefined) return unknown(refused);
     if (value === undefined) return unknown(`find ${a} without a value`);
     if (kind === "read-path") pushUnique(reads, value);
     i += 2;
@@ -394,6 +414,16 @@ export function extractReadArgs(args: readonly string[]): string[] {
 }
 
 function classifyGit(args: readonly string[]): Verdict {
+  const v = classifyGitInvocation(args);
+  // R45: git honours these wherever they appear in its argv; a grammar may have taken them for an option's value.
+  if (!isHard(v.class) && hasLong(args, R.GIT_RAW_SCANNED_LONG)) {
+    const hit = args.find((a) => hasLong([a], R.GIT_RAW_SCANNED_LONG))!;
+    return unknown(`git honours ${hit.split("=")[0]} anywhere in its arguments, whatever option precedes it (R45)`);
+  }
+  return v;
+}
+
+function classifyGitInvocation(args: readonly string[]): Verdict {
   if (hasLong(args, R.GIT_INJECTION_LONG)) return unknown("git option injects configuration or redirects the repository");
   if (hasLong(args, R.GIT_FILE_LIST_LONG)) return unknown("git reads a pathspec list from a file or stdin (R24)");
   const dirs: string[] = [];
@@ -440,8 +470,10 @@ function logicalPath(w: string): string {
 function classifyGitRead(sub: string, rest: readonly string[], g: R.Grammar): Verdict {
   const r = applyGrammar(`git ${sub}`, rest, g);
   if (!r.ok) return unknown(r.reason);
-  // git diff falls back to --no-index on its own when a path lies outside the work tree.
-  if (sub === "diff" && r.facts.operands.some(mayLeaveWorkTree)) {
+  // git diff falls back to --no-index on its own when a path lies outside the work tree. git looks at raw words (the
+  // first non-option word), so an option's separate value counts too (R45).
+  const rawWords = rest.filter((w) => w !== "--" && !w.startsWith("-"));
+  if (sub === "diff" && [...r.facts.operands, ...rawWords].some(mayLeaveWorkTree)) {
     return unknown("git diff with a path that may lie outside the work tree compares arbitrary files (implicit --no-index)");
   }
   const logical: string[] = [];
@@ -454,9 +486,16 @@ function classifyGitRead(sub: string, rest: readonly string[], g: R.Grammar): Ve
   items.sort((x, y) => x.index - y.index);
   for (const it of items) pushUnique(logical, it.path);
   const opts = r.parsed.options.map((o) => o.name);
+  const patch = opts.some((n) => R.GIT_LOG_CONTENT.has(n));
+  // diff/show with only name/count formats print no content; show still prints a blob operand whatever the format.
+  const statOnly =
+    (sub === "diff" || sub === "show") &&
+    !patch &&
+    opts.some((n) => R.GIT_NO_CONTENT_FORMATS.has(n)) &&
+    (sub === "diff" || r.parsed.operands.every((o) => o.afterDoubleDash || R.GIT_SHOW_COMMIT_REVISION.test(o.word)));
   const content =
-    R.GIT_CONTENT_SUBCOMMANDS.has(sub) ||
-    (sub === "log" && opts.some((n) => R.GIT_LOG_CONTENT.has(n))) ||
+    (R.GIT_CONTENT_SUBCOMMANDS.has(sub) && !statOnly) ||
+    (sub === "log" && patch) ||
     (sub === "status" && opts.some((n) => n === "-v" || n === "--verbose"));
   return {
     ...readOnly(`git ${sub} is read-only`),
@@ -688,7 +727,8 @@ function classifySed(args: readonly string[]): Verdict {
     if (suffix === undefined) {
       remaining.push(a);
     } else {
-      if (!/^[A-Za-z0-9._-]*$/.test(suffix)) return unknown("sed -i backup suffix with a path");
+      // R46: a backup suffix writes `<file><suffix>` (with `*` or `/`, anywhere) without a fact.
+      if (suffix !== "") return unknown(`sed -i with backup suffix ${suffix} writes a backup file without a fact (R46)`);
       inPlace = true;
     }
   }

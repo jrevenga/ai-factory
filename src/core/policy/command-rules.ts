@@ -39,7 +39,12 @@ export type Opt =
   /** An optional value, only attached (`-U5`, `-M50%`) or after `=` (`--color=always`): no fact. */
   | "opt-opaque"
   /** The option makes the command `unknown`, for this reason. */
-  | { reject: string };
+  | { reject: string }
+  /**
+   * A value that must match `pattern`, otherwise the command is `unknown` for `reason` (no fact). `optional`: the value
+   * is attached or after `=` only, as for `opt-opaque` (`cp --preserve[=ATTRS]`).
+   */
+  | { pattern: RegExp; reason: string; optional?: boolean };
 
 export type OperandKind = "read-path" | "write-path" | "opaque";
 
@@ -74,6 +79,16 @@ export interface Grammar {
   nonDirOperands?: boolean;
   /** Each word after `--` must match (cargo passes them to the test binary or a tool); otherwise `unknown`. */
   afterDoubleDash?: RegExp;
+  /**
+   * The first (non-leading) operand must match `pattern`, otherwise `unknown` for `reason`. `nonDir`: it is also a read
+   * fact and must be a known non-directory at the gate (R47: a bare `git fetch` repository name that is a directory).
+   */
+  firstOperand?: { pattern: RegExp; reason: string; nonDir?: boolean };
+  /**
+   * The bash `echo` builtin: a word that is not entirely made of known option letters is text, and so is every later
+   * word (`echo --version` prints `--version`). Nothing is ever an unrecognized option.
+   */
+  unknownAsText?: boolean;
 }
 
 const F = "flag";
@@ -302,7 +317,7 @@ export const READ_ONLY_GRAMMARS: Readonly<Record<string, Grammar>> = {
     },
     operands: RP,
   },
-  echo: { short: each("neE", F), operands: O, order: "posix" },
+  echo: { short: each("neE", F), operands: O, order: "posix", unknownAsText: true },
   printf: { short: { v: reject("assigns a shell variable") }, operands: O, order: "posix" },
   true: { operands: O, order: "posix" },
   false: { operands: O, order: "posix" },
@@ -400,7 +415,11 @@ export const READ_ONLY_GRAMMARS: Readonly<Record<string, Grammar>> = {
     },
     operands: RP,
     leading: { count: 1 },
-    leadingReject: { pattern: /\b(?:import|include|modulemeta|get_search_list|env|input_filename)\b/, reason: "the filter loads modules or reads the environment (R43)" },
+    // Builtins as filter tokens only: `.env`, `.a.include` are key paths (a `.` or a word character before them).
+    leadingReject: {
+      pattern: /(?<![.\w$])(?:import|include|modulemeta|get_search_list|env|input_filename)\b|\$ENV\b/,
+      reason: "the filter loads modules or reads the environment (R43)",
+    },
   },
 };
 
@@ -458,12 +477,23 @@ export const GIT_GLOBAL_FLAGS: ReadonlySet<string> = new Set(["--no-pager", "-P"
 export const GIT_INJECTION_LONG: readonly string[] = ["--config-env", "--exec-path", "--git-dir", "--work-tree"];
 /** Options that read a path list from a file or stdin, anywhere on a git command line: always `unknown` (R24). */
 export const GIT_FILE_LIST_LONG: readonly string[] = ["--pathspec-from-file"];
+/**
+ * R45: options git honours wherever they appear in its raw argv, whatever a grammar takes them for: `cmd_diff` scans
+ * argv for `--no-index` before option parsing, so it cannot be hidden as another option's value. Global options
+ * that change how pathspecs or the repository are read, and `--end-of-options`, are treated the same. Any of them
+ * (exact, abbreviated, or `=value`) anywhere makes a non-hard git command `unknown`.
+ */
+export const GIT_RAW_SCANNED_LONG: readonly string[] = [
+  "--no-index", "--end-of-options", "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
+  "--namespace", "--super-prefix", "--attr-source",
+];
 
 /** Diff output options shared by `git diff`, `git show` and `git log` (git's diff option parser). */
 const GIT_DIFF_SHORT: Record<string, Opt> = {
   ...each("pusazRbwWD", F),
-  ...each("MCBX", OO),
-  ...each("UlSGI", O),
+  // N2: -U takes an optional, attached-only value (git PARSE_OPT_OPTARG): a bare -U never consumes the next word.
+  ...each("UMCBX", OO),
+  ...each("lSGI", O),
   O: RP,
 };
 const GIT_DIFF_LONG: Record<string, Opt> = {
@@ -478,10 +508,11 @@ const GIT_DIFF_LONG: Record<string, Opt> = {
     ],
     F,
   ),
-  ...all(["--stat", "--dirstat", "--color", "--word-diff", "--color-words", "--color-moved", "--abbrev", "--find-renames", "--find-copies", "--break-rewrites", "--relative"], OO),
+  // Optional values, attached or after `=` only (checked against `git diff --no-index -h`, git 2.52).
+  ...all(["--unified", "--stat", "--dirstat", "--color", "--word-diff", "--color-words", "--color-moved", "--abbrev", "--find-renames", "--find-copies", "--break-rewrites", "--relative"], OO),
   ...all(
     [
-      "--unified", "--inter-hunk-context", "--diff-filter", "--diff-algorithm", "--src-prefix", "--dst-prefix", "--line-prefix",
+      "--inter-hunk-context", "--diff-filter", "--diff-algorithm", "--src-prefix", "--dst-prefix", "--line-prefix",
       "--ws-error-highlight", "--ignore-matching-lines", "--anchored", "--word-diff-regex", "--color-moved-ws", "--stat-width",
       "--stat-name-width", "--stat-count", "--stat-graph-width", "--find-object", "--rotate-to", "--skip-to",
     ],
@@ -516,12 +547,28 @@ const GIT_LOG_LONG: Record<string, Opt> = {
     O,
   ),
 };
-/** R41: log options that print file contents (patches, line ranges) or select commits by content (pickaxe). */
+/**
+ * R41: diff options that print file contents (patches, line ranges, `--check`'s offending lines, N3) or select commits
+ * by content (pickaxe). Verified with git 2.52: of the diff options, only -p/-u/--patch/-U/--unified/--patch-with-raw/
+ * --patch-with-stat/--binary/--check/-c/--cc/--remerge-diff print content lines in `git log`; the rest are listed to
+ * stay on the safe side.
+ */
 export const GIT_LOG_CONTENT: ReadonlySet<string> = new Set([
   "-p", "-u", "--patch", "-U", "--unified", "-W", "--function-context", "--word-diff", "--color-words", "-c", "--cc", "-m",
   "--full-diff", "--remerge-diff", "--diff-merges", "-S", "-G", "--binary", "--patch-with-raw", "--patch-with-stat", "-L",
-  "--pickaxe-all", "--pickaxe-regex",
+  "--pickaxe-all", "--pickaxe-regex", "--check", "--inter-hunk-context", "--word-diff-regex",
 ]);
+/**
+ * Diff output formats that print names, counts or object ids, never content lines (verified with git 2.52). `git
+ * diff`/`git show` with one of them and no GIT_LOG_CONTENT option print no file content, except that `git show`
+ * prints a blob operand whatever the format (see GIT_SHOW_COMMIT_REVISION).
+ */
+export const GIT_NO_CONTENT_FORMATS: ReadonlySet<string> = new Set([
+  "--stat", "--numstat", "--shortstat", "--name-only", "--name-status", "--raw", "--summary", "--dirstat", "-X",
+  "--compact-summary", "-s", "--no-patch", "--quiet",
+]);
+/** `git show` operands that can only name a commit (`HEAD`, or a `~`/`^` parent form): never a blob it would print. */
+export const GIT_SHOW_COMMIT_REVISION = /^(?:HEAD|@|[A-Za-z0-9_][A-Za-z0-9_./-]*(?:[~^][0-9]*)+)$/;
 
 /** Allowlisted read-only git subcommands and their grammar (R40). Operands are revisions and pathspecs. */
 export const GIT_READ_GRAMMARS: Readonly<Record<string, Grammar>> = {
@@ -570,9 +617,10 @@ export const GIT_READ_GRAMMARS: Readonly<Record<string, Grammar>> = {
         ],
         F,
       ),
-      ...all(["--exclude", "--exclude-per-directory", "--with-tree", "--format"], O),
+      ...all(["--exclude", "--with-tree", "--format"], O),
       "--abbrev": OO,
       "--exclude-from": RP,
+      "--exclude-per-directory": reject("reads the named file in every directory as a pattern file, without a fact (N5)"),
     },
     operands: RP,
   },
@@ -602,7 +650,8 @@ export const GIT_READ_GRAMMARS: Readonly<Record<string, Grammar>> = {
     },
     operands: O,
   },
-  // Remote and branch names only: a refspec with `:` writes local refs, a URL can name another transport.
+  // Remote and branch names only: a refspec with `:` writes local refs, a URL can name another transport. R47: the
+  // repository is a remote name (no `/`, `.`, `~` or `:`: a path, a `<name>.git` directory, a bundle, `file://`).
   fetch: {
     short: { ...each("qvpta", F), j: O },
     long: {
@@ -611,7 +660,12 @@ export const GIT_READ_GRAMMARS: Readonly<Record<string, Grammar>> = {
       "--upload-pack": RUNS_CODE,
     },
     operands: O,
-    pattern: /^[A-Za-z0-9._/-]+$/,
+    pattern: /^[A-Za-z0-9_][A-Za-z0-9._/-]*$/,
+    firstOperand: {
+      pattern: /^[A-Za-z0-9_][A-Za-z0-9_-]*$/,
+      reason: "the repository is a filesystem path or URL, not a remote name: the facts do not cover another repository (R47)",
+      nonDir: true,
+    },
   },
 };
 /** R41: git subcommands that print tracked file contents (always). `log` does with GIT_LOG_CONTENT; `status` with -v. */
@@ -786,9 +840,11 @@ export const GO_SUBCOMMANDS: ReadonlySet<string> = new Set(["test", "build", "ve
 export const GO_GRAMMAR: Grammar = {
   long: {
     ...all(["-v", "-race", "-cover", "-short", "-benchmem", "-json", "-failfast", "-a", "-trimpath", "-x", "-n"], F),
-    ...all(["-run", "-skip", "-count", "-timeout", "-tags", "-bench", "-benchtime", "-p", "-parallel", "-cpu", "-mod", "-covermode", "-coverpkg", "-ldflags", "-gcflags", "-buildvcs"], O),
+    ...all(["-run", "-skip", "-count", "-timeout", "-tags", "-bench", "-benchtime", "-p", "-parallel", "-cpu", "-mod", "-covermode", "-coverpkg", "-buildvcs"], O),
     "-o": WP,
     ...all(["-exec", "-toolexec", "-vettool"], RUNS_CODE),
+    // `-ldflags=-extld=<prog>` runs another linker; the compiler and assembler flags are refused alike.
+    ...all(["-ldflags", "-gcflags", "-asmflags", "-extldflags"], reject("passes flags to the compiler or linker, which can run another program")),
     ...all(["-C", "-modfile", "-overlay"], CHANGES_ROOT),
   },
   operands: O,
@@ -822,20 +878,34 @@ export const GH_API_GRAMMAR: Grammar = {
 // Write commands use `order: "strict"`: where options stop at the first operand (BSD, POSIXLY_CORRECT), a later
 // option word is an operand, so `cp a b -f` would write a file named `-f` the facts never see.
 export const MKDIR_GRAMMAR: Grammar = { short: { ...each("pv", F), m: O }, long: { ...all(["--parents", "--verbose"], F), "--mode": O }, operands: WP, order: "strict" };
-export const TOUCH_GRAMMAR: Grammar = { short: each("acm", F), long: all(["--no-create"], F), operands: WP, order: "strict" };
+/** `-r`/`--reference` read the reference file's times: a read fact. */
+export const TOUCH_GRAMMAR: Grammar = {
+  short: { ...each("acmh", F), ...each("dt", O), r: RP },
+  long: { ...all(["--no-create", "--no-dereference"], F), "--date": O, "--time": O, "--reference": RP },
+  operands: WP,
+  order: "strict",
+};
 export const TEE_GRAMMAR: Grammar = { short: each("aip", F), long: all(["--append", "--ignore-interrupts"], F), operands: WP, order: "strict" };
+/** R46: backups (`dest~`, `dest<SUFFIX>`, numbered) are written next to the destination without a fact. */
+const BACKUP = reject("writes a backup file next to the destination, without a fact (R46)");
 /** R43: `cp -t` copies into a directory (unknown); every operand must be a known non-directory at the gate. */
 export const CP_GRAMMAR: Grammar = {
-  short: { ...each("rRafinpvuLPTHxls", F), S: O, t: reject("copies into a directory, writing children the gate has no facts for (R43)") },
+  short: { ...each("rRafinpvuLPTHxls", F), ...each("bS", BACKUP), t: reject("copies into a directory, writing children the gate has no facts for (R43)") },
   long: {
     ...all(
       [
-        "--recursive", "--archive", "--force", "--interactive", "--no-clobber", "--preserve", "--verbose", "--update", "--parents",
+        "--recursive", "--archive", "--force", "--interactive", "--no-clobber", "--verbose", "--update", "--parents",
         "--no-target-directory", "--dereference", "--no-dereference",
       ],
       F,
     ),
-    "--suffix": O,
+    // Non-link attributes only: `links`/`all` copy links as links (R28).
+    "--preserve": {
+      pattern: /^(?:mode|ownership|timestamps)(?:,(?:mode|ownership|timestamps))*$/,
+      reason: "preserves attributes other than mode, ownership and timestamps (links keep symbolic links, R28)",
+      optional: true,
+    },
+    ...all(["--backup", "--suffix"], BACKUP),
     "--target-directory": reject("copies into a directory, writing children the gate has no facts for (R43)"),
   },
   operands: WP,
@@ -843,8 +913,8 @@ export const CP_GRAMMAR: Grammar = {
   order: "strict",
 };
 export const MV_GRAMMAR: Grammar = {
-  short: { ...each("finvuT", F), S: O, t: WP },
-  long: { ...all(["--force", "--interactive", "--no-clobber", "--verbose", "--update", "--no-target-directory"], F), "--suffix": O, "--target-directory": WP },
+  short: { ...each("finvuT", F), ...each("bS", BACKUP), t: WP },
+  long: { ...all(["--force", "--interactive", "--no-clobber", "--verbose", "--update", "--no-target-directory"], F), ...all(["--backup", "--suffix"], BACKUP), "--target-directory": WP },
   operands: WP,
   order: "strict",
 };

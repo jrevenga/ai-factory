@@ -245,8 +245,107 @@ export const GATE_CORPUS: GateCorpusEntry[] = [
   { cmd: "sort -o out in", expect: "unknown", why: "sort -o writes a file" },
   { cmd: "ls\r\ngit push", expect: "unknown", why: "carriage return (pre-scan)" },
   ...REVIEW_CASES(),
+  ...ROUND_5_CASES(),
   { cmd: "ls​ && git push", expect: "unknown", why: "invisible format character (pre-scan)" },
 ];
+
+/**
+ * Fix round 5 (task-3-rereview-r4.md N1-N5 and out-of-scope findings, rulings R45-R47): every re-review input, with
+ * the classifier facts and the adapter-to-gate outcome in the fixture world (which tracks a dummy `.env`).
+ */
+function ROUND_5_CASES(): GateCorpusEntry[] {
+  return [
+    // --- N1 (R45): git scans its raw argv for --no-index, so an option value cannot hide it ---
+    { cmd: "git diff --src-prefix --no-index a b", expect: "unknown", why: "--no-index taken as --src-prefix's value by the grammar, but git pre-scans argv (N1, R45)", gate: UNKNOWN_GATE },
+    { cmd: "git diff --line-prefix --no-index src out", expect: "unknown", why: "--no-index after --line-prefix (N1, R45)", gate: UNKNOWN_GATE },
+    { cmd: "git diff -U --no-index a b", expect: "unknown", why: "--no-index after a bare -U (N1, N2, R45)", gate: UNKNOWN_GATE },
+    { cmd: "git diff --unified --no-index a b", expect: "unknown", why: "--no-index after a bare --unified (N1, N2, R45)", gate: UNKNOWN_GATE },
+    { cmd: "git diff --dst-prefix --no-index a b", expect: "unknown", why: "--no-index after --dst-prefix (R45)" },
+    { cmd: "git diff --no-index=x a b", expect: "unknown", why: "--no-index= form (R45)" },
+    { cmd: "git diff HEAD --no-index", expect: "unknown", why: "--no-index anywhere in argv (R45)" },
+    { cmd: "git log --grep --no-index", expect: "unknown", why: "--no-index anywhere on any git command line (R45)" },
+    { cmd: "git diff --src-prefix /h/.aws/credentials notes.txt", expect: "unknown", why: "git's implicit no-index check reads raw words: a non-option word outside the work tree (R45)" },
+    { cmd: "git log --end-of-options HEAD", expect: "unknown", why: "--end-of-options anywhere (R45 audit)" },
+    { cmd: "git log --literal-pathspecs", expect: "unknown", why: "global pathspec option after the subcommand (R45 audit)" },
+    { cmd: "git log --format=%H --exec-path=x", expect: "unknown", why: "global --exec-path after the subcommand (R45 audit)" },
+    { cmd: "git push --no-index", expect: "remote-mutating", why: "the raw scan never lowers a hard class" },
+    // --- N2: -U/--unified take an optional, attached-only value ---
+    { cmd: "git show -U HEAD:.env", expect: "read-only", why: "a bare -U does not consume HEAD:.env (N2)", facts: { logicalPaths: [".env"], trackedContent: true }, gate: SECRET_GATE },
+    { cmd: "git diff -U HEAD:.env HEAD:notes.txt", expect: "read-only", why: "both blob selections are reported (N2)", facts: { logicalPaths: [".env", "notes.txt"], trackedContent: true }, gate: SECRET_GATE },
+    { cmd: "git show --unified HEAD:.env", expect: "read-only", why: "a bare --unified does not consume the operand (N2)", facts: { logicalPaths: [".env"], trackedContent: true }, gate: SECRET_GATE },
+    { cmd: "git diff -U5 HEAD", expect: "read-only", why: "attached -U value", facts: { logicalPaths: ["HEAD"], trackedContent: true } },
+    { cmd: "git diff --unified=5 HEAD", expect: "read-only", why: "--unified=N value", facts: { logicalPaths: ["HEAD"], trackedContent: true } },
+    { cmd: "git diff -U /h/.aws/credentials notes.txt", expect: "unknown", why: "with -U bare, the outside path is an operand: implicit no-index (N2)" },
+    // --- N3: diff output options that print content lines ---
+    { cmd: "git log --check", expect: "read-only", why: "--check prints offending added lines (N3)", facts: { trackedContent: true }, gate: SECRET_GATE },
+    { cmd: "git log -1 --check", expect: "read-only", why: "--check prints offending added lines (N3)", facts: { trackedContent: true }, gate: SECRET_GATE },
+    { cmd: "git show --stat --check", expect: "read-only", why: "--check makes a stat-only show print lines (N3)", facts: { trackedContent: true } },
+    { cmd: "git diff --name-only --check", expect: "read-only", why: "--check prints lines (N3)", facts: { trackedContent: true } },
+    // --- N4 (R46): backup-writing options ---
+    { cmd: "cp -S .bak safe.txt copy.txt", expect: "unknown", why: "cp -S writes copy.txt.bak without a fact (N4, R46)", gate: UNKNOWN_GATE },
+    { cmd: "mv -S .bak safe.txt copy.txt", expect: "unknown", why: "mv -S writes copy.txt.bak without a fact (N4, R46)", gate: UNKNOWN_GATE },
+    { cmd: "sed -i.bak s/a/b/ notes", expect: "unknown", why: "sed -i<suffix> writes notes.bak without a fact (N4, R46)", gate: UNKNOWN_GATE },
+    { cmd: "sed --in-place=.bak s/a/b/ notes", expect: "unknown", why: "sed --in-place=<suffix> (R46)" },
+    { cmd: "cp --suffix=.bak safe.txt copy.txt", expect: "unknown", why: "cp --suffix (R46)" },
+    { cmd: "cp -b safe.txt copy.txt", expect: "unknown", why: "cp -b (R46)" },
+    { cmd: "cp --backup=numbered safe.txt copy.txt", expect: "unknown", why: "cp --backup (R46)" },
+    { cmd: "mv -b safe.txt copy.txt", expect: "unknown", why: "mv -b (R46)" },
+    { cmd: "mv --suffix .bak safe.txt copy.txt", expect: "unknown", why: "mv --suffix (R46)" },
+    { cmd: "install -b safe.txt copy.txt", expect: "unknown", why: "install is not allowlisted (R46)" },
+    { cmd: "ln -S .bak safe.txt copy.txt", expect: "unknown", why: "ln is not allowlisted (R46)" },
+    { cmd: "sed -i s/a/b/ notes", expect: "local-write", why: "plain sed -i keeps its rule (R46)", facts: { pathArgs: ["notes"] }, gate: { decision: "allow", answer: "deny" } },
+    // --- N5: ls-files per-directory exclude file ---
+    { cmd: "git ls-files --exclude-per-directory=.env -o -i", expect: "unknown", why: "reads <name> in every directory as a pattern file (N5)", gate: UNKNOWN_GATE },
+    { cmd: "git ls-files --exclude-per-directory .env -o -i", expect: "unknown", why: "separate value (N5)" },
+    // --- R47: git fetch/pull from a filesystem path or file:// URL ---
+    { cmd: "git fetch ../other", expect: "unknown", why: "a local repository path (R47)", gate: UNKNOWN_GATE },
+    { cmd: "git fetch /abs/repo", expect: "unknown", why: "an absolute repository path (R47)" },
+    { cmd: "git fetch ./other main", expect: "unknown", why: "a relative repository path (R47)" },
+    { cmd: "git fetch other.git", expect: "unknown", why: "a name with a dot can be a repository directory or bundle (R47)" },
+    { cmd: "git fetch file:///abs/repo", expect: "unknown", why: "a file:// URL (R47)" },
+    { cmd: "git fetch sub", expect: "read-only", why: "a bare name that is an existing directory is a local repository (R47: unknown at the gate)", facts: { readArgs: ["sub"], nonDirPaths: ["sub"] }, gate: UNKNOWN_GATE },
+    { cmd: "git fetch origin feature/x", expect: "read-only", why: "a remote name and a branch with a slash", facts: { readArgs: ["origin"], nonDirPaths: ["origin"] }, gate: ALLOW_GATE },
+    { cmd: "git pull ../other", expect: "unknown", why: "git pull is not allowlisted (R47)" },
+    { cmd: "git pull file:///abs/repo", expect: "unknown", why: "git pull is not allowlisted (R47)" },
+    // --- Minor: go flags passed to the compiler and linker ---
+    { cmd: "go build -ldflags=-extld=x ./cmd", expect: "unknown", why: "-ldflags can name a linker program (R47 minor)" },
+    { cmd: "go build -gcflags all=-N ./cmd", expect: "unknown", why: "-gcflags (minor)" },
+    { cmd: "go build -asmflags=x ./cmd", expect: "unknown", why: "-asmflags (minor)" },
+    { cmd: "go build -extldflags=x ./cmd", expect: "unknown", why: "-extldflags (minor)" },
+    { cmd: "go build -overlay=o.json ./cmd", expect: "unknown", why: "-overlay (minor)" },
+    // --- demotion polish ---
+    { cmd: "jq .env package.json", expect: "read-only", why: "a .env key path is not the env builtin", facts: { readArgs: ["package.json"] }, gate: ALLOW_GATE },
+    { cmd: "jq .a.env package.json", expect: "read-only", why: "a nested env key", facts: { readArgs: ["package.json"] } },
+    { cmd: "jq .include package.json", expect: "read-only", why: "an include key is not a module directive", facts: { readArgs: ["package.json"] } },
+    { cmd: "jq -n 'env.HOME'", expect: "unknown", why: "the env builtin prints the environment" },
+    { cmd: "jq -n '.a | env'", expect: "unknown", why: "env as a filter token" },
+    { cmd: "git show --stat", expect: "read-only", why: "a stat-only show prints names and counts", facts: { trackedContent: false }, gate: ALLOW_GATE },
+    { cmd: "git diff --name-only", expect: "read-only", why: "names only", facts: { trackedContent: false }, gate: ALLOW_GATE },
+    { cmd: "git diff --name-status HEAD^", expect: "read-only", why: "names only", facts: { trackedContent: false } },
+    { cmd: "git diff --shortstat", expect: "read-only", why: "counts only", facts: { trackedContent: false } },
+    { cmd: "git diff --numstat HEAD", expect: "read-only", why: "counts only", facts: { trackedContent: false } },
+    { cmd: "git show --name-only HEAD^2", expect: "read-only", why: "a commit-only revision", facts: { trackedContent: false } },
+    { cmd: "git show -s --format=%H", expect: "read-only", why: "no diff output", facts: { trackedContent: false } },
+    { cmd: "git show --stat -p", expect: "read-only", why: "a patch option prints content", facts: { trackedContent: true } },
+    { cmd: "git show --stat 3f2a9c1", expect: "read-only", why: "an object name can be a blob, which show prints whatever the format", facts: { trackedContent: true } },
+    { cmd: "git show --stat v1", expect: "read-only", why: "a tag can point at a blob", facts: { trackedContent: true } },
+    { cmd: "git show --stat HEAD:notes.txt", expect: "read-only", why: "a rev:path blob is printed", facts: { trackedContent: true, logicalPaths: ["notes.txt"] } },
+    { cmd: "git diff --stat -S x", expect: "read-only", why: "pickaxe is a content oracle", facts: { trackedContent: true } },
+    { cmd: "cp --preserve=mode,timestamps safe.txt copy.txt", expect: "local-write", why: "non-link attributes", facts: { pathArgs: ["safe.txt", "copy.txt"] }, gate: { decision: "allow", answer: "deny" } },
+    { cmd: "cp --preserve safe.txt copy.txt", expect: "local-write", why: "default attributes" },
+    { cmd: "cp --preserve=links safe.txt copy.txt", expect: "unknown", why: "links are link-preserving (R28)" },
+    { cmd: "cp --preserve=all safe.txt copy.txt", expect: "unknown", why: "all includes links" },
+    { cmd: "touch -d yesterday notes", expect: "local-write", why: "touch -d takes a date", facts: { pathArgs: ["notes"], readArgs: ["notes"] } },
+    { cmd: "touch --date=now notes", expect: "local-write", why: "touch --date", facts: { pathArgs: ["notes"] } },
+    { cmd: "touch -t 202601010000 notes", expect: "local-write", why: "touch -t takes a stamp", facts: { pathArgs: ["notes"] } },
+    { cmd: "touch -r /h/.aws/credentials notes", expect: "local-write", why: "touch -r reads the reference file's times: a read fact", facts: { pathArgs: ["notes"], readArgs: ["/h/.aws/credentials", "notes"] }, gate: { decision: "ask", hardGate: "secrets", answer: "deny" } },
+    { cmd: "touch --reference=safe.txt notes", expect: "local-write", why: "touch --reference", facts: { pathArgs: ["notes"], readArgs: ["safe.txt", "notes"] } },
+    { cmd: "echo --x", expect: "read-only", why: "echo prints an unknown option as text", facts: { readArgs: [] }, gate: ALLOW_GATE },
+    { cmd: "echo --version", expect: "read-only", why: "the bash echo builtin prints --version", facts: { readArgs: [] } },
+    { cmd: "echo -n --x", expect: "read-only", why: "options end at the first word that is not one", facts: { readArgs: [] } },
+    { cmd: "echo -nx y", expect: "read-only", why: "a cluster with a letter outside neE is text", facts: { readArgs: [] } },
+  ];
+}
 
 /**
  * Fix round 4 (task-3-codex-review.md findings 1-13, rulings R40-R44): every review input, with the path facts the

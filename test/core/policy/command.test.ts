@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { classifyCommandLine, extractReadArgs, isPathLikeArg, severity, type CommandClass } from "../../../src/core/policy/command.ts";
+import { GIT_READ_GRAMMARS, type Grammar } from "../../../src/core/policy/command-rules.ts";
 import { GATE_CORPUS } from "../../fixtures/gate-corpus.ts";
 
 const NO_PROJECT = { projectCommands: [] as string[][] };
@@ -312,7 +313,7 @@ describe("classifyCommandLine: rule details", () => {
     ["rm --no-preserve-root x", "destructive"],
     ["rm -fv x", "local-write"],
     ["rm --weird x", "unknown"],
-    ["touch -d yesterday x", "unknown"],
+    ["touch -d yesterday x", "local-write"],
     ["sed 's/a/b/' f", "unknown"],
     ["sed -i -e 's/a/b/' f", "local-write"],
     ["sed -i 's/a/b/;w x' f", "unknown"],
@@ -500,7 +501,7 @@ describe("classifyCommandLine: option grammar (R40)", () => {
   // One unmodelled option per allowlisted program or git subcommand: each must be `unknown`, never allowlisted.
   const families = [
     "ls", "cat", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "grep x", "fd x", "tree", "pwd", "which", "whereis", "type",
-    "file", "stat", "du", "df", "echo", "printf", "true", "false", "basename", "dirname", "realpath", "readlink", "date", "sleep",
+    "file", "stat", "du", "df", "printf", "true", "false", "basename", "dirname", "realpath", "readlink", "date", "sleep",
     "diff", "cmp", "jq .", "find .", "git status", "git log", "git diff", "git show", "git rev-parse", "git ls-files", "git blame",
     "git describe", "git fetch", "git stash push", "git restore --staged", "git commit -m x", "git add", "git branch", "git tag",
     "git config --get", "git remote", "cp a", "mv a", "mkdir", "touch", "tee", "rm", "rmdir", "sed -i", "curl https://x",
@@ -634,5 +635,89 @@ describe("classifyCommandLine: gh api read grammar (R40)", () => {
     expect(classify("gh api --paginate repos/o/r/pulls").class).toBe("read-only");
     expect(classify("gh api repos/o/r --zz").class).toBe("unknown");
     expect(classify("gh api -f a=b repos/o/r").class).toBe("remote-mutating");
+  });
+});
+
+describe("classifyCommandLine: fix round 5 (R45-R47)", () => {
+  // N1: every git diff/log/show option that takes a separate value, followed by --no-index (git pre-scans argv).
+  const valued = (g: Grammar) => [
+    ...Object.entries(g.short ?? {}).filter(([, k]) => typeof k === "string" && k !== "flag" && k !== "opt-opaque").map(([c]) => `-${c}`),
+    ...Object.entries(g.long ?? {}).filter(([, k]) => typeof k === "string" && k !== "flag" && k !== "opt-opaque").map(([n]) => n),
+  ];
+  for (const sub of ["diff", "log", "show"]) {
+    const opts = valued(GIT_READ_GRAMMARS[sub]!);
+    it(`git ${sub}: --no-index as the separate value of any option is unknown (${opts.length} options)`, () => {
+      expect(opts.length).toBeGreaterThan(10);
+      for (const o of [...opts, "-U", "--unified"]) {
+        const r = classify(`git ${sub} ${o} --no-index a b`);
+        expect(r.class, `${o}: ${r.reasons.join("; ")}`).toBe("unknown");
+      }
+    });
+  }
+
+  it("R45: raw-scanned git options are unknown anywhere, without lowering a hard class", () => {
+    for (const cmd of [
+      "git diff --no-index=x a b",
+      "git status --no-index",
+      "git log -- --no-index",
+      "git log --end-of-options HEAD",
+      "git log --literal-pathspecs",
+      "git log --glob-pathspecs",
+      "git log --noglob-pathspecs",
+      "git log --icase-pathspecs",
+      "git log --grep x --git-dir=y",
+      "git log --work-tree x",
+      "git show --exec-path=x",
+      "git log --config-env=a=B",
+    ]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+    expect(classify("git push --no-index").class).toBe("remote-mutating");
+    expect(classify("git reset --hard --end-of-options").class).toBe("destructive");
+  });
+
+  it("N2: -U/--unified never consume the next word", () => {
+    expect(classify("git show -U HEAD:.env").logicalPaths).toEqual([".env"]);
+    expect(classify("git diff --unified HEAD:.env HEAD:notes.txt").logicalPaths).toEqual([".env", "notes.txt"]);
+    expect(classify("git log -U -1").class).toBe("read-only");
+    expect(classify("git log -U -1").trackedContent).toBe(true);
+    expect(classify("git diff -pU3 HEAD").logicalPaths).toEqual(["HEAD"]);
+  });
+
+  it("N3: --check makes git log content-printing", () => {
+    expect(classify("git log --check").trackedContent).toBe(true);
+    expect(classify("git log --oneline --check -3").trackedContent).toBe(true);
+  });
+
+  it("stat-only diff and show print no content; any content option or blob-capable show operand does", () => {
+    for (const cmd of ["git show --stat", "git show --numstat HEAD", "git show --shortstat HEAD^2", "git show --name-status main^", "git diff --stat HEAD^", "git diff --name-only -- src", "git show --stat -- src"]) {
+      expect(classify(cmd), cmd).toMatchObject({ class: "read-only", trackedContent: false });
+    }
+    for (const cmd of ["git show --stat main", "git show --stat -u", "git diff --stat --patch-with-stat", "git show --name-only --word-diff", "git diff --stat -U1"]) {
+      expect(classify(cmd), cmd).toMatchObject({ class: "read-only", trackedContent: true });
+    }
+  });
+
+  it("R46: backup-writing options are unknown; plain sed -i keeps its rule", () => {
+    for (const cmd of ["cp -S x a b", "cp -bf a b", "cp --backup a b", "mv -S x a b", "mv --backup=simple a b", "mv --suffix=x a b", "sed -i.orig s/a/b/ f", "sed -ibak s/a/b/ f", "sed --in-place=.b s/a/b/ f"]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+    expect(classify("sed -i s/a/b/ f").class).toBe("local-write");
+    expect(classify("sed --in-place s/a/b/ f").class).toBe("local-write");
+  });
+
+  it("R47: git fetch takes a remote name (no path, dot or URL) first, reported for the directory check", () => {
+    for (const cmd of ["git fetch ../x", "git fetch /x", "git fetch ~/x", "git fetch .", "git fetch x.bundle", "git fetch file:///x", "git fetch -- ../x", "git fetch origin ../x"]) {
+      expect(classify(cmd).class, cmd).toBe("unknown");
+    }
+    const r = classify("git fetch upstream main");
+    expect(r.class).toBe("read-only");
+    expect(r.segments[0]!.nonDirPaths).toEqual(["upstream"]);
+    expect(classify("git fetch --prune").class).toBe("read-only");
+  });
+
+  it("echo prints unknown options as text", () => {
+    expect(classify("echo --zz-unmodelled b").class).toBe("read-only");
+    expect(classify("echo -e --x").readArgs).toEqual([]);
   });
 });
