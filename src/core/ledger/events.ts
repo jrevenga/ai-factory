@@ -1,5 +1,6 @@
 // Run ledger events (Phase 2 ruling 9). Loose objects: readers accept fields added by newer versions.
 import { z } from "zod";
+import { HARD_GATES } from "../config/schema.ts";
 import { CheckRecord, ReviewDisposition } from "../evidence/records.ts";
 
 const base = { v: z.literal(1), ts: z.string(), runId: z.string() };
@@ -22,9 +23,12 @@ export const RunEvent = z.discriminatedUnion("type", [
   ev("gate", {
     tool: z.string(),
     toolCallId: z.string(),
-    decision: open(["allow", "ask", "deny"] as const),
+    /** Set for a call another tool made (e.g. a codemode script). */
+    parentToolCallId: z.string().optional(),
+    /** `allow`/`deny`, or the outcome of an ask: `allow (approved)` / `deny (rejected)` (no UI: `deny`). */
+    decision: open(["allow", "deny", "allow (approved)", "deny (rejected)"] as const),
     class: z.string().optional(),
-    hardGate: z.boolean().optional(),
+    hardGate: open(HARD_GATES).optional(),
     reason: z.string(),
     summary: z.string(),
   }),

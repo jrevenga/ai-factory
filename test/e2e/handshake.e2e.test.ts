@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -18,6 +18,17 @@ function observed(file: string): Observed[] {
     .split("\n")
     .filter((l) => l !== "")
     .map((l) => JSON.parse(l) as Observed);
+}
+
+/** Every event of the single run under `<FACTORY_HOME>/runs/<projectId>/<runId>/events.jsonl`. */
+function ledgerEvents(factoryHome: string): Array<{ type: string } & Record<string, unknown>> {
+  const runs = join(factoryHome, "runs");
+  const files = readdirSync(runs).flatMap((p) => readdirSync(join(runs, p)).map((r) => join(runs, p, r, "events.jsonl")));
+  expect(files).toHaveLength(1);
+  return readFileSync(files[0]!, "utf8")
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => JSON.parse(l) as { type: string } & Record<string, unknown>);
 }
 
 let cli: string;
@@ -74,11 +85,31 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
     expect(existsSync(s.out)).toBe(true);
   }, 120_000);
 
-  it("valid state at the package version: the handshake passes and the write happens", async () => {
+  it("valid state at the package version: the handshake passes and the GatePolicy decides, audited in the run ledger", async () => {
     const s = await setup("0.1.0");
-    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION] });
+    const log = join(s.dir, "observed.jsonl");
+    s.env.OBSERVE_FILE = log;
+    s.env.FAUX_SCRIPT = JSON.stringify([
+      { tool: "bash", args: { command: "echo gate-ok" } },
+      { tool: "write", args: { path: s.out, content: "x" } },
+    ]);
+    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER] });
+    expect(r.timedOut).toBe(false);
     expect(r.code, r.stderr).toBe(0);
-    expect(existsSync(s.out)).toBe(true);
+    const results = observed(log).filter((o) => o.event === "tool_result");
+    expect(results.map((x) => [x.toolName, x.isError])).toEqual([
+      ["bash", false],
+      ["write", true],
+    ]);
+    expect(results[0]?.text).toContain("gate-ok");
+    // No route declared yet: the answer route is read-only.
+    expect(results[1]?.text).toContain("the answer route cannot write");
+    expect(existsSync(s.out)).toBe(false);
+
+    const events = ledgerEvents(s.env.FACTORY_HOME as string);
+    expect(events.map((e) => e.type)).toEqual(["run_start", "gate", "gate", "run_end"]);
+    expect(events[1]).toMatchObject({ tool: "bash", decision: "allow", class: "read-only", summary: "echo gate-ok" });
+    expect(events[2]).toMatchObject({ tool: "write", decision: "deny" });
   }, 120_000);
 
   it("state at another version: the write is blocked and the output names version-mismatch", async () => {
@@ -101,7 +132,7 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
       const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: order });
       expect(r.code, r.stderr).toBe(0);
       expect(observed(log).filter((o) => o.event === "handshake")).toEqual([
-        { event: "handshake", data: { ok: true, version: "0.1.0", policy: "none", reasons: [] } },
+        { event: "handshake", data: { ok: true, version: "0.1.0", policy: "v1", reasons: [] } },
       ]);
     }
   }, 120_000);
@@ -121,7 +152,7 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
     const o = observed(log);
     expect(o.find((x) => x.event === "handshake")).toEqual({
       event: "handshake",
-      data: { ok: false, version: "0.1.0", policy: "none", reasons: ["version-mismatch"] },
+      data: { ok: false, version: "0.1.0", policy: "v1", reasons: ["version-mismatch"] },
     });
     const results = o.filter((x) => x.event === "tool_result");
     expect(results.map((x) => [x.toolName, x.isError])).toEqual([

@@ -103,13 +103,22 @@ describe("factory guard (e2e, faux provider)", () => {
     expect(res[0]?.text).not.toContain("factory guard");
   }, 120_000);
 
-  it("with the factory extension and a valid state the write succeeds", async () => {
+  it("with the factory extension and a valid state the guard steps aside and the factory gate decides", async () => {
     const s = await setup({ stateVersion: "0.1.0", script: [] });
     const target = join(s.dir, "out.txt");
-    s.env.FAUX_SCRIPT = JSON.stringify([{ tool: "write", args: { path: target, content: "x" } }]);
+    s.env.FAUX_SCRIPT = JSON.stringify([
+      { tool: "bash", args: { command: "echo guard-ok" } },
+      { tool: "write", args: { path: target, content: "x" } },
+    ]);
     const res = await run(s, [FAUX, EXTENSION]);
-    expect(existsSync(target)).toBe(true);
-    expect(res[0]?.isError).toBe(false);
+    // The guard blocks bash without a handshake; here the read-only command runs.
+    expect(res[0]).toMatchObject({ toolName: "bash", isError: false });
+    expect(res[0]?.text).toContain("guard-ok");
+    // The write is now decided by the GatePolicy (answer route), not by the guard.
+    expect(res[1]).toMatchObject({ toolName: "write", isError: true });
+    expect(res[1]?.text).toContain("the answer route cannot write");
+    expect(res[1]?.text).not.toContain("factory guard:");
+    expect(existsSync(target)).toBe(false);
   }, 120_000);
 
   it("with the factory extension and a mismatched state the write is blocked", async () => {

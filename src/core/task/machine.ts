@@ -90,3 +90,69 @@ export function touchesMachine(before: string, after: string): boolean {
     p && !("invalid" in p) ? md.slice(p.start, p.end) : undefined;
   return slice(before, a) !== slice(after, b);
 }
+
+export interface TextEdit {
+  oldText: string;
+  newText: string;
+}
+
+/** What Pi's fuzzy edit matching may treat as equal: line endings, trailing spaces, quote, dash and space variants. */
+function fuzzy(s: string): string {
+  return s
+    .normalize("NFKC")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/[\u2010-\u2015\u2212]/g, "-")
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ")
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .join("\n");
+}
+
+function overlapsExactly(text: string, needle: string, start: number, end: number): boolean {
+  for (let i = text.indexOf(needle); i >= 0; i = text.indexOf(needle, i + 1)) {
+    if (i < end && i + needle.length > start) return true;
+  }
+  return false;
+}
+
+/**
+ * Ruling 8's conservative pre-check for Pi's `edit` (whose fuzzy matcher is not exported, so an in-memory replay
+ * can diverge; the post-check at `tool_result` covers what this misses). True when:
+ * - the current file's markers are ambiguous (fail closed), or an `oldText` is empty;
+ * - any `newText` contains a marker (a block would appear, or the section would become ambiguous);
+ * - any `oldText` contains a marker or a line of the current block, or an exact occurrence of it overlaps the block;
+ * - an `oldText` has no exact occurrence (Pi falls back to fuzzy matching) and, normalized, lies inside the block;
+ * - replaying the edits exactly changes the block.
+ */
+export function editTouchesMachine(current: string, edits: readonly TextEdit[]): boolean {
+  const parsed = parseMachine(current);
+  if (parsed && "invalid" in parsed) return true;
+  for (const e of edits) {
+    if (e.oldText === "") return true;
+    if (e.newText.includes(MACHINE_OPEN) || e.newText.includes(MACHINE_CLOSE)) return true;
+  }
+  if (!parsed) return false;
+  const block = current.slice(parsed.start, parsed.end);
+  const lines = block
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+  const fuzzyBlock = fuzzy(block);
+  let replayed = current;
+  let replayable = true;
+  for (const { oldText, newText } of edits) {
+    if (oldText.includes(MACHINE_OPEN) || oldText.includes(MACHINE_CLOSE)) return true;
+    if (lines.some((l) => oldText.includes(l))) return true;
+    if (current.includes(oldText)) {
+      if (overlapsExactly(current, oldText, parsed.start, parsed.end)) return true;
+      if (replayable) replayed = replayed.replace(oldText, () => newText);
+    } else {
+      replayable = false;
+      const needle = fuzzy(oldText).trim();
+      if (needle === "" || fuzzyBlock.includes(needle)) return true;
+    }
+  }
+  return replayable && touchesMachine(current, replayed);
+}

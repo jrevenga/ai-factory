@@ -3,12 +3,16 @@
 // personal config parses and that FACTORY_HOME is writable, then emits `factory:handshake` for the
 // guard (ruling 8). While the handshake has failed, its own tool_call handler blocks every tool except
 // the read-only ones, which covers "loaded but handshake failed" even without the guard file.
+// Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger) and enforces
+// the GatePolicy on every tool call (enforce.ts); `run_end` is written at session_shutdown.
+import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import path, { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PersonalConfig } from "../../../core/config/schema.ts";
+import { resolveConfig } from "../../../core/config/resolve.ts";
+import { CoreConfig, PersonalConfig } from "../../../core/config/schema.ts";
 import {
   evaluateHandshake,
   HANDSHAKE_EVENT,
@@ -16,11 +20,22 @@ import {
   READ_ONLY_TOOLS,
   type HandshakeResult,
 } from "../../../core/handshake.ts";
-import { resolveFactoryHome } from "../../../core/paths/homes.ts";
+import { projectIdFor, runIdFor } from "../../../core/ledger/events.ts";
+import { resolveFactoryHome, resolvePiAgentDir } from "../../../core/paths/homes.ts";
+import type { AutonomyLevel } from "../../../core/policy/autonomy.ts";
+import type { GateContext } from "../../../core/policy/gate.ts";
+import { INITIAL_ROUTE } from "../../../core/route/route.ts";
+import type { RouteState } from "../../../core/route/types.ts";
 import { FactoryState } from "../../../core/state/schema.ts";
+import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
+import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
+import { ledgerDirFor, RunLedger } from "./ledger.ts";
 import { storeWritable } from "./store-probe.ts";
 
 const PACKAGE_JSON = fileURLToPath(new URL("../../../../package.json", import.meta.url));
+const CORE_DEFAULTS = fileURLToPath(new URL("../../../../defaults/config.json", import.meta.url));
+/** A git dir chosen through the environment applies to every bash `git` (R21; Task 6 concern 2). */
+const GIT_DIR_VARS = ["GIT_DIR", "GIT_COMMON_DIR"];
 
 type Read = { kind: "missing" } | { kind: "json"; value: unknown } | { kind: "error" };
 
@@ -56,39 +71,166 @@ async function packageVersion(): Promise<string> {
   return "unknown";
 }
 
+type PersonalRead = { ok: true; config: PersonalConfig | undefined } | { ok: false };
+
 /** No personal config yet is fine (defaults apply); one that exists must parse. */
-async function configOk(home: string): Promise<boolean> {
+async function personalConfig(home: string): Promise<PersonalRead> {
   const r = await readJson(join(home, "config.json"));
-  if (r.kind === "missing") return true;
-  return r.kind === "json" && PersonalConfig.safeParse(r.value).success;
+  if (r.kind === "missing") return { ok: true, config: undefined };
+  if (r.kind !== "json") return { ok: false };
+  const parsed = PersonalConfig.safeParse(r.value);
+  return parsed.success ? { ok: true, config: parsed.data } : { ok: false };
 }
 
-async function runHandshake(env: NodeJS.ProcessEnv = process.env): Promise<HandshakeResult> {
+interface HandshakeRun {
+  result: HandshakeResult;
+  personal: PersonalConfig | undefined;
+}
+
+async function runHandshake(env: NodeJS.ProcessEnv = process.env): Promise<HandshakeRun> {
   const home = resolveFactoryHome(env, homedir());
-  const [expectedVersion, version, config, writable] = await Promise.all([
+  const [expectedVersion, version, personal, writable] = await Promise.all([
     installedVersion(home),
     packageVersion(),
-    configOk(home),
+    personalConfig(home),
     storeWritable(home),
   ]);
-  return evaluateHandshake({ expectedVersion, packageVersion: version, configOk: config, storeWritable: writable });
+  const result = evaluateHandshake({ expectedVersion, packageVersion: version, configOk: personal.ok, storeWritable: writable });
+  return { result, personal: personal.ok ? personal.config : undefined };
 }
 
-function report(ctx: ExtensionContext, result: HandshakeResult): void {
-  const message = handshakeFailureMessage(result);
+function report(ctx: ExtensionContext, message: string): void {
   // Print and JSON modes have no UI (Pi docs/extensions.md); stderr keeps stdout clean there.
   if (ctx.hasUI) ctx.ui.notify(message, "error");
   else process.stderr.write(`${message}\n`);
 }
 
-export default function factoryExtension(pi: ExtensionAPI): void {
-  let current: Promise<HandshakeResult> | undefined;
+/** Facts fixed for the run: gathered once at session start (git runs only here, never per tool call). */
+interface Session {
+  ledger: RunLedger;
+  runId: string;
+  rawHome: string;
+  home: string;
+  piAgentDir: string;
+  factoryHome: string;
+  projectRoot: string;
+  ledgerDir: string;
+  gitDirs: string[];
+  tmpCandidates: string[];
+  autonomy: AutonomyLevel;
+  postChecks: MachinePostChecks;
+}
 
-  const start = (ctx: ExtensionContext): Promise<HandshakeResult> => {
-    current = runHandshake().then((result) => {
+function within(child: string, parent: string): boolean {
+  const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+  const rel = path.relative(fold(parent), fold(child));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * A tmp root is usable only when no protected location lies inside it and it is not inside the project, a
+ * write root or factory/Pi state: otherwise a command write "to tmp" could land in protected files (tests
+ * keep the project under the OS temp dir, as can a user).
+ */
+function usableTmpRoots(s: Session, route: RouteState): string[] {
+  const containers = [s.projectRoot, ...route.writeRoots, s.piAgentDir, s.factoryHome, ...s.gitDirs];
+  const guarded = [...containers, s.home];
+  return s.tmpCandidates.filter((t) => !guarded.some((g) => within(g, t)) && !containers.some((c) => within(t, c)));
+}
+
+function taskFileExists(route: RouteState): boolean {
+  if ((route.route !== "feature" && route.route !== "project") || route.worktree === undefined || route.taskId === undefined) return false;
+  return existsSync(join(route.worktree, ".factory", "knowledge", "tasks", `${route.taskId}.md`));
+}
+
+function policyContext(s: Session, ctx: ExtensionContext): GateContext {
+  const route = currentRoute();
+  return {
+    route,
+    mode: ctx.hasUI ? "interactive" : "unattended",
+    autonomy: s.autonomy,
+    home: s.home,
+    piAgentDir: s.piAgentDir,
+    projectRoot: s.projectRoot,
+    tmpRoots: usableTmpRoots(s, route),
+    ledgerDir: s.ledgerDir,
+    // Project-declared runners arrive with Task 10 (`.factory/config.json` commands).
+    projectCommands: [],
+    taskFileExists: taskFileExists(route),
+    gitDirs: s.gitDirs,
+  };
+}
+
+/** Opens the factory run: realpathed facts, effective autonomy, run ledger with `run_start`. Throws on failure. */
+function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined, version: string, env: NodeJS.ProcessEnv = process.env): Session {
+  const rawHome = homedir();
+  const factoryHome = resolveFactoryHome(env, rawHome);
+  const projectRoot = repoRoot(ctx.cwd) ?? canonicalDir(path.resolve(ctx.cwd));
+  const dirs = gitDirs(projectRoot);
+  for (const k of GIT_DIR_VARS) {
+    const v = env[k];
+    if (v) {
+      const d = canonicalDir(path.resolve(ctx.cwd, v));
+      if (!dirs.includes(d)) dirs.push(d);
+    }
+  }
+  const core = CoreConfig.parse(JSON.parse(readFileSync(CORE_DEFAULTS, "utf8")));
+  const autonomy = resolveConfig({ core, ...(personal ? { personal } : {}) }).value.autonomy;
+  const projectId = projectIdFor(projectRoot, sha256hex);
+  const runId = runIdFor(new Date(), process.pid);
+  const ledger = new RunLedger(ledgerDirFor(factoryHome, projectId), runId);
+  ledger.append({
+    v: 1,
+    ts: new Date().toISOString(),
+    runId,
+    type: "run_start",
+    pid: process.pid,
+    projectId,
+    projectRoot,
+    factoryVersion: version,
+    piSession: ctx.sessionManager.getSessionId(),
+  });
+  return {
+    ledger,
+    runId,
+    rawHome,
+    home: canonicalDir(rawHome),
+    piAgentDir: canonicalDir(resolvePiAgentDir(env, rawHome)),
+    factoryHome: canonicalDir(factoryHome),
+    projectRoot,
+    ledgerDir: canonicalDir(join(factoryHome, "runs")),
+    gitDirs: dirs,
+    tmpCandidates: [canonicalDir(tmpdir())],
+    autonomy,
+    postChecks: new MachinePostChecks(),
+  };
+}
+
+interface Started {
+  handshake: HandshakeResult;
+  session?: Session;
+  sessionError?: string;
+}
+
+export default function factoryExtension(pi: ExtensionAPI): void {
+  let current: Promise<Started> | undefined;
+
+  const start = (ctx: ExtensionContext): Promise<Started> => {
+    current = runHandshake().then(({ result, personal }) => {
       pi.events.emit(HANDSHAKE_EVENT, result);
-      if (!result.ok) report(ctx, result);
-      return result;
+      if (!result.ok) {
+        report(ctx, handshakeFailureMessage(result));
+        return { handshake: result };
+      }
+      // Task 8 restores the route from session entries; a new session starts read-only.
+      setRoute(INITIAL_ROUTE);
+      try {
+        return { handshake: result, session: openSession(ctx, personal, result.version) };
+      } catch (e) {
+        const sessionError = (e as Error).message;
+        report(ctx, `factory policy unavailable (every tool is blocked): ${sessionError}`);
+        return { handshake: result, sessionError };
+      }
     });
     return current;
   };
@@ -98,8 +240,36 @@ export default function factoryExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    const result = await (current ?? start(ctx));
-    if (result.ok || READ_ONLY_TOOLS.includes(event.toolName)) return undefined;
-    return { block: true, reason: handshakeFailureMessage(result) };
+    const s = await (current ?? start(ctx));
+    if (!s.handshake.ok) {
+      if (READ_ONLY_TOOLS.includes(event.toolName)) return undefined;
+      return { block: true, reason: handshakeFailureMessage(s.handshake) };
+    }
+    const session = s.session;
+    if (session === undefined) return { block: true, reason: `factory policy unavailable (fail closed): ${s.sessionError ?? "unknown error"}` };
+    const ui: GateUi | undefined = ctx.hasUI ? { confirm: (title, message) => ctx.ui.confirm(title, message, { timeout: CONFIRM_TIMEOUT_MS }) } : undefined;
+    return enforce(event, { cwd: ctx.cwd }, {
+      policyContext: () => policyContext(session, ctx),
+      ledger: session.ledger,
+      runId: session.runId,
+      home: session.rawHome,
+      postChecks: session.postChecks,
+      ...(ui ? { ui } : {}),
+    });
+  });
+
+  pi.on("tool_result", async (event) => {
+    const session = current === undefined ? undefined : (await current).session;
+    return session?.postChecks.afterToolResult(event, session.ledger, session.runId);
+  });
+
+  pi.on("session_shutdown", async (event) => {
+    const session = current === undefined ? undefined : (await current).session;
+    if (session === undefined) return;
+    try {
+      session.ledger.append({ v: 1, ts: new Date().toISOString(), runId: session.runId, type: "run_end", reason: event.reason });
+    } catch (e) {
+      process.stderr.write(`factory: could not write run_end: ${(e as Error).message}\n`);
+    }
   });
 }

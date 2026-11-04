@@ -8,13 +8,13 @@ describe("evaluateHandshake", () => {
     expect(evaluateHandshake({ ...good, expectedVersion: undefined })).toEqual({
       ok: false,
       version: "0.1.0",
-      policy: "none",
+      policy: "v1",
       reasons: ["not-installed"],
     });
   });
 
-  it("all good -> ok with policy none", () => {
-    expect(evaluateHandshake(good)).toEqual({ ok: true, version: "0.1.0", policy: "none", reasons: [] });
+  it("all good -> ok with policy v1", () => {
+    expect(evaluateHandshake(good)).toEqual({ ok: true, version: "0.1.0", policy: "v1", reasons: [] });
   });
 
   it("state version differs from the package version -> version-mismatch", () => {

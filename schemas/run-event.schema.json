@@ -135,14 +135,18 @@
         "toolCallId": {
           "type": "string"
         },
+        "parentToolCallId": {
+          "type": "string"
+        },
         "decision": {
           "anyOf": [
             {
               "type": "string",
               "enum": [
                 "allow",
-                "ask",
-                "deny"
+                "deny",
+                "allow (approved)",
+                "deny (rejected)"
               ]
             },
             {
@@ -154,7 +158,21 @@
           "type": "string"
         },
         "hardGate": {
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "destructive",
+                "remote-mutation",
+                "secrets",
+                "integration",
+                "outside-root-write"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ]
         },
         "reason": {
           "type": "string"

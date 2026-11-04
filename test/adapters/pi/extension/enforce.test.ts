@@ -1,0 +1,346 @@
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  CONFIRM_TIMEOUT_MS,
+  enforce,
+  MachinePostChecks,
+  toToolAction,
+  type EnforceDeps,
+  type GateUi,
+} from "../../../../src/adapters/pi/extension/enforce.ts";
+import { canonicalDir } from "../../../../src/adapters/pi/extension/facts.ts";
+import { RunEvent } from "../../../../src/core/ledger/events.ts";
+import type { GateContext } from "../../../../src/core/policy/gate.ts";
+import type { RouteState } from "../../../../src/core/route/types.ts";
+import { renderMachine } from "../../../../src/core/task/machine.ts";
+import { makeTmp } from "../../../helpers/tmp.ts";
+
+const cleanups: Array<() => Promise<void>> = [];
+afterEach(async () => {
+  vi.useRealTimers();
+  for (const c of cleanups.splice(0)) await c();
+});
+
+const RUN_ID = "20261103T100000Z-1";
+const TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+const FIELDS = { phase: "build", base: "abc123", checkpoint: "def456", worktree: "/w/t1", run: "r-1" };
+const TASK_DOC = `# Task t1\n\n${renderMachine(FIELDS)}\n\n## Notes\n\nfree text here\n`;
+
+interface FakeLedger {
+  events: RunEvent[];
+  append(e: RunEvent): void;
+}
+function fakeLedger(): FakeLedger {
+  const events: RunEvent[] = [];
+  // Validates like RunLedger but does not redact, so the test sees what enforce itself wrote.
+  return { events, append: (e) => void events.push(RunEvent.parse(e)) };
+}
+
+async function world() {
+  const t = await makeTmp("enforce");
+  cleanups.push(t.cleanup);
+  const root = join(t.dir, "project");
+  mkdirSync(root, { recursive: true });
+  const real = canonicalDir(root);
+  const ledgerDir = canonicalDir(join(t.dir, "factory home", "runs"));
+  const piAgentDir = canonicalDir(join(t.dir, "pi agent"));
+  const answer: RouteState = { route: "answer", writeRoots: [], needsReclassification: false };
+  const feature: RouteState = {
+    route: "feature",
+    tier: "feature",
+    taskId: "t1",
+    reason: "test",
+    worktree: real,
+    writeRoots: [real],
+    needsReclassification: false,
+  };
+  const context = (route: RouteState, over: Partial<GateContext> = {}): GateContext => ({
+    route,
+    mode: "unattended",
+    autonomy: "medium",
+    home: canonicalDir(homedir()),
+    piAgentDir,
+    projectRoot: real,
+    tmpRoots: [],
+    ledgerDir,
+    projectCommands: [],
+    taskFileExists: true,
+    gitDirs: [],
+    ...over,
+  });
+  const ledger = fakeLedger();
+  const postChecks = new MachinePostChecks();
+  const deps = (route: RouteState, over: Partial<GateContext> = {}, ui?: GateUi): EnforceDeps => ({
+    policyContext: () => context(route, over),
+    ledger,
+    runId: RUN_ID,
+    home: homedir(),
+    postChecks,
+    ...(ui ? { ui } : {}),
+  });
+  const taskFile = join(root, ".factory", "knowledge", "tasks", "t1.md");
+  return { dir: t.dir, root, real, answer, feature, context, ledger, postChecks, deps, taskFile };
+}
+
+let seq = 0;
+function call(toolName: string, input: Record<string, unknown>, extra: { toolCallId?: string; parentToolCallId?: string } = {}) {
+  return { type: "tool_call" as const, toolName, toolCallId: extra.toolCallId ?? `call-${++seq}`, input, ...extra };
+}
+
+function gates(l: FakeLedger) {
+  return l.events.filter((e): e is Extract<RunEvent, { type: "gate" }> => e.type === "gate");
+}
+
+function confirmer(answer: boolean | Promise<boolean>) {
+  const calls: Array<{ title: string; message: string }> = [];
+  const ui: GateUi = {
+    confirm: (title, message) => {
+      calls.push({ title, message });
+      return Promise.resolve(answer);
+    },
+  };
+  return { ui, calls };
+}
+
+describe("enforce (tool_call hook)", () => {
+  it("deny returns the Pi block result with the reason and audits one gate event", async () => {
+    const w = await world();
+    const ev = call("write", { path: "x.txt", content: "x" });
+    const r = await enforce(ev, { cwd: w.root }, w.deps(w.answer));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("the answer route cannot write");
+    expect(gates(w.ledger)).toHaveLength(1);
+    expect(gates(w.ledger)[0]).toMatchObject({ tool: "write", toolCallId: ev.toolCallId, decision: "deny", runId: RUN_ID });
+  });
+
+  it("ask + confirm true allows the call and audits `allow (approved)`", async () => {
+    const w = await world();
+    const { ui, calls } = confirmer(true);
+    const outside = join(w.dir, "outside.txt");
+    const r = await enforce(call("write", { path: outside, content: "x" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, ui));
+    expect(r).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.title).toBe("Factory gate: outside-root-write");
+    expect(calls[0]!.message).toContain("write");
+    expect(calls[0]!.message).toContain(outside);
+    expect(calls[0]!.message).toContain("write outside the route's write roots");
+    expect(gates(w.ledger)).toEqual([
+      expect.objectContaining({ decision: "allow (approved)", hardGate: "outside-root-write", tool: "write" }),
+    ]);
+  });
+
+  it("ask + confirm false blocks and audits `deny (rejected)`", async () => {
+    const w = await world();
+    const { ui } = confirmer(false);
+    const r = await enforce(call("bash", { command: "git push origin main" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, ui));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("rejected");
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "deny (rejected)", hardGate: "remote-mutation", class: "remote-mutating" })]);
+  });
+
+  it("ask without a UI is denied with `requires human approval`", async () => {
+    const w = await world();
+    const r = await enforce(call("bash", { command: "git push origin main" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("requires human approval");
+    const [g] = gates(w.ledger);
+    expect(g).toMatchObject({ decision: "deny", hardGate: "remote-mutation" });
+    expect(g!.reason).toContain("requires human approval");
+  });
+
+  it("a confirm dialog that fails or never answers denies (timeout)", async () => {
+    const w = await world();
+    const failing: GateUi = { confirm: () => Promise.reject(new Error("ui gone")) };
+    const r1 = await enforce(call("bash", { command: "git push" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, failing));
+    expect(r1?.block).toBe(true);
+
+    vi.useFakeTimers();
+    const silent: GateUi = { confirm: () => new Promise<boolean>(() => {}) };
+    const pending = enforce(call("bash", { command: "git push" }), { cwd: w.root }, w.deps(w.feature, { mode: "interactive" }, silent));
+    await vi.advanceTimersByTimeAsync(CONFIRM_TIMEOUT_MS);
+    const r2 = await pending;
+    expect(r2?.block).toBe(true);
+    expect(gates(w.ledger).map((g) => g.decision)).toEqual(["deny (rejected)", "deny (rejected)"]);
+  });
+
+  it("an edit touching the machine section is blocked and the file is left alone", async () => {
+    const w = await world();
+    mkdirSync(join(w.taskFile, ".."), { recursive: true });
+    writeFileSync(w.taskFile, TASK_DOC);
+    const r = await enforce(
+      call("edit", { path: w.taskFile, edits: [{ oldText: "checkpoint: def456", newText: "checkpoint: 000000" }] }),
+      { cwd: w.root },
+      w.deps(w.feature),
+    );
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("machine-owned section");
+    expect(readFileSync(w.taskFile, "utf8")).toBe(TASK_DOC);
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ tool: "edit", decision: "deny" })]);
+  });
+
+  it("a write that creates a machine block in a new task file is blocked", async () => {
+    const w = await world();
+    const r = await enforce(call("write", { path: w.taskFile, content: TASK_DOC }), { cwd: w.root }, w.deps(w.feature));
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("machine-owned section");
+  });
+
+  it("an allowed edit that still alters the block (fuzzy match) is repaired at tool_result and a note is appended", async () => {
+    const w = await world();
+    mkdirSync(join(w.taskFile, ".."), { recursive: true });
+    writeFileSync(w.taskFile, TASK_DOC);
+    const ev = call("edit", { path: w.taskFile, edits: [{ oldText: "free text here", newText: "edited text" }] });
+    expect(await enforce(ev, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+
+    // Simulate the tool: the legitimate change plus an unexpected change inside the machine block.
+    writeFileSync(w.taskFile, TASK_DOC.replace("free text here", "edited text").replace("checkpoint: def456", "checkpoint: 999999"));
+    const original = [{ type: "text" as const, text: "Successfully replaced 1 block(s)." }];
+    const res = w.postChecks.afterToolResult({ toolCallId: ev.toolCallId, content: original, isError: false }, w.ledger, RUN_ID);
+
+    expect(readFileSync(w.taskFile, "utf8")).toBe(TASK_DOC.replace("free text here", "edited text"));
+    expect(res?.content).toHaveLength(2);
+    expect(res?.content?.[0]).toEqual(original[0]);
+    const note = res?.content?.[1];
+    expect(note?.type === "text" ? note.text : "").toMatch(/machine-owned section .* restored/);
+    expect(w.ledger.events.filter((e) => e.type === "error")).toEqual([expect.objectContaining({ where: "machine-section" })]);
+    // The audit trail still has exactly one gate event for the call.
+    expect(gates(w.ledger).filter((g) => g.toolCallId === ev.toolCallId)).toHaveLength(1);
+  });
+
+  it("an allowed edit that keeps the block intact leaves the tool result unchanged", async () => {
+    const w = await world();
+    mkdirSync(join(w.taskFile, ".."), { recursive: true });
+    writeFileSync(w.taskFile, TASK_DOC);
+    const ev = call("edit", { path: w.taskFile, edits: [{ oldText: "free text here", newText: "edited text" }] });
+    expect(await enforce(ev, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    writeFileSync(w.taskFile, TASK_DOC.replace("free text here", "edited text"));
+    expect(w.postChecks.afterToolResult({ toolCallId: ev.toolCallId, content: [], isError: false }, w.ledger, RUN_ID)).toBeUndefined();
+    // A second result for the same id (or an unknown id) is ignored.
+    expect(w.postChecks.afterToolResult({ toolCallId: ev.toolCallId, content: [], isError: false }, w.ledger, RUN_ID)).toBeUndefined();
+  });
+
+  it("a write that deletes the block through a fuzzy path restores the whole pre-call file", async () => {
+    const w = await world();
+    mkdirSync(join(w.taskFile, ".."), { recursive: true });
+    writeFileSync(w.taskFile, TASK_DOC);
+    const ev = call("write", { path: w.taskFile, content: TASK_DOC.replace("free text here", "rewritten") });
+    expect(await enforce(ev, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    writeFileSync(w.taskFile, "# Task t1\n\nno block any more\n");
+    const res = w.postChecks.afterToolResult({ toolCallId: ev.toolCallId, content: [], isError: false }, w.ledger, RUN_ID);
+    expect(readFileSync(w.taskFile, "utf8")).toBe(TASK_DOC);
+    expect(res?.content).toHaveLength(1);
+  });
+
+  it("every decision appends exactly one gate event with a redacted summary", async () => {
+    const w = await world();
+    writeFileSync(join(w.root, "a.txt"), "a");
+    const calls = [
+      call("read", { path: "a.txt" }),
+      call("bash", { command: `echo ${TOKEN}` }),
+      call("write", { path: "b.txt", content: TOKEN }),
+      call("dangerous_tool", { secret: TOKEN }),
+    ];
+    for (const c of calls) await enforce(c, { cwd: w.root }, w.deps(w.answer));
+    const g = gates(w.ledger);
+    expect(g.map((x) => x.toolCallId)).toEqual(calls.map((c) => c.toolCallId));
+    expect(g.map((x) => x.decision)).toEqual(["allow", "allow", "deny", "deny"]);
+    expect(g[1]!.summary).toContain("echo ***");
+    for (const x of g) {
+      expect(JSON.stringify(x)).not.toContain(TOKEN);
+      expect(x.summary).not.toBe("");
+    }
+    expect(g[2]!.summary).toContain("b.txt");
+  });
+
+  it("a nested call is gated the same way and the gate event carries parentToolCallId", async () => {
+    const w = await world();
+    const ev = call("write", { path: join(w.dir, "outside.txt"), content: "x" }, { toolCallId: "p1/1", parentToolCallId: "p1" });
+    const r = await enforce(ev, { cwd: w.root }, w.deps(w.feature));
+    expect(r?.block).toBe(true);
+    expect(gates(w.ledger)[0]).toMatchObject({ toolCallId: "p1/1", parentToolCallId: "p1", decision: "deny" });
+  });
+
+  it("an exception while building the policy context denies with a gate event (fail closed)", async () => {
+    const w = await world();
+    const deps: EnforceDeps = {
+      ...w.deps(w.answer),
+      policyContext: () => {
+        throw new Error("config exploded");
+      },
+    };
+    const r = await enforce(call("read", { path: "a.txt" }), { cwd: w.root }, deps);
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("config exploded");
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "deny" })]);
+    expect(gates(w.ledger)[0]!.reason).toContain("policy error");
+  });
+
+  it("a failed audit write blocks even an allowed call", async () => {
+    const w = await world();
+    const deps: EnforceDeps = {
+      ...w.deps(w.answer),
+      ledger: {
+        append: () => {
+          throw new Error("ENOSPC");
+        },
+      },
+    };
+    const r = await enforce(call("read", { path: "a.txt" }), { cwd: w.root }, deps);
+    expect(r?.block).toBe(true);
+    expect(r?.reason).toContain("audit");
+  });
+});
+
+describe("toToolAction", () => {
+  const facts = (cwd: string) => ({ cwd, home: homedir(), projectCommands: [] });
+
+  it("bash: one fact per pathArg and per path-like or existing readArg, input equal to the argument", async () => {
+    const w = await world();
+    writeFileSync(join(w.root, "a.txt"), "a");
+    const a = toToolAction(call("bash", { command: "cp a.txt ../out.txt && cat ./missing notes" }), facts(w.root));
+    expect(a.kind).toBe("command");
+    if (a.kind !== "command") return;
+    const inputs = a.pathFacts.map((f) => f.input);
+    expect(inputs).toContain("../out.txt");
+    expect(inputs).toContain("a.txt");
+    expect(inputs).toContain("./missing");
+    // Not path-like and not on disk: a word, not a file (R25).
+    expect(inputs).not.toContain("notes");
+    const out = a.pathFacts.find((f) => f.input === "../out.txt");
+    expect(out?.resolved).toBe(join(canonicalDir(w.dir), "out.txt"));
+  });
+
+  it("read tools: the path when given; grep/find/ls without a path default to the cwd", async () => {
+    const w = await world();
+    const r = toToolAction(call("read", { path: "a.txt" }), facts(w.root));
+    expect(r).toMatchObject({ kind: "read", tool: "read", path: { input: "a.txt", resolved: join(w.real, "a.txt") } });
+    const g = toToolAction(call("grep", { pattern: "x" }), facts(w.root));
+    expect(g).toMatchObject({ kind: "read", tool: "grep", path: { input: ".", resolved: w.real } });
+  });
+
+  it("write/edit: path facts, targetExists and the machine pre-check", async () => {
+    const w = await world();
+    writeFileSync(join(w.root, "plain.md"), "plain");
+    const plain = toToolAction(call("write", { path: "plain.md", content: renderMachine(FIELDS) }), facts(w.root));
+    expect(plain).toMatchObject({ kind: "write", tool: "write", touchesMachineSection: false, targetExists: true });
+    const fresh = toToolAction(call("write", { path: "new.md", content: "x" }), facts(w.root));
+    expect(fresh).toMatchObject({ targetExists: false, touchesMachineSection: false });
+    const task = toToolAction(call("write", { path: w.taskFile, content: TASK_DOC }), facts(w.root));
+    expect(task).toMatchObject({ touchesMachineSection: true });
+    // A non-task file that already holds a block is protected too.
+    writeFileSync(join(w.root, "other.md"), TASK_DOC);
+    const other = toToolAction(call("edit", { path: "other.md", edits: [{ oldText: "checkpoint: def456", newText: "x" }] }), facts(w.root));
+    expect(other).toMatchObject({ kind: "write", tool: "edit", touchesMachineSection: true });
+  });
+
+  it("classifies factory tools, powershell and anything else", async () => {
+    const w = await world();
+    expect(toToolAction(call("set_route", { route: "small" }), facts(w.root))).toEqual({ kind: "factory", tool: "set_route" });
+    expect(toToolAction(call("powershell", { command: "Get-ChildItem" }), facts(w.root))).toMatchObject({ kind: "command", tool: "powershell" });
+    expect(toToolAction(call("mcp_tool", {}), facts(w.root))).toEqual({ kind: "unknown", tool: "mcp_tool" });
+    // A malformed built-in call is not trusted.
+    expect(toToolAction(call("write", { path: 3 }), facts(w.root))).toEqual({ kind: "unknown", tool: "write" });
+  });
+});

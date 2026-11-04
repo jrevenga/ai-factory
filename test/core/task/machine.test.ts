@@ -7,6 +7,7 @@ import {
   renderMachine,
   replaceMachine,
   touchesMachine,
+  editTouchesMachine,
 } from "../../../src/core/task/machine.ts";
 
 const valid = (md: string) => {
@@ -121,5 +122,41 @@ describe("machine section fail-closed handling", () => {
     expect(() => renderMachine({ "bad key": "x" })).toThrow();
     const f = { phase: "build", base: "", checkpoint: "c", worktree: "w", run: "" };
     expect(valid(`${renderMachine(f)}\n`)?.fields).toEqual(f);
+  });
+});
+
+describe("editTouchesMachine (ruling 8 conservative pre-check)", () => {
+  const doc = `# Task t1\n\n${renderMachine(fields)}\n\n## Notes\n\nfree text here\n`;
+  const e = (oldText: string, newText = "x") => [{ oldText, newText }];
+
+  it("allows an edit that only changes text outside the block", () => {
+    expect(editTouchesMachine(doc, e("free text here", "new text"))).toBe(false);
+  });
+  it("is false for a file without any machine block when no marker is added", () => {
+    expect(editTouchesMachine("# plain\n\ntext\n", e("text", "more"))).toBe(false);
+  });
+  it("denies an oldText that contains a marker", () => {
+    expect(editTouchesMachine(doc, e(MACHINE_OPEN))).toBe(true);
+    expect(editTouchesMachine(doc, e(`${MACHINE_CLOSE}\n\n## Notes`))).toBe(true);
+  });
+  it("denies an oldText that contains a line of the current block", () => {
+    const line = "phase: build · base: abc123 · checkpoint: def456 · worktree: /w/t1 · run: r-1";
+    expect(editTouchesMachine(doc, e(`${line}\n`))).toBe(true);
+  });
+  it("denies an oldText whose only occurrence lies inside the block (a fragment of a field)", () => {
+    expect(editTouchesMachine(doc, e("checkpoint: def456", "checkpoint: 000000"))).toBe(true);
+  });
+  it("denies a newText that adds a marker, with or without an existing block", () => {
+    expect(editTouchesMachine(doc, e("free text here", MACHINE_OPEN))).toBe(true);
+    expect(editTouchesMachine("# plain\n\ntext\n", e("text", `${MACHINE_OPEN}\nphase: x\n${MACHINE_CLOSE}`))).toBe(true);
+  });
+  it("denies when no exact match exists but a fuzzy match could land in the block", () => {
+    // Trailing spaces and a CRLF: Pi's fuzzy matching may still find it inside the block.
+    expect(editTouchesMachine(doc, e("checkpoint: def456   "))).toBe(true);
+    expect(editTouchesMachine(doc.replaceAll("\n", "\r\n"), e(`${MACHINE_OPEN}\n`))).toBe(true);
+  });
+  it("is fail-closed on an ambiguous block and on an empty oldText", () => {
+    expect(editTouchesMachine(`${doc}\n${MACHINE_OPEN}\n`, e("free text here"))).toBe(true);
+    expect(editTouchesMachine(doc, e(""))).toBe(true);
   });
 });
