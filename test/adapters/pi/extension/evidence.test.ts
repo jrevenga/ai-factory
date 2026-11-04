@@ -11,10 +11,10 @@ import {
   RECORD_DECISION_TOOL,
   RECORD_REVIEW_TOOL,
   registerEvidence,
-  resolveExecutable,
   RUN_CHECK_TOOL,
   type EvidenceSession,
 } from "../../../../src/adapters/pi/extension/evidence.ts";
+import { gitRun, resolveProgram, safePathEntries } from "../../../../src/adapters/pi/extension/facts.ts";
 import { RunLedger } from "../../../../src/adapters/pi/extension/ledger.ts";
 import type { SoftGateId } from "../../../../src/core/config/schema.ts";
 import { SIMPLE_COMMANDS_ONLY } from "../../../../src/core/evidence/check-plan.ts";
@@ -30,11 +30,13 @@ import { makeTmp } from "../../../helpers/tmp.ts";
 const isWin = process.platform === "win32";
 const RUN_ID = "20261104T120000Z-1";
 const TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+const ORIGINAL_PATH = process.env.PATH ?? "";
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: isWin ? "NUL" : "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   setRoute(INITIAL_ROUTE);
+  vi.stubEnv("PATH", ORIGINAL_PATH);
   for (const c of cleanups.splice(0)) await c();
 });
 beforeAll(() => {
@@ -536,37 +538,100 @@ describe("run_check", () => {
   });
 });
 
-describe("resolveExecutable (decision 4)", () => {
-  const files = new Set(["C:\\node\\node.exe", "C:\\node\\npm.cmd", "C:\\tools\\run.bat", "C:\\repo\\git.exe", "C:\\node\\script.js"]);
+describe("resolveProgram (decision 4, M2)", () => {
+  const files = new Set(["C:\\node\\node.exe", "C:\\node\\npm.cmd", "C:\\tools\\run.bat", "C:\\repo\\git.exe", "C:\\node\\script.js", "C:\\repo\\bin\\cat.exe", "C:\\sys\\cat.exe"]);
   // Windows file names are case-insensitive (PATHEXT entries are upper case).
   const lower = new Set([...files].map((f) => f.toLowerCase()));
-  const win = (env: NodeJS.ProcessEnv) => ({ platform: "win32" as const, env, isFile: (p: string) => lower.has(p.toLowerCase()) });
+  const win = (env: NodeJS.ProcessEnv, excludeRoots: string[] = ["C:\\repo"]) => ({
+    platform: "win32" as const,
+    env,
+    isFile: (p: string) => lower.has(p.toLowerCase()),
+    excludeRoots,
+    real: (p: string) => p,
+  });
   const env = { Path: "C:\\node;C:\\tools", PATHEXT: ".COM;.EXE;.BAT;.CMD;.JS" };
 
   it("resolves through PATH and PATHEXT to an .exe on Windows", () => {
-    const r = resolveExecutable("node", "C:\\repo", win(env));
+    const r = resolveProgram("node", "C:\\repo", win(env));
     expect(r.ok && r.file.toLowerCase()).toBe("c:\\node\\node.exe");
   });
 
   it("refuses .cmd/.bat (Node will not spawn them without a shell) and other non-programs", () => {
     for (const name of ["npm", "run"]) {
-      const r = resolveExecutable(name, "C:\\repo", win(env));
+      const r = resolveProgram(name, "C:\\repo", win(env));
       expect(r.ok, name).toBe(false);
       if (!r.ok) expect(r.error).toContain("batch file");
     }
-    const js = resolveExecutable("script", "C:\\repo", win(env));
+    const js = resolveProgram("script", "C:\\repo", win(env));
     expect(js.ok).toBe(false);
     if (!js.ok) expect(js.error).toContain("only .exe and .com");
   });
 
-  it("never picks a program from the current directory and reports a missing one", () => {
-    const r = resolveExecutable("git", "C:\\repo", win(env));
+  it("never picks a program from the current directory, a relative or empty PATH entry, or a PATH entry inside the project", () => {
+    const r = resolveProgram("git", "C:\\repo", win(env));
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("not found on PATH");
+    const planted = resolveProgram("cat", "C:\\repo", win({ Path: ".;;bin;C:\\repo\\bin;C:\\sys", PATHEXT: ".EXE" }));
+    expect(planted.ok && planted.file.toLowerCase()).toBe("c:\\sys\\cat.exe");
   });
 
-  it("leaves POSIX resolution to the OS", () => {
-    expect(resolveExecutable("node", "/repo", { platform: "linux", env: {}, isFile: () => false })).toEqual({ ok: true, file: "node" });
+  it("POSIX: searches only absolute PATH entries outside the project for an executable file", () => {
+    const exec = new Set(["/repo/node_modules/.bin/cat", "/usr/bin/cat", "/repo/bin/cat"]);
+    const posix = { platform: "linux" as const, env: { PATH: "node_modules/.bin::/repo/bin:/usr/bin" }, isFile: (p: string) => exec.has(p), excludeRoots: ["/repo"], real: (p: string) => p };
+    expect(resolveProgram("cat", "/repo", posix)).toEqual({ ok: true, file: "/usr/bin/cat" });
+    const missing = resolveProgram("nope", "/repo", posix);
+    expect(missing.ok).toBe(false);
+    // A path-qualified program (only a declared command gets here) is taken as named, relative to the cwd.
+    expect(resolveProgram("node_modules/.bin/vitest", "/repo", posix)).toEqual({ ok: true, file: "/repo/node_modules/.bin/vitest" });
+  });
+
+  it("safePathEntries drops relative, empty and in-project entries", () => {
+    expect(safePathEntries({ PATH: ":.:bin:/repo/x:/repo:/usr/bin:/opt/b" }, "linux", ["/repo"], (p) => p)).toEqual(["/usr/bin", "/opt/b"]);
+  });
+});
+
+describe("planted programs (M2)", () => {
+  it.skipIf(isWin)("run_check never runs a program planted in the project through a relative or in-project PATH entry", async () => {
+    const x = await world();
+    setRoute(x.small);
+    const bin = join(x.project, "node_modules", ".bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "cat"), `#!/bin/sh\necho planted > "${join(x.dir, "marker")}"\n`, { mode: 0o755 });
+    for (const PATH of [`node_modules/.bin:${process.env.PATH}`, `${bin}:${process.env.PATH}`, `:${process.env.PATH}`]) {
+      vi.stubEnv("PATH", PATH);
+      const r = await x.check("cat README.md");
+      expect(r.record?.exitCode, PATH).toBe(0);
+      expect(r.text, PATH).toContain("readme");
+      expect(existsSync(join(x.dir, "marker")), PATH).toBe(false);
+    }
+    vi.stubEnv("PATH", ORIGINAL_PATH);
+  });
+
+  it.skipIf(isWin)("factory git never runs a git planted in the repository through `.` or an in-repository PATH entry", async () => {
+    const x = await world();
+    const plant = (dir: string) => {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "git"), `#!/bin/sh\necho planted > "${join(x.dir, "marker")}"\nexit 0\n`, { mode: 0o755 });
+    };
+    plant(x.project);
+    plant(join(x.project, "tools"));
+    for (const PATH of [`.:${process.env.PATH}`, `${join(x.project, "tools")}:${process.env.PATH}`]) {
+      vi.stubEnv("PATH", PATH);
+      expect(gitRun(x.project, ["rev-parse", "--show-toplevel"]).stdout.trim(), PATH).toBe(x.project);
+      expect(fingerprint(x.project), PATH).toMatch(/^[0-9a-f]{40}$/);
+      expect(existsSync(join(x.dir, "marker")), PATH).toBe(false);
+    }
+    vi.stubEnv("PATH", ORIGINAL_PATH);
+  });
+
+  it("factory git fails closed with a clear message when no git is found outside the project", async () => {
+    const x = await world();
+    vi.stubEnv("PATH", join(x.dir, "empty"));
+    const r = gitRun(x.project, ["status"]);
+    expect(r.status).toBeNull();
+    expect(r.stderr).toContain("git was not found on PATH");
+    expect(() => fingerprint(x.project)).toThrow(/git was not found on PATH/);
+    vi.stubEnv("PATH", ORIGINAL_PATH);
   });
 });
 

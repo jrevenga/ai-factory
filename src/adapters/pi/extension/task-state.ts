@@ -17,7 +17,7 @@ import { redact, summarizeCommand } from "../../../core/policy/redact.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { parseMachine, renderMachine, replaceMachine } from "../../../core/task/machine.ts";
 import { currentRoute, setRoute, type LedgerSink } from "./enforce.ts";
-import { canonicalDir, gitRun, hostPlatform, type GitRun } from "./facts.ts";
+import { canonicalDir, gitFailureText, gitRun, hostPlatform, type GitRun } from "./facts.ts";
 import { checkedBase, ROUTE_ENTRY, ROUTE_IO, verifyRegisteredTool, type RouteIo } from "./route-state.ts";
 
 export const TASK_PROGRESS_TOOL = "task_progress";
@@ -98,8 +98,7 @@ function result(text: string, details: Details | undefined, isError = false) {
 }
 
 function gitError(what: string, r: { status: number | null; stderr: string }): Refusal {
-  const detail = r.stderr.trim().split(/\r?\n/).slice(-3).join(" ").slice(0, 500);
-  return new Refusal(`${what} failed${r.status === null ? " (git could not run or timed out)" : ` (exit ${r.status})`}${detail !== "" ? `: ${detail}` : ""}`);
+  return new Refusal(gitFailureText(what, r));
 }
 
 export type Git = (cwd: string, args: string[], input?: string, env?: Record<string, string>) => GitRun;

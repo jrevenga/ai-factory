@@ -10,7 +10,7 @@
 // The `CheckRecord` holds the fingerprints before and after (`mutated` when they differ).
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, writeSync } from "node:fs";
 import { constants as osConstants, homedir, tmpdir } from "node:os";
 import path, { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -26,7 +26,7 @@ import { isSecretPath } from "../../../core/policy/paths.ts";
 import { LineRedactor, redact, summarizeCommand } from "../../../core/policy/redact.ts";
 import { currentRoute, RUN_CHECK_TOOL, type GatedChecks, type LedgerSink } from "./enforce.ts";
 import { killProcessTree, type ProcessDeps } from "../../platform/process.ts";
-import { canonicalDir, hostPlatform } from "./facts.ts";
+import { canonicalDir, gitFailureText, hostPlatform, hostProgramSearch, resolveProgram, withSafePath } from "./facts.ts";
 import { RunLedger } from "./ledger.ts";
 import { verifyRegisteredTool } from "./route-state.ts";
 import { withSafeGit, type Git, type SecretTest } from "./task-state.ts";
@@ -55,8 +55,7 @@ const nulList = (items: readonly string[]) => `${items.join("\0")}\0`;
 // --- Fingerprint (ruling 11) -----------------------------------------------------------------------------------
 
 function gitFailure(what: string, r: { status: number | null; stderr: string }): Error {
-  const detail = r.stderr.trim().split(/\r?\n/).slice(-3).join(" ").slice(0, 500);
-  return new Error(`fingerprint: git ${what} failed${r.status === null ? " (git could not run or timed out)" : ` (exit ${r.status})`}${detail !== "" ? `: ${detail}` : ""}`);
+  return new Error(`fingerprint: ${gitFailureText(`git ${what}`, r)}`);
 }
 
 /** Absolute path of the work tree's own index (`--git-path index`: a linked worktree has its own). */
@@ -92,6 +91,7 @@ export function fingerprint(dir: string, isSecret?: SecretTest): string {
   return withSafeGit((git) => {
     const topRun = git(dir, ["rev-parse", "--show-toplevel"]);
     const topOut = topRun.stdout.trim();
+    if (topRun.status === null) throw gitFailure("rev-parse --show-toplevel", topRun);
     if (topRun.status !== 0 || topOut === "") throw new Error(`fingerprint: ${dir} is not inside a git work tree`);
     const top = path.resolve(dir, topOut);
     const secret = isSecret ?? secretTestFor(top, { home: canonicalDir(homedir()), piAgentDir: canonicalDir(resolvePiAgentDir(process.env, homedir())) });
@@ -154,63 +154,6 @@ export function loadEvidence(ledgerDir: string, runIds?: readonly string[]): { c
     }
   }
   return { checks, dispositions };
-}
-
-// --- Executables (decision 4) ----------------------------------------------------------------------------------
-
-export interface ResolveDeps {
-  platform: NodeJS.Platform;
-  env: NodeJS.ProcessEnv;
-  isFile(p: string): boolean;
-}
-
-function isFile(p: string): boolean {
-  try {
-    return statSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
-
-const envValue = (env: NodeJS.ProcessEnv, name: string) => Object.entries(env).find(([k]) => k.toUpperCase() === name)?.[1];
-
-/**
- * The file `run_check` spawns for `argv0` (always with `shell: false`). POSIX: `argv0` itself (the OS searches
- * PATH). Windows: resolved through PATH and PATHEXT (never the current directory, so a program planted in the
- * repository is not picked up); a `.cmd`/`.bat` is refused, because Node refuses to spawn one without a shell
- * (EINVAL since the 2024 fix for CVE-2024-27980) and Phase 2 adds no shell; only `.exe`/`.com` run.
- */
-export function resolveExecutable(argv0: string, cwd: string, deps: ResolveDeps = { platform: process.platform, env: process.env, isFile }): { ok: true; file: string } | { ok: false; error: string } {
-  if (deps.platform !== "win32") return { ok: true, file: argv0 };
-  const w = path.win32;
-  const exts = (envValue(deps.env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .map((e) => e.trim())
-    .filter((e) => e.startsWith("."));
-  const withDir = /[\\/]/.test(argv0) || /^[A-Za-z]:/.test(argv0);
-  const dirs = withDir
-    ? [cwd]
-    : (envValue(deps.env, "PATH") ?? "")
-        .split(";")
-        .map((d) => d.trim().replace(/^"(.*)"$/, "$1"))
-        .filter((d) => d !== "" && w.isAbsolute(d));
-  const names = w.extname(argv0) !== "" ? [argv0, ...exts.map((e) => `${argv0}${e}`)] : exts.map((e) => `${argv0}${e}`);
-  for (const d of dirs) {
-    for (const n of names) {
-      const candidate = w.resolve(d, n);
-      if (!deps.isFile(candidate)) continue;
-      const ext = w.extname(candidate).toLowerCase();
-      if (ext === ".cmd" || ext === ".bat") {
-        return {
-          ok: false,
-          error: `${argv0} resolves to the batch file ${candidate}; run_check starts programs without a shell and Node refuses .cmd/.bat files without one (Phase 2 adds no shell). Run the program it wraps instead (for example node with the script path) and declare that command in .factory/config.json`,
-        };
-      }
-      if (ext !== ".exe" && ext !== ".com") return { ok: false, error: `${argv0} resolves to ${candidate}, which run_check cannot start without a shell (only .exe and .com)` };
-      return { ok: true, file: candidate };
-    }
-  }
-  return { ok: false, error: `${argv0} was not found on PATH (PATHEXT ${exts.join(";")})` };
 }
 
 // --- Process tree teardown (decision 5) ------------------------------------------------------------------------
@@ -594,10 +537,14 @@ async function runCheck(s: EvidenceSession, toolCallId: string, params: { comman
   const plan = planCheck(cleared.command, s.projectCommands);
   if (!plan.ok) throw new Refusal(plan.error);
   const cwd = cleared.cwd;
+  // M2: programs come only from absolute PATH entries outside the project and the write root, in the search and in
+  // the child's own PATH.
+  const excluded = [s.projectRoot, cwd];
+  const env = withSafePath(process.env, process.platform, excluded);
   const steps: ResolvedStep[] = plan.steps.map((step: CheckStep) => {
-    const exe = resolveExecutable(step.argv[0]!, cwd);
+    const exe = resolveProgram(step.argv[0]!, cwd, hostProgramSearch(excluded, env));
     if (!exe.ok) throw new Refusal(exe.error);
-    return { file: exe.file, args: step.argv.slice(1), env: { ...process.env, ...step.env }, display: step.argv.join(" ") };
+    return { file: exe.file, args: step.argv.slice(1), env: { ...env, ...step.env }, display: step.argv.join(" ") };
   });
   const secret = secretTestFor(cwd, s);
   const before = fingerprint(cwd, secret);

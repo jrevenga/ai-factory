@@ -12,7 +12,7 @@
 // dangling symlinks to their target (a write through one creates the target).
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { accessSync, constants, lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PathFacts, PathPlatform } from "../../../core/policy/paths.ts";
@@ -272,6 +272,172 @@ export function canonicalDir(p: string): string {
   return realTarget(path.resolve(p));
 }
 
+// --- Programs on PATH (decision 4, M2) --------------------------------------------------------------------------
+
+export interface ProgramSearch {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  /** POSIX: an executable regular file; Windows: a regular file. */
+  isFile(p: string): boolean;
+  /** Directories whose programs are never picked up through PATH (the project, the write root). */
+  excludeRoots: readonly string[];
+  /** Realpath for the containment check (default: the native realpath, undefined when missing). */
+  real?: (p: string) => string | undefined;
+}
+
+const envValue = (env: NodeJS.ProcessEnv, name: string) => Object.entries(env).find(([k]) => k.toUpperCase() === name)?.[1];
+
+function insideAny(p: string, roots: readonly string[], platform: NodeJS.Platform): boolean {
+  const a = platform === "win32" ? path.win32 : path.posix;
+  const fold = (x: string) => (platform === "win32" ? x.toLowerCase() : x);
+  return roots.some((r) => {
+    const rel = a.relative(fold(r), fold(p));
+    return rel === "" || (!rel.startsWith("..") && !a.isAbsolute(rel));
+  });
+}
+
+/**
+ * M2: the PATH entries a factory spawn may search: absolute, non-empty and outside every `excludeRoots` entry (also
+ * after following links), so neither a relative entry (`node_modules/.bin`, `.`, an empty one) nor a directory in the
+ * project can supply the program.
+ */
+export function safePathEntries(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  excludeRoots: readonly string[],
+  real: (p: string) => string | undefined = realOrUndefined,
+): string[] {
+  const a = platform === "win32" ? path.win32 : path.posix;
+  const roots = excludeRoots.flatMap((r) => [r, real(r) ?? r]);
+  return (envValue(env, "PATH") ?? "")
+    .split(platform === "win32" ? ";" : ":")
+    .map((d) => (platform === "win32" ? d.trim().replace(/^"(.*)"$/, "$1") : d))
+    .filter((d) => d !== "" && a.isAbsolute(d) && !insideAny(d, roots, platform) && !insideAny(real(d) ?? d, roots, platform));
+}
+
+/** The env with PATH reduced to `safePathEntries`, under its original variable name. */
+export function withSafePath(env: NodeJS.ProcessEnv, platform: NodeJS.Platform, excludeRoots: readonly string[]): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  const key = Object.keys(out).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  for (const k of Object.keys(out)) if (k.toUpperCase() === "PATH") delete out[k];
+  out[key] = safePathEntries(env, platform, excludeRoots).join(platform === "win32" ? ";" : ":");
+  return out;
+}
+
+function executableFile(p: string): boolean {
+  try {
+    if (!statSync(p).isFile()) return false;
+    if (process.platform !== "win32") accessSync(p, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The host's program search, excluding `excludeRoots`. */
+export function hostProgramSearch(excludeRoots: readonly string[], env: NodeJS.ProcessEnv = process.env): ProgramSearch {
+  return { platform: process.platform, env, isFile: executableFile, excludeRoots };
+}
+
+/**
+ * The absolute file a factory spawn starts for `argv0` (always `shell: false`), searched in `safePathEntries` only,
+ * never the current directory. A path-qualified `argv0` (only a declared command reaches here with one) is taken as
+ * named, relative to `cwd`. Windows: PATHEXT applies; a `.cmd`/`.bat` is refused, because Node refuses to spawn one
+ * without a shell (EINVAL since the fix for CVE-2024-27980) and Phase 2 adds no shell; only `.exe`/`.com` run.
+ */
+export function resolveProgram(argv0: string, cwd: string, deps: ProgramSearch): { ok: true; file: string } | { ok: false; error: string } {
+  const win = deps.platform === "win32";
+  const a = win ? path.win32 : path.posix;
+  const withDir = win ? /[\\/]/.test(argv0) || /^[A-Za-z]:/.test(argv0) : argv0.includes("/");
+  const ignored = "relative, empty and in-project PATH entries are ignored";
+  if (!win) {
+    if (withDir) return { ok: true, file: a.resolve(cwd, argv0) };
+    for (const d of safePathEntries(deps.env, deps.platform, deps.excludeRoots, deps.real ?? realOrUndefined)) {
+      const candidate = a.join(d, argv0);
+      if (deps.isFile(candidate)) return { ok: true, file: candidate };
+    }
+    return { ok: false, error: `${argv0} was not found on PATH (${ignored})` };
+  }
+  const dirs = withDir ? [cwd] : safePathEntries(deps.env, deps.platform, deps.excludeRoots, deps.real ?? realOrUndefined);
+  const exts = (envValue(deps.env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((e) => e.trim())
+    .filter((e) => e.startsWith("."));
+  const names = a.extname(argv0) !== "" ? [argv0, ...exts.map((e) => `${argv0}${e}`)] : exts.map((e) => `${argv0}${e}`);
+  for (const d of dirs) {
+    for (const n of names) {
+      const candidate = a.resolve(d, n);
+      if (!deps.isFile(candidate)) continue;
+      const ext = a.extname(candidate).toLowerCase();
+      if (ext === ".cmd" || ext === ".bat") {
+        return {
+          ok: false,
+          error: `${argv0} resolves to the batch file ${candidate}; run_check starts programs without a shell and Node refuses .cmd/.bat files without one (Phase 2 adds no shell). Run the program it wraps instead (for example node with the script path) and declare that command in .factory/config.json`,
+        };
+      }
+      if (ext !== ".exe" && ext !== ".com") return { ok: false, error: `${argv0} resolves to ${candidate}, which run_check cannot start without a shell (only .exe and .com)` };
+      return { ok: true, file: candidate };
+    }
+  }
+  return { ok: false, error: `${argv0} was not found on PATH (PATHEXT ${exts.join(";")}; ${ignored})` };
+}
+
+// --- Factory git ------------------------------------------------------------------------------------------------
+
+const GIT_NOT_FOUND =
+  "git was not found on PATH outside the project (relative, empty and in-project PATH entries are ignored); factory git commands cannot run";
+
+/**
+ * The repository roots around `cwd`, found without running git: the nearest ancestor holding `.git`, and for a linked
+ * worktree (`.git` is a file naming `<main>/.git/worktrees/<name>`) the main work tree too.
+ */
+function repoRootsAround(cwd: string): string[] {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    const dotGit = path.join(dir, ".git");
+    let isFile: boolean | undefined;
+    try {
+      isFile = lstatSync(dotGit).isFile();
+    } catch {
+      isFile = undefined;
+    }
+    if (isFile !== undefined) {
+      const roots = [dir];
+      if (isFile) {
+        try {
+          const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
+          const gitdir = m ? path.resolve(dir, m[1]!) : undefined;
+          const idx = gitdir === undefined ? -1 : gitdir.replaceAll("\\", "/").lastIndexOf("/.git/worktrees/");
+          if (gitdir !== undefined && idx > 0) roots.push(gitdir.slice(0, idx));
+        } catch {
+          // Unreadable: the worktree itself stays excluded.
+        }
+      }
+      return roots;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return [];
+    dir = parent;
+  }
+}
+
+const gitCache = new Map<string, string | undefined>();
+
+/**
+ * M2: the absolute git every factory git spawn uses, resolved once per PATH and repository (cached). It is searched
+ * only in `safePathEntries`: never the cwd (Windows libuv would look there first for a bare `git`), never a PATH entry
+ * inside the cwd or the repository around it. Undefined when none is found (callers fail closed).
+ */
+export function gitExecutable(cwd: string): string | undefined {
+  const roots = [path.resolve(cwd), ...repoRootsAround(cwd)];
+  const key = [process.platform, envValue(process.env, "PATH") ?? "", envValue(process.env, "PATHEXT") ?? "", ...roots].join("\0");
+  if (gitCache.has(key)) return gitCache.get(key);
+  const r = resolveProgram("git", cwd, hostProgramSearch(roots));
+  const file = r.ok ? r.file : undefined;
+  gitCache.set(key, file);
+  return file;
+}
+
 /**
  * The process env for git: no prompts, and no inherited location variables. `extra` is applied after the stripping
  * (e.g. a factory-owned `GIT_INDEX_FILE` for the fingerprint's temporary index).
@@ -283,6 +449,15 @@ function gitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     if (GIT_LOCATION_VARS.includes(u) || GIT_PATHSPEC_VARS.includes(u)) delete env[k];
   }
   return { ...env, ...extra };
+}
+
+/**
+ * M8: one formatter for a failed factory git command: what failed, the exit status (or that git could not run or
+ * timed out), and the last lines of its stderr (at most 500 characters).
+ */
+export function gitFailureText(what: string, r: { status: number | null; stderr: string }): string {
+  const detail = r.stderr.trim().split(/\r?\n/).slice(-3).join(" ").slice(0, 500);
+  return `${what} failed${r.status === null ? " (git could not run or timed out)" : ` (exit ${r.status})`}${detail !== "" ? `: ${detail}` : ""}`;
 }
 
 export interface GitRun {
@@ -298,7 +473,9 @@ export interface GitRun {
  * the inherited git location and pathspec variables are stripped.
  */
 export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS, input?: string, env?: Record<string, string>): GitRun {
-  const r = spawnSync("git", args, {
+  const git = gitExecutable(cwd);
+  if (git === undefined) return { status: null, stdout: "", stderr: GIT_NOT_FOUND };
+  const r = spawnSync(git, args, {
     cwd,
     env: gitEnv(env),
     encoding: "utf8",
@@ -314,8 +491,10 @@ export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS, 
 /** Non-interactive git: no shell, no prompts, bounded. Undefined on any failure (not a repo, git missing, timeout). */
 function gitOut(cwd: string, args: string[]): string | undefined {
   const env = gitEnv();
+  const git = gitExecutable(cwd);
+  if (git === undefined) return undefined;
   try {
-    return execFileSync("git", args, {
+    return execFileSync(git, args, {
       cwd,
       env,
       encoding: "utf8",
