@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { vi } from "vitest";
@@ -575,5 +575,48 @@ describe("fix round 1", () => {
     for (let i = 0; i < 150; i++) expect(text).toContain(`src/t${i}.txt`);
     for (let i = 0; i < 700; i++) expect(text).toContain(`new-${i}.txt`);
     expect(text).not.toContain("more (all listed in");
+  });
+
+  it.skipIf(isWin)("fix round 2: a new untracked hard link to an ignored executable is backed up as an independent 0600 copy; the executable keeps 0755", async () => {
+    const r = await repo();
+    mkdirSync(join(r.root, "dist"));
+    const exe = join(r.root, "dist", "tool.sh");
+    writeFileSync(exe, "#!/bin/sh\necho tool\n");
+    chmodSync(exe, 0o755);
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    linkSync(exe, join(r.root, "linked.sh"));
+    mkdirSync(join(r.root, "gen"));
+    linkSync(exe, join(r.root, "gen", "inner.sh"));
+    const res = reconcileAfter(r.root, snap);
+    expect(res.moved.sort()).toEqual(["gen/inner.sh", "linked.sh"]);
+    expect(statSync(exe).mode & 0o777).toBe(0o755);
+    expect(statSync(exe).nlink).toBe(1);
+    for (const copy of [join(bd, "after", "linked.sh"), join(bd, "after", "gen", "inner.sh")]) {
+      const st = lstatSync(copy);
+      expect(st.isFile()).toBe(true);
+      expect(st.mode & 0o777).toBe(0o600);
+      expect(st.nlink).toBe(1);
+      expect(read(copy)).toBe("#!/bin/sh\necho tool\n");
+    }
+  });
+
+  it.skipIf(isWin)("fix round 2: a hard-linked file inside a moved directory is copied, not chmodded through the link", async () => {
+    const r = await repo();
+    const outside = join(r.dir, "outside.sh");
+    writeFileSync(outside, "outside\n");
+    chmodSync(outside, 0o755);
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    unlinkSync(join(r.root, "README.md"));
+    mkdirSync(join(r.root, "README.md"));
+    linkSync(outside, join(r.root, "README.md", "hard.sh"));
+    const res = reconcileAfter(r.root, snap);
+    expect(res.reverted).toEqual(["README.md"]);
+    expect(statSync(outside).mode & 0o777).toBe(0o755);
+    const copy = join(bd, "after", "README.md", "hard.sh");
+    expect(statSync(copy).mode & 0o777).toBe(0o600);
+    expect(statSync(copy).nlink).toBe(1);
+    expect(read(copy)).toBe("outside\n");
   });
 });

@@ -13,6 +13,7 @@ import {
   chmodSync,
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -576,17 +577,60 @@ function hasAfterContent(backupDir: string): boolean {
 
 /**
  * R39 for entries moved into `after*` (a rename keeps their modes): directories 0700 and files 0600, descendants
- * included. Symlinks are skipped, never followed. Best effort on Windows.
+ * included. Symlinks are skipped, never followed. A file whose inode has other hard links (an ignored or external
+ * file the runner linked) is never chmodded, which would change that other file too: it is replaced in the backup by
+ * an independent 0600 copy (written beside it, renamed over the moved link). Best effort on Windows.
  */
 function privatizeTree(p: string): void {
   const st = lstatSync(p);
   if (st.isSymbolicLink()) return;
+  if (st.isDirectory()) {
+    chmodBestEffort(p, DIR_MODE);
+    for (const name of readdirSync(p)) privatizeTree(path.join(p, name));
+    return;
+  }
+  if (!st.isFile()) {
+    // A fifo or socket: no content to copy; never chmod a shared inode.
+    if (st.nlink <= 1) chmodBestEffort(p, FILE_MODE);
+    return;
+  }
+  const fd = openSync(p, constants.O_RDONLY | NOFOLLOW);
+  let shared: boolean;
   try {
-    chmodSync(p, st.isDirectory() ? DIR_MODE : FILE_MODE);
+    const now = fstatSync(fd);
+    if (!now.isFile()) throw new Error(`${p} changed while its backup mode was set`);
+    shared = now.nlink > 1;
+    if (!shared) {
+      try {
+        fchmodSync(fd, FILE_MODE);
+      } catch (e) {
+        if (!isWin) throw e;
+      }
+    }
+  } finally {
+    closeSync(fd);
+  }
+  if (!shared) return;
+  const tmp = path.join(path.dirname(p), `.${path.basename(p)}.factory-copy-${process.pid}-${randomBytes(4).toString("hex")}`);
+  try {
+    readRegular(p, "sha1", tmp);
+    renameSync(tmp, p);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Not created, or already renamed.
+    }
+    throw e;
+  }
+}
+
+function chmodBestEffort(p: string, mode: number): void {
+  try {
+    chmodSync(p, mode);
   } catch (e) {
     if (!isWin) throw e;
   }
-  if (st.isDirectory()) for (const name of readdirSync(p)) privatizeTree(path.join(p, name));
 }
 
 class Restorer {
