@@ -83,7 +83,7 @@ export interface Grammar {
    * The first (non-leading) operand must match `pattern`, otherwise `unknown` for `reason`. `nonDir`: it is also a read
    * fact and must be a known non-directory at the gate (R47: a bare `git fetch` repository name that is a directory).
    */
-  firstOperand?: { pattern: RegExp; reason: string; nonDir?: boolean };
+  firstOperand?: { pattern: RegExp; reason: string; nonDir?: boolean; absentSuffixes?: readonly string[] };
   /**
    * The bash `echo` builtin: a word that is not entirely made of known option letters is text, and so is every later
    * word (`echo --version` prints `--version`). Nothing is ever an unrecognized option.
@@ -665,9 +665,19 @@ export const GIT_READ_GRAMMARS: Readonly<Record<string, Grammar>> = {
       pattern: /^[A-Za-z0-9_][A-Za-z0-9_-]*$/,
       reason: "the repository is a filesystem path or URL, not a remote name: the facts do not cover another repository (R47)",
       nonDir: true,
+      // R48: git also treats the name as a path (`backup`, `backup.git`, `backup.bundle`) when such an entry exists.
+      absentSuffixes: ["", ".git", ".bundle"],
     },
   },
 };
+/**
+ * R48: options that select refs or objects beyond the named operands. They can reach a blob (a tag or ref pointing at
+ * one), which `git show` prints whatever the format, so the stat-only exception does not apply.
+ */
+export const GIT_REF_SELECTORS: ReadonlySet<string> = new Set([
+  "--tags", "--branches", "--remotes", "--all", "--glob", "--exclude", "--stdin", "--reflog", "--walk-reflogs", "-g", "--bisect",
+  "--alternate-refs", "--indexed-objects", "--single-worktree",
+]);
 /** R41: git subcommands that print tracked file contents (always). `log` does with GIT_LOG_CONTENT; `status` with -v. */
 export const GIT_CONTENT_SUBCOMMANDS: ReadonlySet<string> = new Set(["diff", "show", "blame"]);
 

@@ -199,6 +199,7 @@ function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionF
   };
   for (const a of c.pathArgs) add(a);
   for (const a of c.inputPaths) add(a);
+  for (const seg of c.segments) for (const a of seg.absentPaths ?? []) add(a);
   for (const a of c.readArgs) if (isPathLikeArg(a) || exists(path.resolve(f.cwd, a))) add(a);
   const facts: PathFacts[] = args.flatMap((a) => commandPathFacts(a, f.cwd, f.home));
   const action: ToolAction = { kind: "command", tool, command, pathFacts: facts };

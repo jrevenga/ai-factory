@@ -716,6 +716,20 @@ describe("classifyCommandLine: fix round 5 (R45-R47)", () => {
     expect(classify("git fetch --prune").class).toBe("read-only");
   });
 
+  it("R48: git show --stat with a ref selector option prints content; with HEAD it does not", () => {
+    for (const sel of ["--tags", "--branches", "--remotes", "--all", "--glob=refs/*", "--exclude=x", "--reflog", "--stdin", "--walk-reflogs", "--bisect", "--alternate-refs", "--indexed-objects", "--single-worktree"]) {
+      const r = classify(`git show --stat ${sel}`);
+      expect(r.class === "read-only" ? r.trackedContent : true, sel).toBe(true);
+    }
+    expect(classify("git show --stat --tags")).toMatchObject({ class: "read-only", trackedContent: true });
+    expect(classify("git show --stat HEAD")).toMatchObject({ class: "read-only", trackedContent: false });
+  });
+
+  it("R48: git fetch reports <name>, <name>.git and <name>.bundle as entries that must not exist", () => {
+    expect(classify("git fetch backup").segments[0]!.absentPaths).toEqual(["backup", "backup.git", "backup.bundle"]);
+    expect(classify("git fetch origin").class).toBe("read-only");
+  });
+
   it("echo prints unknown options as text", () => {
     expect(classify("echo --zz-unmodelled b").class).toBe("read-only");
     expect(classify("echo -e --x").readArgs).toEqual([]);

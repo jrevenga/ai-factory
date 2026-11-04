@@ -311,6 +311,17 @@ function demoteDirectoryOperands(c: CommandClassification, facts: PathFacts[]): 
         why: `${seg.argv[0] ?? ""} operand ${p} is a directory (or of unknown kind): its descendants are read or written without facts (R43)`,
       })),
     ];
+    // R48: a fetch name that is also an existing file, repository or bundle path is not a remote.
+    for (const p of seg.absentPaths ?? []) {
+      if (!facts.some((f) => f.input === p && f.exists)) continue;
+      out = {
+        ...out,
+        class: unknownClass(out.class),
+        allowlisted: false,
+        reasons: [...out.reasons, `${seg.argv[0] ?? ""} ${p} exists: git may fetch from it as a path or bundle instead of a remote (R48)`],
+        segments: out.segments.map((s, j) => (j === i ? { ...s, class: unknownClass(s.class), allowlisted: false } : s)),
+      };
+    }
     for (const { p, why } of checks) {
       const own = facts.filter((f) => f.input === p);
       if (own.length === 0 || own.every((f) => f.directory === false)) continue;

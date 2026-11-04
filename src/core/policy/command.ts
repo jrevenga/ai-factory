@@ -54,6 +54,8 @@ export interface SegmentClassification {
    * that rewrites its operands, reads or writes descendants the facts do not cover); otherwise the segment is unknown.
    */
   nonDirPaths?: string[];
+  /** R48: entries that must not exist (a fetch name that is also a repository path or bundle); otherwise the segment is unknown. */
+  absentPaths?: string[];
   /** R41: repository paths selected by git syntax (`rev:path`, `:path`, `-L range:path`, pathspecs). */
   logicalPaths?: string[];
   /** R41: the segment prints tracked file contents (git diff/show/blame, log with patches, status -v). */
@@ -96,6 +98,7 @@ interface Verdict {
   /** R40: the grammar's read facts; undefined falls back to `extractReadArgs` for read-only/local-write segments. */
   readArgs?: string[];
   nonDirPaths?: string[];
+  absentPaths?: string[];
   logicalPaths?: string[];
   trackedContent?: boolean;
 }
@@ -263,6 +266,7 @@ interface GrammarFacts {
   readArgs: string[];
   pathArgs: string[];
   nonDirPaths: string[];
+  absentPaths: string[];
   /** Operands after the leading (pattern/filter) ones, `-` included. */
   operands: string[];
 }
@@ -315,7 +319,9 @@ function grammarFacts(p: Extract<Parsed, { ok: true }>, g: R.Grammar): GrammarFa
   const nonDirPaths: string[] = [];
   if (g.nonDirOperands === true) for (const o of rest) pushUnique(nonDirPaths, o.word);
   if (first !== undefined && g.firstOperand!.nonDir === true) pushUnique(nonDirPaths, first.word);
-  return { readArgs, pathArgs, nonDirPaths, operands: rest.map((o) => o.word) };
+  const absentPaths: string[] = [];
+  if (first !== undefined) for (const x of g.firstOperand!.absentSuffixes ?? []) pushUnique(absentPaths, first.word + x);
+  return { readArgs, pathArgs, nonDirPaths, absentPaths, operands: rest.map((o) => o.word) };
 }
 
 type GrammarResult = { ok: true; parsed: Extract<Parsed, { ok: true }>; facts: GrammarFacts } | { ok: false; reason: string };
@@ -329,8 +335,12 @@ function applyGrammar(name: string, args: readonly string[], g: R.Grammar): Gram
 }
 
 /** Grammar facts as verdict fields (empty lists omitted). */
-function factFields(f: GrammarFacts): Pick<Verdict, "readArgs" | "nonDirPaths"> {
-  return { readArgs: f.readArgs, ...(f.nonDirPaths.length > 0 ? { nonDirPaths: f.nonDirPaths } : {}) };
+function factFields(f: GrammarFacts): Pick<Verdict, "readArgs" | "nonDirPaths" | "absentPaths"> {
+  return {
+    readArgs: f.readArgs,
+    ...(f.nonDirPaths.length > 0 ? { nonDirPaths: f.nonDirPaths } : {}),
+    ...(f.absentPaths.length > 0 ? { absentPaths: f.absentPaths } : {}),
+  };
 }
 
 // --- per-command rules ---
@@ -492,7 +502,9 @@ function classifyGitRead(sub: string, rest: readonly string[], g: R.Grammar): Ve
     (sub === "diff" || sub === "show") &&
     !patch &&
     opts.some((n) => R.GIT_NO_CONTENT_FORMATS.has(n)) &&
-    (sub === "diff" || r.parsed.operands.every((o) => o.afterDoubleDash || R.GIT_SHOW_COMMIT_REVISION.test(o.word)));
+    (sub === "diff" ||
+      (!opts.some((n) => R.GIT_REF_SELECTORS.has(n)) &&
+        r.parsed.operands.every((o) => o.afterDoubleDash || R.GIT_SHOW_COMMIT_REVISION.test(o.word))));
   const content =
     (R.GIT_CONTENT_SUBCOMMANDS.has(sub) && !statOnly) ||
     (sub === "log" && patch) ||
@@ -1055,7 +1067,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
     // R40: a grammar's read facts are exact (any class: a remote curl upload reports its file); segments without a
     // grammar fall back to the R25 over-approximation when read-only or local-write.
     const segReadArgs = v.readArgs ?? (v.class === "read-only" || v.class === "local-write" ? extractReadArgs(seg.argv.slice(1)) : []);
-    const nonEmpty = (k: "stagePaths" | "nonDirPaths" | "logicalPaths") => (v[k] !== undefined && v[k].length > 0 ? { [k]: [...v[k]] } : {});
+    const nonEmpty = (k: "stagePaths" | "nonDirPaths" | "absentPaths" | "logicalPaths") => (v[k] !== undefined && v[k].length > 0 ? { [k]: [...v[k]] } : {});
     segments.push({
       argv: seg.argv,
       class: v.class,
@@ -1065,6 +1077,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
       readArgs: [...segReadArgs],
       ...nonEmpty("stagePaths"),
       ...nonEmpty("nonDirPaths"),
+      ...nonEmpty("absentPaths"),
       ...nonEmpty("logicalPaths"),
       ...(v.trackedContent === true ? { trackedContent: true } : {}),
     });

@@ -2,7 +2,7 @@
 // (`toToolAction`) and the gate, in a harmless fixture world. Nothing here executes a command under review: the
 // commands are only classified; the fixture files hold dummy text.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { toToolAction } from "../../../../src/adapters/pi/extension/enforce.ts";
@@ -126,6 +126,22 @@ describe("classifier to gate through adapter facts (fix round 4)", () => {
       expect(a.hardGate, a.reason).toBe(g.answerHardGate);
     });
   }
+
+  it("R48: git fetch <name> is unknown when <name>, <name>.git or <name>.bundle exists; plain remotes keep their class", () => {
+    const { small, answer } = contexts(w);
+    for (const entry of ["backup", "backup.git", "backup.bundle"]) {
+      writeFileSync(join(w.project, entry), "not a remote\n");
+      for (const ctx of [small, answer]) expect(decide("git fetch backup", w, ctx).decision, entry).not.toBe("allow");
+      rmSync(join(w.project, entry));
+    }
+    for (const ctx of [small, answer]) expect(decide("git fetch origin", w, ctx).decision).toBe("allow");
+  });
+
+  it("R48: git show --stat with a ref selector asks for a tracked secret", () => {
+    const { small } = contexts(w);
+    expect(decide("git show --stat --tags", w, small)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(decide("git show --stat HEAD", w, small).decision).toBe("allow");
+  });
 
   it("bash facts carry whether each path is a directory (R43)", () => {
     const action = toToolAction({ toolName: "bash", toolCallId: "c2", input: { command: "diff a safe.txt" } }, { cwd: w.project, home: w.home, projectCommands: [] });
