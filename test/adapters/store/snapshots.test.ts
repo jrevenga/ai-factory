@@ -116,6 +116,28 @@ describe("listSnapshots", () => {
 });
 
 describe("restoreSnapshot", () => {
+  it("absent: removes restorable files the snapshot recorded as absent, after restoring the present ones", async () => {
+    await rm(paths.managedSettings, { force: true });
+    const original = await readFile(paths.config);
+    const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });
+    expect(info.files).not.toContain("managed-settings.json");
+    await writeFile(paths.config, '{"schema":2,"profile":"migrated"}');
+    await writeFile(paths.managedSettings, '{"schema":2,"keys":{}}');
+    await writeFile(paths.memoryDb, "created by the failed transaction");
+    await restoreSnapshot(paths, info.id, ["config.json"], { absent: ["managed-settings.json", "memory.db"] });
+    expect(await readFile(paths.config)).toEqual(original);
+    expect(existsSync(paths.managedSettings)).toBe(false);
+    expect(existsSync(paths.memoryDb)).toBe(false);
+  });
+
+  it("absent: refuses a file the snapshot holds or one that is not restorable, changing nothing", async () => {
+    const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });
+    await writeFile(paths.config, '{"schema":2,"profile":"migrated"}');
+    await expect(restoreSnapshot(paths, info.id, [], { absent: ["config.json"] })).rejects.toThrow(/holds a copy/);
+    await expect(restoreSnapshot(paths, info.id, [], { absent: ["pi-packages.json"] })).rejects.toThrow(/not a restorable/);
+    expect(await readFile(paths.config, "utf8")).toBe('{"schema":2,"profile":"migrated"}');
+  });
+
   it("restores documents byte-equal", async () => {
     const original = await readFile(paths.config);
     const info = await createSnapshot(paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: T1 });

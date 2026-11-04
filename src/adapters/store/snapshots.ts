@@ -213,14 +213,27 @@ async function stage(id: string, file: string, src: string, target: string, verb
  *
  * `verbatim` is for recovering a journal: the snapshot is exactly what existed before the transaction,
  * so it is restored as it is, even a document no reader accepts (validation belongs in the preflight).
+ *
+ * `absent` lists RESTORABLE files the snapshot recorded as absent (not in its `files`); they are removed
+ * after the present ones are restored, so a recovery also restores what did not exist yet (I3).
  */
-export async function restoreSnapshot(paths: FactoryPaths, id: string, files: string[], opts: { verbatim?: boolean } = {}): Promise<void> {
+export async function restoreSnapshot(
+  paths: FactoryPaths,
+  id: string,
+  files: string[],
+  opts: { verbatim?: boolean; absent?: string[] } = {},
+): Promise<void> {
   const dir = snapshotDir(paths, id);
   const info = await readInfo(dir);
   if (info === undefined || info.id !== id) throw new SnapshotNotFound(id, dir);
   for (const file of files) {
     if (!RESTORABLE.includes(file)) throw new Error(`${file} is not a restorable snapshot file.`);
     if (!info.files.includes(file)) throw new SnapshotFileMissing(id, file, "the snapshot has no copy of it");
+  }
+  const absent = opts.absent ?? [];
+  for (const file of absent) {
+    if (!RESTORABLE.includes(file)) throw new Error(`${file} is not a restorable snapshot file.`);
+    if (info.files.includes(file)) throw new Error(`Snapshot ${id} holds a copy of ${file}; it cannot be restored as absent.`);
   }
   await mkdir(paths.home, { recursive: true });
   const staged: { tmp: string; target: string }[] = [];
@@ -237,4 +250,5 @@ export async function restoreSnapshot(paths: FactoryPaths, id: string, files: st
   } finally {
     for (const s of staged) await rm(s.tmp, { force: true });
   }
+  for (const file of absent) await rm(targetOf(paths, file), { force: true, maxRetries: 5, retryDelay: 50 });
 }
