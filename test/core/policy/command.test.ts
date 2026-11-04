@@ -389,17 +389,30 @@ describe("classifyCommandLine: link-preserving copies and moves before another s
     expect(classify("mv evil out && cat out/x").segments[0]?.class).toBe("unknown");
     expect(classify("mv a b; ls").segments[0]?.class).toBe("unknown");
   });
-  it("is unchanged when the copy is the last segment, or dereferences with -L", () => {
+  it("is unchanged when the copy is the last segment, or is a plain dereferencing copy", () => {
     expect(classify("cp -r evil out").class).toBe("local-write");
     expect(classify("ls && cp -r evil out").class).toBe("local-write");
     expect(classify("mv a b").class).toBe("local-write");
-    expect(classify("cp -rL evil out && cat out/x").segments[0]?.class).toBe("local-write");
-    expect(classify("cp -r --dereference evil out && cat out/x").segments[0]?.class).toBe("local-write");
+    // R32 makes recursive dereferencing copies unknown on their own; a plain dereferencing copy stays.
+    expect(classify("cp -L a.txt out && cat out/x").segments[0]?.class).toBe("local-write");
     expect(classify("cp a b && cat b").segments[0]?.class).toBe("local-write");
   });
   it("reports pathArgs, inputPaths and readArgs per segment", () => {
     const c = classify("cp a.txt out.txt && cat ./out.txt < in.txt > log.txt");
     expect(c.segments[0]!.pathArgs).toContain("out.txt");
     expect(c.segments[1]).toMatchObject({ pathArgs: ["log.txt"], inputPaths: ["in.txt"], readArgs: ["./out.txt"] });
+  });
+});
+
+describe("classifyCommandLine: recursive copies that follow links (R32)", () => {
+  it("a recursive cp with -L/--dereference is unknown even as the only segment", () => {
+    for (const cp of ["cp -rL evil out2", "cp -RL evil out2", "cp -aL evil out2", "cp -r -L evil out2", "cp --recursive --dereference evil out2", "cp -r --deref evil out2"]) {
+      const c = classify(cp);
+      expect(c.class, cp).toBe("unknown");
+      expect(c.reasons.join(" "), cp).toContain("R32");
+    }
+  });
+  it("a non-recursive dereferencing copy keeps its class (its source argument is checked through its facts)", () => {
+    expect(classify("cp -L link out").class).toBe("local-write");
   });
 });

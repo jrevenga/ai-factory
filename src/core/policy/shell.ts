@@ -40,6 +40,19 @@ const RESERVED_WORDS = new Set([
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const INVISIBLE = /[\p{C}\p{Z}]/u;
 
+/**
+ * R33: the first control, format (bidi, zero-width) or non-space separator character of `text` as `U+XXXX`, or
+ * undefined. Space, tab and newline are ordinary. Such characters can hide part of a command in a terminal.
+ */
+export function invisibleCharacter(text: string): string | undefined {
+  for (const ch of text) {
+    if (ch !== " " && ch !== "\t" && ch !== "\n" && INVISIBLE.test(ch)) {
+      return `U+${ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+    }
+  }
+  return undefined;
+}
+
 function prescan(cmd: string): string | undefined {
   if (cmd.length > MAX_LENGTH) return "command line too long";
   if (cmd.trim() === "") return "empty command";

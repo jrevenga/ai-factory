@@ -10,6 +10,7 @@ import type { HardGateId } from "../config/schema.ts";
 import type { RouteState } from "../route/types.ts";
 import type { AutonomyLevel } from "./autonomy.ts";
 import { classifyCommandLine, isPathLikeArg, type CommandClass, type CommandClassification } from "./command.ts";
+import { invisibleCharacter } from "./shell.ts";
 import { classifyPath, isSecretPath, type PathClassification, type PathContext, type PathFacts, type PathPlatform } from "./paths.ts";
 
 export type ToolAction =
@@ -261,6 +262,11 @@ function answerRouteDeny(c: CommandClassification, ctx: GateContext): string | u
 }
 
 function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): GateResult {
+  // R33: a command whose text a terminal may not show faithfully is never offered for approval.
+  const hidden = invisibleCharacter(action.command);
+  if (hidden !== undefined) {
+    return result("deny", `the command contains a control or invisible character (${hidden}) that could hide part of it`, { class: "unknown" });
+  }
   if (action.tool === "powershell") {
     return result("ask", "PowerShell commands are not classified in Phase 2 (ruling 3)", { class: "unknown" });
   }

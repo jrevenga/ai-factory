@@ -699,6 +699,20 @@ function plantsLinks(argv: readonly string[]): string | undefined {
   return keeps && !derefs ? "cp copies symbolic links as links" : undefined;
 }
 
+/**
+ * R32: a recursive copy that follows links copies the targets of links inside the tree (e.g. a committed
+ * `evil/aws -> ~/.aws`) into the destination, where they are ordinary files; facts see only the top argument.
+ * The only allowlisted recursive copier is `cp` (rsync, tar and the like are already unknown).
+ */
+function copiesLinkTargets(argv: readonly string[]): string | undefined {
+  const name = argv[0] === undefined ? undefined : commandName(argv[0]);
+  if (name !== "cp") return undefined;
+  const args = argv.slice(1);
+  const recursive = hasShort(args, R.CP_RECURSIVE_SHORT) || hasLong(args, R.CP_RECURSIVE_LONG);
+  const derefs = hasShort(args, R.CP_DEREFERENCE_SHORT) || hasLong(args, R.CP_DEREFERENCE_LONG);
+  return recursive && derefs ? "a recursive cp that follows links copies the targets of links inside the tree (R32)" : undefined;
+}
+
 export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandClassification {
   const tok = tokenizeCommandLine(cmd);
   if (!tok.ok) {
@@ -724,10 +738,14 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
   tok.segments.forEach((seg, i) => {
     const v = classifySegment(seg, ctx);
     const planted = i < last ? plantsLinks(seg.argv) : undefined;
-    if (planted !== undefined) {
+    const linkReasons = [
+      ...(planted !== undefined ? [`${planted} and a later segment may follow them (R28)`] : []),
+      ...[copiesLinkTargets(seg.argv)].filter((r): r is string => r !== undefined),
+    ];
+    if (linkReasons.length > 0) {
       if (severity(v.class) < severity("unknown")) v.class = "unknown";
       v.allowlisted = false;
-      v.reasons = [...v.reasons, `${planted} and a later segment may follow them (R28)`];
+      v.reasons = [...v.reasons, ...linkReasons];
     }
     const segReadArgs = v.class === "read-only" || v.class === "local-write" ? extractReadArgs(seg.argv.slice(1)) : [];
     segments.push({

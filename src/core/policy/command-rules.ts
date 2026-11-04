@@ -221,6 +221,9 @@ export const MV_SPEC: OptionSpec = {
  */
 export const CP_LINK_PRESERVING_SHORT = "rRadPs";
 export const CP_LINK_PRESERVING_LONG: readonly string[] = ["--recursive", "--archive", "--no-dereference", "--symbolic-link"];
+/** R32: cp options that copy a directory tree (with -L/--dereference they copy every link's target too). */
+export const CP_RECURSIVE_SHORT = "rRa";
+export const CP_RECURSIVE_LONG: readonly string[] = ["--recursive", "--archive"];
 export const CP_DEREFERENCE_SHORT = "L";
 export const CP_DEREFERENCE_LONG: readonly string[] = ["--dereference"];
 /** Options of cp/mv whose value is a path. */
