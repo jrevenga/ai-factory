@@ -137,6 +137,9 @@ export function runPiPrint(opts: PiPrintOptions): Promise<RunResult> {
 
 export type RpcRecord = { type: string } & Record<string, unknown>;
 
+/** Returned by `startPiRpc`'s `onUiRequest` to leave an extension dialog unanswered. */
+export const NO_ANSWER: unique symbol = Symbol("no answer");
+
 export interface PiRpc {
   /** Every stdout record so far, in order. */
   readonly records: RpcRecord[];
@@ -155,9 +158,12 @@ export interface PiRpc {
  * `node <cli> --mode rpc --no-session|--session-dir <dir> [-e each] [...args] --model <model>` in the same isolated environment as
  * print runs (piPrintEnv), driven over stdin/stdout JSON lines (Pi docs/rpc.md). Stdout is split on LF only.
  * Extension dialogs are answered `cancelled` unless `onUiRequest` answers them (it returns the response
- * fields, or undefined to cancel); fire-and-forget UI records are only recorded.
+ * fields, undefined to cancel, or NO_ANSWER to leave the dialog unanswered so Pi's own dialog timeout applies);
+ * fire-and-forget UI records are only recorded.
  */
-export function startPiRpc(opts: Omit<PiPrintOptions, "prompt" | "timeoutMs"> & { onUiRequest?: (r: RpcRecord) => Record<string, unknown> | undefined }): PiRpc {
+export function startPiRpc(
+  opts: Omit<PiPrintOptions, "prompt" | "timeoutMs"> & { onUiRequest?: (r: RpcRecord) => Record<string, unknown> | typeof NO_ANSWER | undefined },
+): PiRpc {
   const env = piPrintEnv(opts.agentDir, opts.env);
   const args = [opts.cli, "--mode", "rpc", ...(opts.sessionDir === undefined ? ["--no-session"] : ["--session-dir", opts.sessionDir])];
   for (const e of opts.extensions) args.push("-e", e);
@@ -188,7 +194,7 @@ export function startPiRpc(opts: Omit<PiPrintOptions, "prompt" | "timeoutMs"> & 
     records.push(r);
     if (r.type === "extension_ui_request" && dialog.has(String(r.method))) {
       const answer = opts.onUiRequest?.(r);
-      write({ type: "extension_ui_response", id: r.id, ...(answer ?? { cancelled: true }) });
+      if (answer !== NO_ANSWER) write({ type: "extension_ui_response", id: r.id, ...(answer ?? { cancelled: true }) });
     }
     for (const w of [...waiters]) {
       if (w.pred(r)) {

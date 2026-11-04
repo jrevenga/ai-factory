@@ -1,5 +1,6 @@
 // Pi extension used by e2e tests: registers the offline faux provider `factory-test/faux`.
-// FAUX_SCRIPT (JSON array of { tool, args, hold? }) becomes one tool-call message per entry, then "done".
+// FAUX_SCRIPT (JSON array of { tool, args, hold? } or { batch: [{ tool, args }, …] }) becomes one tool-call message
+// per entry (a batch entry: one message with several tool calls), then "done".
 // A step with `hold: { signal, release }` writes the `signal` file when its LLM call starts and answers only
 // once the `release` file exists (60 s cap), which keeps the agent run open for steering tests.
 // FAUX_CAPTURE, when set, receives one JSON line per LLM call with the messages the provider was given.
@@ -11,6 +12,8 @@ interface ScriptStep {
   tool: string;
   args: ToolCall["arguments"];
   hold?: { signal: string; release: string };
+  /** One assistant message with several tool calls (Pi may run them in parallel); `tool`/`args` are then ignored. */
+  batch?: Array<{ tool: string; args: ToolCall["arguments"] }>;
 }
 
 const HOLD_LIMIT_MS = 60_000;
@@ -45,7 +48,15 @@ export default function (pi: ExtensionAPI): void {
       return make();
     };
   faux.setResponses([
-    ...script().map((s) => step(() => fauxAssistantMessage(fauxToolCall(s.tool, s.args), { stopReason: "toolUse" }), s.hold)),
+    ...script().map((s) =>
+      step(
+        () =>
+          fauxAssistantMessage(s.batch ? s.batch.map((b) => fauxToolCall(b.tool, b.args)) : fauxToolCall(s.tool, s.args), {
+            stopReason: "toolUse",
+          }),
+        s.hold,
+      ),
+    ),
     step(() => fauxAssistantMessage("done")),
   ]);
   pi.registerProvider(faux.provider);

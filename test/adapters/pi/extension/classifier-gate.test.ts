@@ -37,6 +37,7 @@ interface World {
  *   auth -> ../.aws/credentials, sub/auth -> ../../.aws/credentials   neutral-name links to a home secret
  *   a/.env, b/.env, src/.env, src/a.ts                                 directories with secret descendants
  *   out/safe.txt -> <tmp>/outside/result.txt                           a destination child that leaves the root
+ *   rel/l -> ../.aws/credentials                                       R28: proj/.aws/credentials (absent) in place
  *   safe.txt, input.txt, notes, format.txt, names, -input, mods/leak.jq
  * <tmp>/outside/result.txt      outside the project
  * <tmp>/state/runs              the ledger directory
@@ -61,6 +62,9 @@ async function makeWorld(trackSecret: boolean): Promise<World> {
   symlinkSync(join("..", ".aws", "credentials"), join(project, "auth"));
   symlinkSync(join("..", "..", ".aws", "credentials"), join(project, "sub", "auth"));
   symlinkSync(join(outside, "result.txt"), join(project, "out", "safe.txt"));
+  // R28 relative-symlink fixture (Task 12): harmless in rel/, the home secret once copied to the project root.
+  mkdirSync(join(project, "rel"));
+  symlinkSync(join("..", ".aws", "credentials"), join(project, "rel", "l"));
   git(project, "init", "-q");
   if (trackSecret) writeFileSync(join(project, ".env"), "DUMMY=1\n");
   git(project, "add", "--", "README.md", "notes.txt", ...(trackSecret ? [".env"] : []));

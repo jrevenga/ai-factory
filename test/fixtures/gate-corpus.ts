@@ -246,8 +246,32 @@ export const GATE_CORPUS: GateCorpusEntry[] = [
   { cmd: "ls\r\ngit push", expect: "unknown", why: "carriage return (pre-scan)" },
   ...REVIEW_CASES(),
   ...ROUND_5_CASES(),
+  ...TASK_12_PINS(),
   { cmd: "ls​ && git push", expect: "unknown", why: "invisible format character (pre-scan)" },
 ];
+
+/**
+ * Task 12 carry-forwards: residuals pinned as current behaviour (with the real-Pi counterparts in
+ * test/e2e/gates.e2e.test.ts).
+ */
+function TASK_12_PINS(): GateCorpusEntry[] {
+  return [
+    // R28 residual (Task 7 X1, judged acceptable): `git apply` is unknown, so the line asks (denied unattended, and on
+    // the answer route). The patch could replace the existing `safe.txt` with a symlink before `cat` follows it; the
+    // target exists at hook time, so R28's "does not exist yet" rule does not fire. The owner approves the full
+    // command text (R30).
+    { cmd: "git apply p.diff && cat safe.txt", expect: "unknown", why: "git apply is unmodelled; R28 residual pinned (Task 12)", gate: UNKNOWN_GATE },
+    // R28 relative-symlink fixture: rel/l -> ../.aws/credentials resolves to proj/.aws/credentials (absent, not a
+    // secret) where it is, and to the home secret once copied to the project root.
+    {
+      cmd: "cp -P rel/l copy && cat copy",
+      expect: "unknown",
+      why: "a link-preserving copy followed by a later segment (R28); the later read of the fresh `copy` asks secrets",
+      gate: { decision: "ask", hardGate: "secrets", answer: "deny" },
+    },
+    { cmd: "cp -P rel/l copy", expect: "local-write", why: "copying the link alone stays allowlisted; a later `cat copy` is a secret read (e2e)", gate: { decision: "allow", answer: "deny" } },
+  ];
+}
 
 /**
  * Fix round 5 (task-3-rereview-r4.md N1-N5 and out-of-scope findings, rulings R45-R47): every re-review input, with
