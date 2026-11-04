@@ -15,6 +15,7 @@ import { INITIAL_ROUTE } from "../../../core/route/route.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { editTouchesMachine, MACHINE_CLOSE, MACHINE_OPEN, parseMachine, touchesMachine, type TextEdit } from "../../../core/task/machine.ts";
 import { commandPathFacts, pathFacts } from "./facts.ts";
+import type { Reconciler } from "./reconcile.ts";
 
 /** Ruling 4: an unanswered confirm dialog denies after 120 s. */
 export const CONFIRM_TIMEOUT_MS = 120_000;
@@ -27,7 +28,7 @@ export const MAX_APPROVAL_CHARS = 4000;
 const TASK_FILE_DIRS = [".factory", "knowledge", "tasks"];
 /**
  * Task 10: `run_check` runs a command, so the gate decides it exactly as it decides `bash` for the same command line
- * (same facts, hard gates, ask path and R29 deny), resolved against the directory the check runs in.
+ * (same facts, hard gates, ask path and answer-route reconciliation), resolved against the directory the check runs in.
  */
 export const RUN_CHECK_TOOL = "run_check";
 
@@ -100,7 +101,7 @@ export interface PreparedAction {
   /** Set for write/edit on a task file or on a file that holds machine markers (ruling 8 post-check). */
   machine?: MachineCopy;
   /** `run_check`: the command and the directory it runs in, cleared for execution once the gate allows it. */
-  runCheck?: { command: string; cwd: string };
+  runCheck?: ClearedCheck;
 }
 
 function str(v: unknown): string | undefined {
@@ -483,19 +484,29 @@ export class InFlightCalls {
  * call found here (consumed once), so a `run_check` that did not pass through this hook, or whose input changed
  * after it, never runs.
  */
+export interface ClearedCheck {
+  command: string;
+  cwd: string;
+  /**
+   * Task 11: the check is an answer-route runner the gate reconciles; its fingerprints must not write git objects
+   * into the user's repository (data-safety rule), so they use a temporary object directory.
+   */
+  reconciled?: boolean;
+}
+
 export class GatedChecks {
-  private readonly cleared = new Map<string, { command: string; cwd: string }>();
+  private readonly cleared = new Map<string, ClearedCheck>();
 
   clear(): void {
     this.cleared.clear();
   }
 
-  approve(toolCallId: string, check: { command: string; cwd: string }): void {
+  approve(toolCallId: string, check: ClearedCheck): void {
     this.cleared.set(toolCallId, { ...check });
   }
 
   /** The cleared check for this call, removed; undefined when the gate did not allow it. */
-  take(toolCallId: string): { command: string; cwd: string } | undefined {
+  take(toolCallId: string): ClearedCheck | undefined {
     const c = this.cleared.get(toolCallId);
     this.cleared.delete(toolCallId);
     return c;
@@ -521,6 +532,11 @@ export interface EnforceDeps {
   ui?: GateUi;
   /** Task 10: where allowed `run_check` calls are cleared for execution. Without it no `run_check` can run. */
   gatedChecks?: GatedChecks;
+  /**
+   * Task 11: snapshots of answer-route runner calls (`reconcile: true`), reconciled at their `tool_result`. Without
+   * it such a call is denied (fail closed).
+   */
+  reconciler?: Reconciler;
 }
 
 export type BlockResult = { block: true; reason: string };
@@ -622,6 +638,8 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
   const group = deps.inFlight.groupFor(ev.parentToolCallId);
   let mutating = true;
   let taskFile: string | undefined;
+  /** Task 11: the work tree an allowed answer-route runner is reconciled in. */
+  let reconcileRoot: string | undefined;
   try {
     const policy = deps.policyContext();
     taskFile = runCheckFacts(policy).taskFile;
@@ -646,8 +664,12 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
     if (busy !== undefined) {
       r = { ...r, decision: "deny", reason: `${busy}: re-issue this call after the previous call finishes (R31)`, reconcile: false };
     } else if (r.decision === "allow" && r.reconcile) {
-      // R29: ruling 5 allows answer-route runners only with reconciliation, which Task 11 adds.
-      r = { ...r, decision: "deny", reason: "answer-route runner reconciliation is not available yet: declare a change route with set_route", reconcile: false };
+      // Ruling 5: answer-route runners run only with reconciliation (Task 11, replacing the R29 deny).
+      if (deps.reconciler === undefined) {
+        r = { ...r, decision: "deny", reason: "answer-route runner reconciliation is not available in this session (fail closed): declare a change route with set_route", reconcile: false };
+      } else {
+        reconcileRoot = prepared.runCheck?.cwd ?? policy.projectRoot;
+      }
     }
   } catch (e) {
     r = { decision: "deny", reason: `policy error (fail closed): ${(e as Error).message}`, reconcile: false };
@@ -674,6 +696,18 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
     outcome = deny(`approval failed (fail closed): ${(e as Error).message}`);
   }
 
+  // Task 11 (R38): the snapshot is taken before the decision is audited, so a call without a valid snapshot is
+  // recorded (and blocked) as a deny.
+  let snapshotTaken = false;
+  if (outcome.block === undefined && reconcileRoot !== undefined && deps.reconciler !== undefined) {
+    try {
+      deps.reconciler.begin(ev.toolCallId, ev.parentToolCallId, reconcileRoot);
+      snapshotTaken = true;
+    } catch (e) {
+      outcome = deny(`answer-route runner refused: ${(e as Error).message} (no valid snapshot to reconcile it, fail closed)`);
+    }
+  }
+
   try {
     deps.ledger.append({
       v: 1,
@@ -690,11 +724,11 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
       summary,
     });
   } catch (e) {
+    if (snapshotTaken) deps.reconciler?.discard(ev.toolCallId);
     return block(`${BLOCK_PREFIX}: the audit ledger could not be written (fail closed): ${(e as Error).message}`);
   }
 
   if (outcome.block !== undefined || prepared === undefined) return block(outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}`);
-  // Task 11: when the gate returns `reconcile: true`, take the snapshot here instead of the R29 deny above.
   if (prepared.machine !== undefined) {
     deps.postChecks.remember(ev.toolCallId, prepared.machine);
   } else if (prepared.action.kind === "command" && mutating && taskFile !== undefined) {
@@ -702,6 +736,6 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
     const copy = taskFileCopy(taskFile, ctx.cwd, deps.home);
     if (copy !== undefined) deps.postChecks.remember(ev.toolCallId, copy);
   }
-  if (prepared.runCheck !== undefined) deps.gatedChecks?.approve(ev.toolCallId, prepared.runCheck);
+  if (prepared.runCheck !== undefined) deps.gatedChecks?.approve(ev.toolCallId, { ...prepared.runCheck, ...(snapshotTaken ? { reconciled: true } : {}) });
   return undefined;
 }

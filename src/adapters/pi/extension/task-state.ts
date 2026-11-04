@@ -17,7 +17,7 @@ import { redact, summarizeCommand } from "../../../core/policy/redact.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { parseMachine, renderMachine, replaceMachine } from "../../../core/task/machine.ts";
 import { currentRoute, setRoute, type LedgerSink } from "./enforce.ts";
-import { canonicalDir, gitFailureText, gitRun, hostPlatform, type GitRun } from "./facts.ts";
+import { canonicalDir, gitFailureText, gitRun, gitRunBytes, hostPlatform, type GitRun, type GitRunBytes } from "./facts.ts";
 import { checkedBase, ROUTE_ENTRY, ROUTE_IO, verifyRegisteredTool, type RouteIo } from "./route-state.ts";
 
 export const TASK_PROGRESS_TOOL = "task_progress";
@@ -102,6 +102,8 @@ function gitError(what: string, r: { status: number | null; stderr: string }): R
 }
 
 export type Git = (cwd: string, args: string[], input?: string, env?: Record<string, string>) => GitRun;
+/** Task 11: the same safe git with stdout as bytes, bounded by `maxBuffer` (blob contents, large listings). */
+export type GitBytes = (cwd: string, args: string[], maxBuffer: number, env?: Record<string, string>, input?: string) => GitRunBytes;
 
 /**
  * Git with repository hooks disabled (an empty hooks directory), no fsmonitor command and no commit signing: a
@@ -109,11 +111,14 @@ export type Git = (cwd: string, args: string[], input?: string, env?: Record<str
  * nor wait for a signing prompt. Filter drivers selected by `.gitattributes` (e.g. git-lfs) still run (README).
  * Inherited git location and pathspec variables are stripped (`gitRun`); `env` adds factory-owned ones.
  */
-export function withSafeGit<T>(fn: (git: Git) => T): T {
+export function withSafeGit<T>(fn: (git: Git, gitBytes: GitBytes) => T): T {
   const hooks = mkdtempSync(join(tmpdir(), "factory-no-hooks-"));
   try {
     const safe = ["-c", `core.hooksPath=${hooks}`, "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false"];
-    return fn((cwd, args, input, env) => gitRun(cwd, [...safe, ...args], GIT_WRITE_TIMEOUT_MS, input, env));
+    return fn(
+      (cwd, args, input, env) => gitRun(cwd, [...safe, ...args], GIT_WRITE_TIMEOUT_MS, input, env),
+      (cwd, args, maxBuffer, env, input) => gitRunBytes(cwd, [...safe, ...args], GIT_WRITE_TIMEOUT_MS, maxBuffer, env, input),
+    );
   } finally {
     rmSync(hooks, { recursive: true, force: true });
   }

@@ -2,7 +2,8 @@
 // (ruling 11) and `loadEvidence` for Phase 4's delivery.
 //
 // `run_check` is gated in the `tool_call` hook exactly like `bash` for the same command line (enforce.ts
-// `runCheckAction`): hard gates, the ask path, R29 and R31 apply unchanged, and the call is cleared for execution
+// `runCheckAction`): hard gates, the ask path, R31 and answer-route reconciliation (Task 11) apply unchanged, and the
+// call is cleared for execution
 // there (`GatedChecks`). The tool runs only a cleared call, and only commands whose every segment is read-only,
 // allowlisted or project-declared (`planCheck`), from the same lexer segments the gate classified, each segment's
 // argv spawned directly (no shell), `&&` segments in order until the first failure. Output is redacted line by
@@ -57,16 +58,33 @@ function gitFailure(what: string, r: { status: number | null; stderr: string }):
   return new Error(`fingerprint: ${gitFailureText(`git ${what}`, r)}`);
 }
 
-/** Absolute path of the work tree's own index (`--git-path index`: a linked worktree has its own). */
-function indexPath(git: Git, top: string): string {
-  let r = git(top, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+/**
+ * Absolute `--git-path <name>` of the work tree: `index` is the work tree's own (a linked worktree has its own),
+ * `objects` the shared object directory.
+ */
+function gitPathOf(git: Git, top: string, name: "index" | "objects"): string {
+  let r = git(top, ["rev-parse", "--path-format=absolute", "--git-path", name]);
   let out = r.stdout.trim();
   if (r.status !== 0 || out.includes("\n") || out.startsWith("-")) {
-    r = git(top, ["rev-parse", "--git-path", "index"]);
+    r = git(top, ["rev-parse", "--git-path", name]);
     out = r.stdout.trim();
-    if (r.status !== 0 || out === "") throw gitFailure("rev-parse --git-path index", r);
+    if (r.status !== 0 || out === "") throw gitFailure(`rev-parse --git-path ${name}`, r);
   }
   return path.resolve(top, out);
+}
+
+/** One `GIT_ALTERNATE_OBJECT_DIRECTORIES` entry, C-quoted so a path holding the list separator stays one entry. */
+function quotedAlternate(dir: string): string {
+  return `"${dir.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+export interface FingerprintOptions {
+  /**
+   * Task 11 (data-safety rule on the answer route): new objects (`git add` blobs, `write-tree` trees) go to a
+   * temporary object directory that reads the repository's objects as an alternate, so the user's repository gets
+   * no new objects. The tree id is the same.
+   */
+  isolateObjects?: boolean;
 }
 
 /** The secret-path test of the gate (R34) for paths relative to `top`. */
@@ -86,7 +104,7 @@ export function secretTestFor(top: string, ctx: { home: string; piAgentDir: stri
  * their hash without writing the blob; the tree is then written with `--missing-ok`. A change to a non-ignored
  * secret file still changes the fingerprint, but its content never reaches the object database.
  */
-export function fingerprint(dir: string, isSecret?: SecretTest): string {
+export function fingerprint(dir: string, isSecret?: SecretTest, opts: FingerprintOptions = {}): string {
   return withSafeGit((git) => {
     const topRun = git(dir, ["rev-parse", "--show-toplevel"]);
     const topOut = topRun.stdout.trim();
@@ -94,12 +112,18 @@ export function fingerprint(dir: string, isSecret?: SecretTest): string {
     if (topRun.status !== 0 || topOut === "") throw new Error(`fingerprint: ${dir} is not inside a git work tree`);
     const top = path.resolve(dir, topOut);
     const secret = isSecret ?? secretTestFor(top, { home: canonicalDir(homedir()), piAgentDir: canonicalDir(resolvePiAgentDir(process.env, homedir())) });
-    const index = indexPath(git, top);
+    const index = gitPathOf(git, top, "index");
     const tmp = mkdtempSync(join(tmpdir(), "factory-fingerprint-"));
     try {
       const tmpIndex = join(tmp, "index");
       if (existsSync(index)) copyFileSync(index, tmpIndex);
-      const env = { GIT_INDEX_FILE: tmpIndex };
+      const env: Record<string, string> = { GIT_INDEX_FILE: tmpIndex };
+      if (opts.isolateObjects === true) {
+        const objects = join(tmp, "objects");
+        mkdirSync(objects);
+        env.GIT_OBJECT_DIRECTORY = objects;
+        env.GIT_ALTERNATE_OBJECT_DIRECTORIES = quotedAlternate(gitPathOf(git, top, "objects"));
+      }
       const run = (what: string, args: string[], input?: string) => {
         const r = git(top, args, input, env);
         if (r.status !== 0) throw gitFailure(what, r);
@@ -555,7 +579,8 @@ async function runCheck(s: EvidenceSession, toolCallId: string, params: { comman
     return { file: exe.file, args: step.argv.slice(1), env: { ...env, ...step.env }, display: step.argv.join(" ") };
   });
   const secret = secretTestFor(cwd, s);
-  const before = fingerprint(cwd, secret);
+  const fpOpts: FingerprintOptions = cleared.reconciled === true ? { isolateObjects: true } : {};
+  const before = fingerprint(cwd, secret, fpOpts);
   const id = newCheckId();
   const log = openCheckLog(s.runDir, id);
   const out = new CheckOutput(log.fd);
@@ -572,7 +597,7 @@ async function runCheck(s: EvidenceSession, toolCallId: string, params: { comman
   const durationMs = Date.now() - started;
   let after: string;
   try {
-    after = fingerprint(cwd, secret);
+    after = fingerprint(cwd, secret, fpOpts);
   } catch (e) {
     out.close();
     throw e;

@@ -58,6 +58,13 @@ export const RunEvent = z.discriminatedUnion("type", [
     reverted: z.array(z.string()),
     moved: z.array(z.string()),
     backupDir: z.string(),
+    /** Task 11: paths that could not be restored, each with its reason (current state and copies kept). */
+    notRestored: z.array(z.string()).optional(),
+    /** Task 11 (R39): gitlinks, nested repositories and entries below a symlink, never reconciled. */
+    skipped: z.array(z.string()).optional(),
+    indexRestored: z.boolean().optional(),
+    /** Nothing changed, so the redundant backup directory was removed. */
+    backupRemoved: z.boolean().optional(),
   }),
   ev("review", { disposition: ReviewDisposition }),
   ev("error", { where: z.string(), message: z.string() }),

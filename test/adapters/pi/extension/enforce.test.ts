@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +13,7 @@ import {
   type GateUi,
 } from "../../../../src/adapters/pi/extension/enforce.ts";
 import { canonicalDir } from "../../../../src/adapters/pi/extension/facts.ts";
+import { Reconciler } from "../../../../src/adapters/pi/extension/reconcile.ts";
 import { RunEvent } from "../../../../src/core/ledger/events.ts";
 import type { GateContext } from "../../../../src/core/policy/gate.ts";
 import type { RouteState } from "../../../../src/core/route/types.ts";
@@ -87,6 +89,17 @@ async function world() {
   });
   const taskFile = join(root, ".factory", "knowledge", "tasks", "t1.md");
   return { dir: t.dir, root, real, answer, feature, context, ledger, postChecks, inFlight, factoryTools, deps, taskFile };
+}
+
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+/** A committed repository with one tracked file `a.txt` ("a\n"). */
+function gitInit(root: string): void {
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-c", "init.defaultBranch=main", "-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", ...args], { cwd: root, env: GIT_ENV, stdio: "ignore" });
+  git("init", "-q");
+  writeFileSync(join(root, "a.txt"), "a\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "init");
 }
 
 let seq = 0;
@@ -399,13 +412,61 @@ describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
     expect(a.pathFacts.find((f) => f.input === "./missing")?.exists).toBe(false);
   });
 
-  it("R29: an answer-route runner the gate would reconcile is denied until reconciliation exists", async () => {
+  it("Task 11: an answer-route runner is allowed after a snapshot and reconciled at its own tool_result (replaces the R29 deny)", async () => {
     const w = await world();
-    const r = await enforce(call("bash", { command: "npm test" }), { cwd: w.root }, w.deps(w.answer));
+    gitInit(w.real);
+    const reconciler = new Reconciler(join(w.dir, "run"));
+    const ev = call("bash", { command: "npm test" });
+    const r = await enforce(ev, { cwd: w.root }, { ...w.deps(w.answer), reconciler });
+    expect(r).toBeUndefined();
+    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "allow", reason: expect.stringContaining("reconciled afterwards") })]);
+    expect(reconciler.size).toBe(1);
+    // The runner rewrites a tracked file; the result of another call does not reconcile it.
+    writeFileSync(join(w.real, "a.txt"), "changed by the runner\n");
+    expect(reconciler.finish({ toolCallId: "other", content: [], isError: false }, w.ledger, RUN_ID)).toBeUndefined();
+    const out = reconciler.finish({ toolCallId: ev.toolCallId, content: [{ type: "text", text: "ok" }], isError: true }, w.ledger, RUN_ID);
+    expect(readFileSync(join(w.real, "a.txt"), "utf8")).toBe("a\n");
+    expect(JSON.stringify(out?.content)).toContain("Reverted on the answer route");
+    expect(w.ledger.events.filter((e) => e.type === "reconciled")).toEqual([expect.objectContaining({ toolCallId: ev.toolCallId, reverted: ["a.txt"] })]);
+  });
+
+  it("Task 11: without a valid snapshot the runner is denied (fail closed): not a git work tree, or no reconciler in the session", async () => {
+    const w = await world();
+    const reconciler = new Reconciler(join(w.dir, "run"));
+    const r1 = await enforce(call("bash", { command: "npm test" }), { cwd: w.root }, { ...w.deps(w.answer), reconciler });
+    expect(r1?.block).toBe(true);
+    expect(r1?.reason).toContain("not a git work tree");
+    expect(r1?.reason).toContain("fail closed");
+    expect(reconciler.size).toBe(0);
+    gitInit(w.real);
+    const r2 = await enforce(call("bash", { command: "npm test" }), { cwd: w.root }, w.deps(w.answer));
+    expect(r2?.block).toBe(true);
+    expect(r2?.reason).toContain("reconciliation is not available in this session");
+    expect(gates(w.ledger).map((g) => g.decision)).toEqual(["deny", "deny"]);
+    expect(w.inFlight.size).toBe(0);
+  });
+
+  it("Task 11: R38 over the untracked cap the runner is denied with the reason", async () => {
+    const w = await world();
+    gitInit(w.real);
+    writeFileSync(join(w.real, "big.bin"), Buffer.alloc(51 * 1024 * 1024));
+    const reconciler = new Reconciler(join(w.dir, "run"));
+    const r = await enforce(call("bash", { command: "npm test" }), { cwd: w.root }, { ...w.deps(w.answer), reconciler });
     expect(r?.block).toBe(true);
-    expect(r?.reason).toContain("answer-route runner reconciliation is not available yet");
-    expect(gates(w.ledger)).toEqual([expect.objectContaining({ decision: "deny" })]);
-    expect(gates(w.ledger)[0]!.reason).toContain("answer-route runner reconciliation is not available yet");
+    expect(r?.reason).toContain("too many untracked files to reconcile safely");
+    expect(reconciler.size).toBe(0);
+  });
+
+  it("Task 11: a snapshot whose gate event cannot be written is discarded with the call", async () => {
+    const w = await world();
+    gitInit(w.real);
+    const reconciler = new Reconciler(join(w.dir, "run"));
+    const deps = { ...w.deps(w.answer), reconciler, ledger: { append: () => { throw new Error("disk full"); } } };
+    const r = await enforce(call("bash", { command: "npm test" }), { cwd: w.root }, deps);
+    expect(r?.block).toBe(true);
+    expect(reconciler.size).toBe(0);
+    expect(existsSync(join(w.dir, "run", "reconcile"))).toBe(true);
+    expect(readdirSync(join(w.dir, "run", "reconcile"))).toEqual([]);
   });
 
   it("R30: the dialog shows the full command unredacted with its newlines; the ledger keeps the redacted summary", async () => {

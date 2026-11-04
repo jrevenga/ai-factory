@@ -6,7 +6,8 @@
 // Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger), restores the route
 // of the session branch (route-state.ts), registers `task_progress` (task-state.ts) and the evidence tools `run_check`,
 // `record_review` and `record_decision` (evidence.ts), and enforces the GatePolicy on every tool call (enforce.ts);
-// `run_end` is written at session_shutdown.
+// allowlisted runners on the answer route are snapshotted before they run and reconciled at their `tool_result`
+// (reconcile.ts, Task 11); `run_end` is written at session_shutdown.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -34,6 +35,7 @@ import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, GatedChecks, InFlightCalls, 
 import { registerEvidence, type EvidenceSession } from "./evidence.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
+import { Reconciler } from "./reconcile.ts";
 import { registerRouteState, type RouteSession } from "./route-state.ts";
 import { storeWritable } from "./store-probe.ts";
 import { registerTaskState, type TaskSession } from "./task-state.ts";
@@ -132,6 +134,8 @@ interface Session {
   postChecks: MachinePostChecks;
   inFlight: InFlightCalls;
   gatedChecks: GatedChecks;
+  /** Task 11: answer-route runner snapshots (`<runDir>/reconcile/<toolCallId>`). */
+  reconciler: Reconciler;
 }
 
 function within(child: string, parent: string): boolean {
@@ -246,6 +250,7 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     postChecks: new MachinePostChecks(),
     inFlight: new InFlightCalls(),
     gatedChecks: new GatedChecks(),
+    reconciler: new Reconciler(dirname(ledger.file)),
   };
 }
 
@@ -366,6 +371,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
       inFlight: session.inFlight,
       factoryTools,
       gatedChecks: session.gatedChecks,
+      reconciler: session.reconciler,
       ...(ui ? { ui } : {}),
     });
   });
@@ -374,20 +380,28 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     const session = await sessionNow();
     if (session === undefined) return undefined;
     try {
-      return session.postChecks.afterToolResult(event, session.ledger, session.runId);
+      const post = session.postChecks.afterToolResult(event, session.ledger, session.runId);
+      // Task 11: the call's own result reconciles its snapshot (and its nested calls'), after the post-check.
+      const reconciled = session.reconciler.finish(post === undefined ? event : { ...event, content: post.content ?? event.content }, session.ledger, session.runId);
+      return reconciled ?? post;
     } finally {
       session.inFlight.done(event.toolCallId);
     }
   });
 
-  // Fires for every call, also for one a later extension's hook blocked (which gets no tool_result).
+  // Fires for every call, also for one a later extension's hook blocked (which gets no tool_result); Pi emits it after
+  // `tool_result`, so a call reconciled there is already gone.
   pi.on("tool_execution_end", async (event) => {
-    (await sessionNow())?.inFlight.done(event.toolCallId);
+    const session = await sessionNow();
+    if (session === undefined) return;
+    session.reconciler.finishId(event.toolCallId, session.ledger, session.runId);
+    session.inFlight.done(event.toolCallId);
   });
 
   // Backstop (review M4): nothing is in flight once the agent has settled.
   pi.on("agent_settled", async () => {
     const session = await sessionNow();
+    session?.reconciler.finishAll(session.ledger, session.runId);
     session?.inFlight.clear();
     session?.postChecks.clear();
     session?.gatedChecks.clear();
@@ -396,6 +410,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (event) => {
     const session = await sessionNow();
     if (session === undefined) return;
+    session.reconciler.finishAll(session.ledger, session.runId);
     session.inFlight.clear();
     session.postChecks.clear();
     session.gatedChecks.clear();

@@ -488,6 +488,34 @@ export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS, 
   return { status: r.error !== undefined ? null : r.status, stdout: r.stdout ?? "", stderr };
 }
 
+export interface GitRunBytes {
+  /** Exit status; null when git could not be started, was killed (timeout) or its output exceeded `maxBuffer`. */
+  status: number | null;
+  stdout: Buffer;
+  stderr: string;
+}
+
+/**
+ * `gitRun` with stdout as raw bytes and a caller-chosen output bound (Task 11: blob contents, which may be binary, and
+ * NUL-separated listings of large repositories). Same resolution, environment and stdin rules as `gitRun`.
+ */
+export function gitRunBytes(cwd: string, args: string[], timeoutMs: number, maxBuffer: number, env?: Record<string, string>, input?: string): GitRunBytes {
+  const git = gitExecutable(cwd);
+  if (git === undefined) return { status: null, stdout: Buffer.alloc(0), stderr: GIT_NOT_FOUND };
+  const r = spawnSync(git, args, {
+    cwd,
+    env: gitEnv(env),
+    stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    ...(input === undefined ? {} : { input }),
+    timeout: timeoutMs,
+    maxBuffer,
+    windowsHide: true,
+  });
+  const errText = r.stderr === null || r.stderr === undefined ? "" : r.stderr.toString("utf8");
+  const stderr = r.error !== undefined ? `${errText}${r.error.message}` : errText;
+  return { status: r.error !== undefined ? null : r.status, stdout: r.stdout ?? Buffer.alloc(0), stderr };
+}
+
 /** Non-interactive git: no shell, no prompts, bounded. Undefined on any failure (not a repo, git missing, timeout). */
 function gitOut(cwd: string, args: string[]): string | undefined {
   const env = gitEnv();

@@ -476,6 +476,24 @@
         },
         "backupDir": {
           "type": "string"
+        },
+        "notRestored": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skipped": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "indexRestored": {
+          "type": "boolean"
+        },
+        "backupRemoved": {
+          "type": "boolean"
         }
       },
       "required": [

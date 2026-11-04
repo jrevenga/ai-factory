@@ -17,6 +17,7 @@ import {
 } from "../../../../src/adapters/pi/extension/evidence.ts";
 import { gitRun, resolveProgram, safePathEntries } from "../../../../src/adapters/pi/extension/facts.ts";
 import { RunLedger } from "../../../../src/adapters/pi/extension/ledger.ts";
+import { Reconciler } from "../../../../src/adapters/pi/extension/reconcile.ts";
 import type { SoftGateId } from "../../../../src/core/config/schema.ts";
 import { SIMPLE_COMMANDS_ONLY } from "../../../../src/core/evidence/check-plan.ts";
 import { validateDelivery, type CheckRecord, type ReviewDisposition } from "../../../../src/core/evidence/records.ts";
@@ -75,6 +76,7 @@ const SCRIPTS: Record<string, string> = {
     "setInterval(() => {}, 1000);",
   ].join("\n"),
   "sleeper.mjs": "setInterval(() => {}, 1000);\n",
+  "mutate-hang.mjs": 'import { writeFileSync } from "node:fs";\nwriteFileSync("README.md", "changed before hanging\\n");\nconsole.log("hanging");\nsetInterval(() => {}, 1000);\n',
   "rewrite-task.mjs": [
     'import { readFileSync, writeFileSync } from "node:fs";',
     'const f = ".factory/knowledge/tasks/t1.md";',
@@ -102,6 +104,8 @@ async function world(
     softened?: SoftGateId[];
     effectiveTools?: () => Array<{ name: string; parameters: unknown }>;
     teardown?: EvidenceSession["teardown"];
+    /** Task 11: wire a Reconciler like the extension does (answer-route runners). */
+    reconcile?: boolean;
   } = {},
 ) {
   const t = await makeTmp("evidence");
@@ -156,6 +160,7 @@ async function world(
   const tool = (name: string) => tools.find((x) => x.name === name)!;
   const postChecks = new MachinePostChecks();
   const inFlight = new InFlightCalls();
+  const reconciler = opts.reconcile === true ? new Reconciler(runDir) : undefined;
 
   const small: RouteState = { route: "small", tier: "small", taskId: "fix-1", reason: "fix", writeRoots: [project], needsReclassification: false };
   const feature: RouteState = { route: "feature", tier: "feature", taskId: "t1", reason: "feature", worktree: wt, writeRoots: [wt], needsReclassification: false };
@@ -188,13 +193,16 @@ async function world(
       inFlight,
       factoryTools,
       gatedChecks,
+      ...(reconciler ? { reconciler } : {}),
       ...(o.ui ? { ui: o.ui } : {}),
     });
     if (blocked !== undefined) return { blocked: blocked.reason, id };
     const res = await tool(RUN_CHECK_TOOL).execute(id, o.input ?? input, undefined, undefined, {});
     const post = postChecks.afterToolResult({ toolCallId: id, content: res.content as never, isError: res.isError === true }, ledger, RUN_ID);
+    const rec = reconciler?.finish({ toolCallId: id, content: (post?.content ?? res.content) as never, isError: res.isError === true }, ledger, RUN_ID);
     inFlight.done(id);
-    return { res, post, id, text: res.content.map((c) => c.text ?? "").join("\n"), record: res.details as CheckRecord | undefined };
+    const content = (rec?.content ?? post?.content ?? res.content) as Array<{ type: string; text?: string }>;
+    return { res, post, id, text: content.map((c) => c.text ?? "").join("\n"), record: res.details as CheckRecord | undefined };
   }
 
   const events = () => RunLedger.read(ledger.file);
@@ -280,6 +288,18 @@ describe("fingerprint (ruling 11)", () => {
     writeFileSync(join(x.project, "plain.ts"), "export const plain = 1;\n");
     fingerprint(x.project);
     expect(blobExists(x.project, "plain.ts")).toBe(true);
+  });
+
+  it("Task 11: isolateObjects gives the same tree id without writing any object into the repository", async () => {
+    const x = await world();
+    writeFileSync(join(x.project, "isolated.ts"), "export const isolated = 1;\n");
+    writeFileSync(join(x.project, "README.md"), "edited for the isolated fingerprint\n");
+    const objects = () => (readdirSync(join(x.project, ".git", "objects"), { recursive: true }) as string[]).sort();
+    const before = objects();
+    const isolated = fingerprint(x.project, undefined, { isolateObjects: true });
+    expect(objects()).toEqual(before);
+    expect(blobExists(x.project, "isolated.ts")).toBe(false);
+    expect(fingerprint(x.project)).toBe(isolated);
   });
 
   it("fails outside a git work tree", async () => {
@@ -449,14 +469,35 @@ describe("run_check", () => {
     expect(x.events().some((e) => e.type === "check")).toBe(false);
   });
 
-  it("decision 2: on the answer route a runner is denied with the R29 message; a read-only command runs in the project root", async () => {
-    const x = await world();
+  it("decision 2 (Task 11): on the answer route a runner runs reconciled in the project root, without new git objects or refs; a read-only command runs unreconciled", async () => {
+    const x = await world({ reconcile: true });
     setRoute(x.answer);
-    const runner = await x.check("node scripts/ok.mjs");
-    expect(runner.blocked).toContain("answer-route runner reconciliation is not available yet");
+    const objects = () => (readdirSync(join(x.project, ".git", "objects"), { recursive: true }) as string[]).sort();
+    const refs = () => git(x.project, "for-each-ref", "--format=%(refname) %(objectname)");
+    const before = { objects: objects(), refs: refs() };
+    const runner = await x.check("node scripts/mutate.mjs");
+    expect(runner.blocked).toBeUndefined();
+    expect(runner.record).toMatchObject({ exitCode: 0, cwd: x.project, mutated: true });
+    expect(runner.text).toContain("Reverted on the answer route");
+    expect(runner.text).toContain("README.md");
+    expect(readFileSync(join(x.project, "README.md"), "utf8")).toBe("readme\n");
+    expect({ objects: objects(), refs: refs() }).toEqual(before);
+    const reconciled = x.events().filter((e) => e.type === "reconciled");
+    expect(reconciled).toEqual([expect.objectContaining({ toolCallId: runner.id, reverted: ["README.md"] })]);
     const ro = await x.check("git status --short");
     expect(ro.record).toMatchObject({ exitCode: 0, cwd: x.project, mutated: false });
+    expect(x.events().filter((e) => e.type === "reconciled")).toHaveLength(1);
   });
+
+  it("Task 11: a runner that times out on the answer route is still reconciled", async () => {
+    const x = await world({ reconcile: true });
+    setRoute(x.answer);
+    const r = await x.check("node scripts/mutate-hang.mjs", { timeoutSec: 2 });
+    expect(r.record).toMatchObject({ timedOut: true, mutated: true });
+    expect(r.text).toContain("Reverted on the answer route");
+    expect(readFileSync(join(x.project, "README.md"), "utf8")).toBe("readme\n");
+    expect(x.events().filter((e) => e.type === "reconciled")).toEqual([expect.objectContaining({ reverted: ["README.md"] })]);
+  }, 30_000);
 
   it("decision 1: a call the gate did not clear, or whose command changed after the gate, never runs", async () => {
     const x = await world();
