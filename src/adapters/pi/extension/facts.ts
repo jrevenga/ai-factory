@@ -10,7 +10,7 @@
 //   `..` is resolved physically, after the symlinks before it.
 // Either way the result is the realpath of the nearest existing ancestor plus the missing tail, following
 // dangling symlinks to their target (a write through one creates the target).
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { accessSync, constants, lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
@@ -261,10 +261,30 @@ export function canonicalDir(p: string): string {
   return realTarget(path.resolve(p));
 }
 
-/** Non-interactive git: no shell, no prompts, bounded. Undefined on any failure (not a repo, git missing, timeout). */
-function gitOut(cwd: string, args: string[]): string | undefined {
+/** The process env for git: no prompts, and no inherited location variables. */
+function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
   for (const k of Object.keys(env)) if (GIT_LOCATION_VARS.includes(k.toUpperCase())) delete env[k];
+  return env;
+}
+
+export interface GitRun {
+  /** Exit status; null when git could not be started or was killed (timeout). */
+  status: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Non-interactive git with its output and status (factory tools that change git state): no shell, bounded. */
+export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS): GitRun {
+  const r = spawnSync("git", args, { cwd, env: gitEnv(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, windowsHide: true });
+  const stderr = r.error !== undefined ? `${r.stderr ?? ""}${r.error.message}` : (r.stderr ?? "");
+  return { status: r.error !== undefined ? null : r.status, stdout: r.stdout ?? "", stderr };
+}
+
+/** Non-interactive git: no shell, no prompts, bounded. Undefined on any failure (not a repo, git missing, timeout). */
+function gitOut(cwd: string, args: string[]): string | undefined {
+  const env = gitEnv();
   try {
     return execFileSync("git", args, {
       cwd,
@@ -355,4 +375,16 @@ export function headCommit(dir: string): string | undefined {
 
 export function sha256hex(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+const COMMIT_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+/**
+ * Carry-forward N1: `base` names a commit of the repository at `dir` that is an ancestor of HEAD (`rev-parse
+ * --verify <base>^{commit}`, `merge-base --is-ancestor`). Only a full hex object id is passed to git.
+ */
+export function baseIsAncestor(dir: string, base: string): boolean {
+  if (!COMMIT_ID.test(base) || !isDir(dir)) return false;
+  if (gitOut(dir, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]) === undefined) return false;
+  return gitRun(dir, ["merge-base", "--is-ancestor", base, "HEAD"]).status === 0;
 }

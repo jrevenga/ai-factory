@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { currentRoute, setRoute } from "../../../../src/adapters/pi/extension/enforce.ts";
@@ -79,6 +79,7 @@ const fakeIo = (over: Partial<RouteIo> = {}): RouteIo => ({
   canonicalDir: (p) => p,
   worktreeFacts: () => ({ exists: false, sameRepo: false }),
   head: () => HEAD,
+  baseOk: () => true,
   ...over,
 });
 
@@ -205,6 +206,22 @@ describe("restoreRoute (session entries)", () => {
     expect(spoofed.notice).toContain(`declared for / , not ${w.project}`.replace(" ,", ","));
   });
 
+  it("N1: a stored base that is not a commit ancestor of HEAD is recomputed from HEAD with a notice", async () => {
+    const w = await world({ git: true });
+    const head = git(w.project, "rev-parse", "HEAD");
+    const kept = restoreRoute([custom(ROUTE_ENTRY, small(w.project, { base: head }))], w.facts, { interrupted: false });
+    expect(kept).toEqual({ state: small(w.project, { base: head }), restored: true });
+    const stale = restoreRoute([custom(ROUTE_ENTRY, small(w.project, { base: "f".repeat(40) }))], w.facts, { interrupted: false });
+    expect(stale.restored).toBe(true);
+    expect(stale.state).toEqual(small(w.project, { base: head }));
+    expect(stale.notice).toContain("f".repeat(40));
+    expect(stale.notice).toContain(head);
+    // An option-looking base is never passed to git as an option.
+    const forged = restoreRoute([custom(ROUTE_ENTRY, small(w.project, { base: "--output=x" }))], w.facts, { interrupted: false });
+    expect(forged.state.base).toBe(head);
+    expect(existsSync(join(w.project, "x"))).toBe(false);
+  });
+
   it("C1: a route declared for one project is not restored in another (fork or open across projects)", async () => {
     const w = await world({ git: true });
     const other = repo(join(w.home, "other"));
@@ -220,8 +237,12 @@ describe("restoreRoute (session entries)", () => {
     const w = await world();
     const link = join(w.dir, "project-link");
     symlinkSync(w.project, link, isWin ? "junction" : "dir");
-    const r = restoreRoute([custom(ROUTE_ENTRY, small(link))], w.facts, { interrupted: false });
-    expect(r.state).toEqual(small(w.project));
+    // Not a repository: no base (a stored one could not be verified and would be cleared, N1).
+    const { base: _stored, ...stored } = small(link);
+    const { base: _expected, ...expected } = small(w.project);
+    const r = restoreRoute([custom(ROUTE_ENTRY, stored)], w.facts, { interrupted: false });
+    expect(r.state).toEqual(expected);
+    expect(r.notice).toBeUndefined();
   });
 
   it("an invalid stored worktree restores the answer route with a notice", async () => {

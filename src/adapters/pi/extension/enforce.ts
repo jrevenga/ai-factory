@@ -223,15 +223,15 @@ export interface LedgerSink {
 
 type ResultLike = Pick<ToolResultEvent, "toolCallId" | "content" | "isError"> & { structuredContent?: ToolResultEvent["structuredContent"] };
 
-/** Atomic replace in the file's directory, keeping its mode. */
-function atomicWrite(file: string, text: string): void {
+/** Atomic replace (temp file in the same directory, then rename), keeping the file's mode. */
+export function atomicWrite(file: string, text: string, tag = "restore"): void {
   let mode: number | undefined;
   try {
     mode = statSync(file).mode & 0o7777;
   } catch {
     mode = undefined;
   }
-  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.factory-restore-${process.pid}-${Date.now()}`);
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.factory-${tag}-${process.pid}-${Date.now()}`);
   writeFileSync(tmp, text, mode === undefined ? {} : { mode });
   renameSync(tmp, file);
 }
@@ -250,11 +250,35 @@ function repaired(before: string, after: string | undefined): { text: string; wh
   return { text: before, whole: true };
 }
 
+const fileKey = (file: string) => (process.platform === "win32" ? file.toLowerCase() : file);
+
+/**
+ * The text whose machine block the post-check expects (carry-forward Task 9): the pre-call copy, unless extension
+ * code (`task_progress`) wrote the file after the copy was taken; then the block the extension wrote, spliced into
+ * the pre-call text when both blocks are valid (else the extension's text).
+ */
+function expectedText(before: string | undefined, written: string | undefined): string | undefined {
+  if (written === undefined) return before;
+  if (before === undefined) return written;
+  const b = parseMachine(before);
+  const w = parseMachine(written);
+  if (b && !("invalid" in b) && w && !("invalid" in w)) return before.slice(0, b.start) + written.slice(w.start, w.end) + before.slice(b.end);
+  return written;
+}
+
 export class MachinePostChecks {
-  private readonly pending = new Map<string, MachineCopy>();
+  private readonly pending = new Map<string, MachineCopy & { seq: number }>();
+  /** realpath (case-folded on win32) → the last text extension code wrote there, with its sequence number. */
+  private readonly written = new Map<string, { text: string; seq: number }>();
+  private seq = 0;
 
   remember(toolCallId: string, copy: MachineCopy): void {
-    this.pending.set(toolCallId, copy);
+    this.pending.set(toolCallId, { ...copy, seq: ++this.seq });
+  }
+
+  /** Extension code wrote `text` to `file` (realpath): its machine block is the expected state from now on. */
+  recordWrite(file: string, text: string): void {
+    this.written.set(fileKey(file), { text, seq: ++this.seq });
   }
 
   get size(): number {
@@ -264,6 +288,7 @@ export class MachinePostChecks {
   /** Review M4: entries whose `tool_result` never fires (another extension blocked the call) are dropped here. */
   clear(): void {
     this.pending.clear();
+    this.written.clear();
   }
 
   /**
@@ -276,21 +301,23 @@ export class MachinePostChecks {
     this.pending.delete(ev.toolCallId);
     const now = readTarget(copy.file);
     const after = now.kind === "text" ? now.text : undefined;
-    const before = copy.before ?? "";
+    const ext = this.written.get(fileKey(copy.file));
+    const expected = expectedText(copy.before, ext !== undefined && ext.seq > copy.seq ? ext.text : undefined);
+    const before = expected ?? "";
     if (now.kind === "error") {
       return this.note(ev, ledger, runId, `could not re-read ${copy.input} to verify its machine-owned section; check it before continuing`);
     }
     if (!touchesMachine(before, after ?? "")) return undefined;
     let message: string;
     try {
-      if (copy.before === undefined) {
+      if (expected === undefined) {
         // The file did not exist before the call: a machine block in it is not the model's to write.
         const p = after === undefined ? undefined : parseMachine(after);
         const text = after !== undefined && p && !("invalid" in p) ? after.slice(0, p.start) + after.slice(p.end) : "";
         atomicWrite(copy.file, text);
         message = `the machine-owned section that this call added to ${copy.input} was removed (only extension code writes it)`;
       } else {
-        const r = repaired(copy.before, after);
+        const r = repaired(expected, after);
         atomicWrite(copy.file, r.text);
         message = r.whole
           ? `this call changed the machine-owned section of ${copy.input}; the file was restored to its content before the call (only extension code writes that section)`
@@ -477,12 +504,17 @@ async function resolveAsk(r: GateResult, tool: string, display: string, ui: Gate
   return { decision: "deny (rejected)", reason, block: `${BLOCK_PREFIX}: ${reason}` };
 }
 
-/** R31: write, edit, powershell, unknown tools and every bash command that is not read-only. */
+/** Factory tools that change files or git state (Task 9: the task file, checkpoint commits and undo refs). */
+const MUTATING_FACTORY_TOOLS: ReadonlySet<string> = new Set(["task_progress"]);
+
+/** R31: write, edit, powershell, unknown tools, mutating factory tools and every bash command that is not read-only. */
 function mayMutate(action: ToolAction, r: GateResult): boolean {
   switch (action.kind) {
     case "write":
     case "unknown":
       return true;
+    case "factory":
+      return MUTATING_FACTORY_TOOLS.has(action.tool);
     case "command":
       return action.tool === "powershell" || r.class !== "read-only";
     default:

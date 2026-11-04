@@ -19,7 +19,7 @@ import {
 } from "../../../core/route/route.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { currentRoute, setRoute, type LedgerSink } from "./enforce.ts";
-import { canonicalDir, headCommit, worktreeFacts, type WorktreeFacts } from "./facts.ts";
+import { baseIsAncestor, canonicalDir, headCommit, worktreeFacts, type WorktreeFacts } from "./facts.ts";
 import { asRouteState } from "./ledger.ts";
 
 /** Custom session entry type holding the route state (`pi.appendEntry`). */
@@ -59,9 +59,25 @@ export interface RouteIo {
   worktreeFacts(p: string, projectRoot: string): WorktreeFacts;
   /** `git rev-parse HEAD` of a write root (ruling 10, R26). */
   head(root: string): string | undefined;
+  /** Carry-forward N1: `base` is a commit of the write root's repository and an ancestor of its HEAD. */
+  baseOk(root: string, base: string): boolean;
 }
 
-export const ROUTE_IO: RouteIo = { canonicalDir, worktreeFacts, head: headCommit };
+export const ROUTE_IO: RouteIo = { canonicalDir, worktreeFacts, head: headCommit, baseOk: baseIsAncestor };
+
+/**
+ * Carry-forward N1: a stored or held `base` that no longer names an ancestor commit of the write root's HEAD
+ * (history rewritten, another repository, a forged entry) is replaced by the current HEAD, with a notice.
+ */
+export function checkedBase(state: RouteState, io: Pick<RouteIo, "head" | "baseOk">): { state: RouteState; notice?: string } {
+  const root = state.writeRoots[0];
+  if (state.base === undefined || root === undefined || io.baseOk(root, state.base)) return { state };
+  const head = io.head(root);
+  const { base: stale, ...rest } = state;
+  const next: RouteState = head === undefined ? rest : { ...rest, base: head };
+  const notice = `factory: the recorded base ${stale} of the ${state.route} route is not an ancestor of HEAD in ${root}; base ${head === undefined ? "cleared" : `reset to ${head}`}`;
+  return { state: next, notice };
+}
 
 /** What the hooks need from the open factory run. */
 export interface RouteSession {
@@ -132,7 +148,7 @@ export interface RestoredRoute {
   state: RouteState;
   /** A stored route was restored (false: none stored, or it no longer validates). */
   restored: boolean;
-  /** Why a stored route was not restored; shown to the user. */
+  /** Why a stored route was not restored, or what was corrected in a restored one (N1 base); shown to the user. */
   notice?: string;
 }
 
@@ -189,8 +205,10 @@ export function restoreRoute(entries: readonly unknown[], facts: RouteFacts, opt
     }
     state = { ...v.state, ...(stored.base !== undefined ? { base: stored.base } : {}), needsReclassification: stored.needsReclassification };
   }
+  const checked = checkedBase(state, io);
+  state = checked.state;
   if (opts.interrupted) state = routeReducer(state, { type: "restored_after_interruption", state });
-  return { state, restored: true };
+  return { state, restored: true, ...(checked.notice !== undefined ? { notice: checked.notice } : {}) };
 }
 
 /** The one-line announcement (M §3.2) that `set_route` returns. */
@@ -350,12 +368,11 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       } catch (e) {
         process.stderr.write(`factory: could not record the route restore: ${(e as Error).message}\n`);
       }
-      return;
     }
     if (!r.restored) return;
     try {
       routeEvent(s, r.state, "restored from session");
-      if (opts.interrupted) pi.appendEntry(ROUTE_ENTRY, r.state);
+      if (opts.interrupted && r.notice === undefined) pi.appendEntry(ROUTE_ENTRY, r.state);
     } catch (e) {
       process.stderr.write(`factory: could not record the restored route: ${(e as Error).message}\n`);
     }
@@ -367,19 +384,26 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
     if (s !== undefined) restore(s, ctx, { interrupted: false });
   });
 
-  const verifyTools = (): void => {
-    if (!deps.factoryTools.has(SET_ROUTE_TOOL)) return;
-    let ours = false;
-    try {
-      ours = pi.getAllTools().find((t) => t.name === SET_ROUTE_TOOL)?.parameters === parameters;
-    } catch {
-      ours = false;
-    }
-    if (!ours) {
-      deps.factoryTools.delete(SET_ROUTE_TOOL);
-      process.stderr.write(`factory: the active ${SET_ROUTE_TOOL} tool is not the factory's (another extension registered the name first); it is gated as unknown\n`);
-    }
-  };
+  const verifyTools = (): void => verifyRegisteredTool(pi, SET_ROUTE_TOOL, parameters, deps.factoryTools);
 
   return { restore, verifyTools };
+}
+
+/**
+ * Review M2: Pi runs the first registration of a tool name. When the effective tool `name` is not the one this
+ * extension registered with `parameters` (schema identity), or cannot be checked, the name leaves `factoryTools`
+ * for good, so the gate treats it as unknown.
+ */
+export function verifyRegisteredTool(pi: Pick<ExtensionAPI, "getAllTools">, name: string, parameters: unknown, factoryTools: Set<string>): void {
+  if (!factoryTools.has(name)) return;
+  let ours = false;
+  try {
+    ours = pi.getAllTools().find((t) => t.name === name)?.parameters === parameters;
+  } catch {
+    ours = false;
+  }
+  if (!ours) {
+    factoryTools.delete(name);
+    process.stderr.write(`factory: the active ${name} tool is not the factory's (another extension registered the name first); it is gated as unknown\n`);
+  }
 }

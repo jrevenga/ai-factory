@@ -448,6 +448,22 @@ describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
     expect(gates(w.ledger).map((g) => g.decision)).toEqual(["allow", "deny", "allow", "allow"]);
   });
 
+  it("R31 (Task 9): task_progress changes files and git state, so it is a mutating factory call; set_route is not", async () => {
+    const w = await world();
+    w.factoryTools.add("task_progress");
+    w.factoryTools.add("set_route");
+    const read = call("read", { path: "a.txt" });
+    expect(await enforce(read, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    expect(await enforce(call("set_route", { route: "small" }), { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    const busy = await enforce(call("task_progress", { checkpoint: true }), { cwd: w.root }, w.deps(w.feature));
+    expect(busy?.block).toBe(true);
+    expect(busy?.reason).toContain("re-issue");
+    w.inFlight.clear();
+    const progress = call("task_progress", { checkpoint: true });
+    expect(await enforce(progress, { cwd: w.root }, w.deps(w.feature))).toBeUndefined();
+    expect((await enforce(call("read", { path: "a.txt" }), { cwd: w.root }, w.deps(w.feature)))?.block).toBe(true);
+  });
+
   it("R31: non-mutating calls run together; denied calls are not tracked", async () => {
     const w = await world();
     expect(await enforce(call("bash", { command: "ls" }), { cwd: w.root }, w.deps(w.feature))).toBeUndefined();

@@ -4,7 +4,7 @@
 // guard (ruling 8). While the handshake has failed, its own tool_call handler blocks every tool except
 // the read-only ones, which covers "loaded but handshake failed" even without the guard file.
 // Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger), restores the route
-// of the session branch (route-state.ts) and enforces the GatePolicy on every tool call (enforce.ts); `run_end`
+// of the session branch (route-state.ts), registers `task_progress` (task-state.ts) and enforces the GatePolicy on every tool call (enforce.ts); `run_end`
 // is written at session_shutdown.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -33,6 +33,7 @@ import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
 import { registerRouteState, type RouteSession } from "./route-state.ts";
 import { storeWritable } from "./store-probe.ts";
+import { registerTaskState, type TaskSession } from "./task-state.ts";
 
 const PACKAGE_JSON = fileURLToPath(new URL("../../../../package.json", import.meta.url));
 const CORE_DEFAULTS = fileURLToPath(new URL("../../../../defaults/config.json", import.meta.url));
@@ -218,6 +219,10 @@ function routeSession(s: Session): RouteSession {
   };
 }
 
+function taskSession(s: Session): TaskSession {
+  return { ledger: s.ledger, runId: s.runId, projectRoot: s.projectRoot, postChecks: s.postChecks };
+}
+
 interface Started {
   handshake: HandshakeResult;
   session?: Session;
@@ -239,6 +244,17 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     },
     factoryTools,
   });
+  const tasks = registerTaskState(pi, {
+    session: async () => {
+      const s = await sessionNow();
+      return s === undefined ? undefined : taskSession(s);
+    },
+    factoryTools,
+  });
+  const verifyTools = (): void => {
+    routes.verifyTools();
+    tasks.verifyTools();
+  };
 
   const start = (ctx: ExtensionContext): Promise<Started> => {
     current = runHandshake().then(({ result, personal }) => {
@@ -251,7 +267,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
       setRoute(INITIAL_ROUTE);
       try {
         const session = openSession(ctx, personal, result.version);
-        routes.verifyTools();
+        verifyTools();
         // Task 13 passes `interrupted: true` when reconciliation finds this session's previous run interrupted.
         routes.restore(routeSession(session), ctx, { interrupted: false });
         return { handshake: result, session };
@@ -277,7 +293,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     const session = s.session;
     if (session === undefined) return { block: true, reason: `factory policy unavailable (fail closed): ${s.sessionError ?? "unknown error"}` };
     // Review M2: a tool registered later under a factory name must not ride on the factory classification.
-    if (factoryTools.has(event.toolName)) routes.verifyTools();
+    if (factoryTools.has(event.toolName)) verifyTools();
     const ui: GateUi | undefined = ctx.hasUI ? { confirm: (title, message) => ctx.ui.confirm(title, message, { timeout: CONFIRM_TIMEOUT_MS }) } : undefined;
     return enforce(event, { cwd: ctx.cwd }, {
       policyContext: () => policyContext(session, ctx),
