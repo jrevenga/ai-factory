@@ -2,7 +2,7 @@
 // (`toToolAction`) and the gate, in a harmless fixture world. Nothing here executes a command under review: the
 // commands are only classified; the fixture files hold dummy text.
 import { execFileSync } from "node:child_process";
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { toToolAction } from "../../../../src/adapters/pi/extension/enforce.ts";
@@ -44,10 +44,13 @@ interface World {
  */
 async function makeWorld(trackSecret: boolean): Promise<World> {
   const tmp = await makeTmp("classifier-gate");
-  const home = join(tmp.dir, "home");
+  // The long real path: a Windows runner's TEMP can be an 8.3 short name (`C:/Users/RUNNER~1/...`), and a `~` inside a
+  // word makes a command unclassifiable (fail closed), which is not what these entries test.
+  const base = realpathSync.native(tmp.dir);
+  const home = join(base, "home");
   const project = join(home, "proj");
-  const outside = join(tmp.dir, "outside");
-  const ledger = join(tmp.dir, "state", "runs");
+  const outside = join(base, "outside");
+  const ledger = join(base, "state", "runs");
   for (const d of [join(home, ".aws"), join(home, ".ssh"), project, outside, ledger]) mkdirSync(d, { recursive: true });
   writeFileSync(join(home, ".aws", "credentials"), DUMMY);
   writeFileSync(join(home, ".ssh", "id_rsa"), DUMMY);
