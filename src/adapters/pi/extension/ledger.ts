@@ -8,13 +8,18 @@ import {
   fstatSync,
   fsyncSync,
   ftruncateSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
+  unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { parseRunEvent, RunEvent } from "../../../core/ledger/events.ts";
 import { redact } from "../../../core/policy/redact.ts";
@@ -330,4 +335,99 @@ export function sessionInterruptedRuns(
     found.push(summarize(runId, events));
   }
   return found;
+}
+
+/**
+ * Fix round 1 (Task 13): whether `runId` (a run of the project other than this one) is interrupted for a replay: no
+ * `run_end`, and marked `run_interrupted` (by whoever detected it) or its pid is not alive. `error` when its ledger is
+ * missing or unreadable (the run is then left alone; `reconcile` reports an unreadable ledger).
+ */
+export function runInterrupted(dir: string, runId: string, isAlive: (pid: number) => boolean): boolean | "error" {
+  let events: RunEvent[];
+  try {
+    events = RunLedger.read(new RunLedger(dir, runId).file);
+  } catch {
+    return "error";
+  }
+  if (events.some((e) => e.type === "run_end")) return false;
+  if (events.some((e) => e.type === "run_interrupted")) return true;
+  const pid = pidOf(runId, events);
+  return pid === undefined || !isAlive(pid);
+}
+
+/** `<runDir>/replay-<n>.claim`: generation `n` of the claim to replay an interrupted run's reconciles. */
+const REPLAY_CLAIM = /^replay-(\d+)\.claim$/;
+/** A claim file without a readable holder is treated as held for this long (its writer may still be writing it). */
+const UNREADABLE_CLAIM_GRACE_MS = 10_000;
+
+/** The holder of a replay claim is alive (its runId's pid); an unreadable holder counts as alive while it is recent. */
+function claimHolderAlive(file: string, isAlive: (pid: number) => boolean): boolean {
+  let text: string;
+  try {
+    text = readFileSync(file, "utf8").trim();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw e;
+  }
+  const m = RUN_ID.test(text) ? /-(\d+)$/.exec(text) : null;
+  if (m) return isAlive(Number(m[1]));
+  try {
+    return Date.now() - lstatSync(file).mtimeMs < UNREADABLE_CLAIM_GRACE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Creates `file` holding `selfRunId` atomically (a complete temp file hard-linked into place; the link fails when the
+ * name exists). A filesystem without hard links falls back to the O_EXCL claim, whose holder is written right after.
+ * False when the name already exists.
+ */
+function claimWhole(file: string, selfRunId: string): boolean {
+  const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  writeFileSync(tmp, `${selfRunId}\n`, { flag: "wx", mode: 0o600 });
+  try {
+    linkSync(tmp, file);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "EEXIST") return false;
+    if (code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS") return claim(file, selfRunId);
+    throw e;
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
+/**
+ * Fix round 1 (Task 13): the claim to replay the reconciles of the interrupted run in `runDir`, so two Pi sessions never
+ * replay the same manifests at once, and a claimant that died (before or during its replay) does not leave them
+ * abandoned. Claims are generations `replay-<n>.claim`, each holding the claimant's runId: while any listed holder is
+ * alive the claim is refused; otherwise generation max+1 is created exclusively, so of two contenders that both saw
+ * only dead holders exactly one wins. A generation's file is created only after the previous one exists and a live
+ * holder's file is never removed, so a live holder is always seen. Dead generations below the newest are pruned.
+ * The claim is kept for the claimant's lifetime: a later startup retries what is unfinished once it is gone.
+ */
+export function claimReplay(runDir: string, selfRunId: string, isAlive: (pid: number) => boolean): boolean {
+  const gens: number[] = [];
+  for (const name of readdirSync(runDir)) {
+    const m = REPLAY_CLAIM.exec(name);
+    if (m) gens.push(Number(m[1]));
+  }
+  gens.sort((a, b) => a - b);
+  for (const g of gens) if (claimHolderAlive(join(runDir, `replay-${g}.claim`), isAlive)) return false;
+  const max = gens.at(-1) ?? 0;
+  if (!claimWhole(join(runDir, `replay-${max + 1}.claim`), selfRunId)) return false;
+  for (const g of gens.slice(0, -1)) {
+    try {
+      unlinkSync(join(runDir, `replay-${g}.claim`));
+    } catch {
+      // Pruned by another claimant, or left: harmless.
+    }
+  }
+  return true;
 }

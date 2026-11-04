@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { ledgerDirFor, RunLedger, type InterruptedRun } from "../../../../src/adapters/pi/extension/ledger.ts";
-import { takeSnapshot } from "../../../../src/adapters/pi/extension/reconcile.ts";
-import { lastRouteEntryRunId, recoverRuns, replayClaimed, resumeLine, resumeSection } from "../../../../src/adapters/pi/extension/resume.ts";
+import { claimReplay, ledgerDirFor, RunLedger, type InterruptedRun } from "../../../../src/adapters/pi/extension/ledger.ts";
+import { loadSnapshot, takeSnapshot } from "../../../../src/adapters/pi/extension/reconcile.ts";
+import { lastRouteEntryRunId, recoverRuns, replayInterruptedRuns, resumeLine, resumeSection } from "../../../../src/adapters/pi/extension/resume.ts";
 import { ROUTE_ENTRY } from "../../../../src/adapters/pi/extension/route-state.ts";
 import { RunEvent } from "../../../../src/core/ledger/events.ts";
 import { makeTmp } from "../../../helpers/tmp.ts";
@@ -78,7 +78,7 @@ describe("recoverRuns", () => {
     expect(RunLedger.read(new RunLedger(ledgerDirFor(h, PROJECT), R1).file).at(-1)).toMatchObject({ type: "run_interrupted", detectedBy: SELF });
   });
 
-  it("M5: when another session already claimed the run, this session still restores flagged and resumes from it, but does not replay it", async () => {
+  it("M5: when another session already claimed the run, this session still restores flagged and resumes from it", async () => {
     const h = await home();
     interruptedRun(h, R1, "session-a", [{ v: 1, ts: TS, runId: R1, type: "progress", taskId: "t1", phase: "verify" }]);
     const other = recoverRuns({ factoryHome: h, projectId: PROJECT, runId: "20261104T110000Z-50", piSession: "session-b", entries: [], isAlive: dead });
@@ -100,30 +100,99 @@ describe("recoverRuns", () => {
   });
 });
 
-describe("replayClaimed", () => {
-  it("finishes a pending answer-route reconcile of a claimed run, audited in the new run, and removes a snapshot dir without manifest", async () => {
+/** A committed repo next to the factory home, and a run R1 interrupted with a pending answer-route snapshot. */
+function gitRepo(h: string): string {
+  const root = join(h, "..", "project");
+  mkdirSync(root, { recursive: true });
+  const git = (...args: string[]) => execFileSync("git", ["-c", "init.defaultBranch=main", "-c", "user.name=T", "-c", "user.email=t@example.invalid", ...args], { cwd: root, encoding: "utf8" });
+  git("init", "-q");
+  writeFileSync(join(root, "a.txt"), "original\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "init");
+  return root;
+}
+
+function pendingRun(h: string, root: string): string {
+  interruptedRun(h, R1, "session-a", []);
+  const runDir = join(ledgerDirFor(h, PROJECT), R1);
+  takeSnapshot(root, join(runDir, "reconcile", "call_1"), undefined, { toolCallId: "call-1", seq: 1 });
+  // The runner ran and Pi was killed before its tool_result.
+  writeFileSync(join(root, "a.txt"), "runner\n");
+  return runDir;
+}
+
+const sinkOf = () => {
+  const events: RunEvent[] = [];
+  return { events, ledger: { append: (e: RunEvent) => void events.push(RunEvent.parse(e)) } };
+};
+
+describe("replayInterruptedRuns", () => {
+  it("finishes a pending answer-route reconcile of an interrupted run, audited in the new run, and removes a snapshot dir without manifest", async () => {
     const h = await home();
-    const root = join(h, "..", "project");
-    mkdirSync(root, { recursive: true });
-    const git = (...args: string[]) => execFileSync("git", ["-c", "init.defaultBranch=main", "-c", "user.name=T", "-c", "user.email=t@example.invalid", ...args], { cwd: root, encoding: "utf8" });
-    git("init", "-q");
-    writeFileSync(join(root, "a.txt"), "original\n");
-    git("add", "-A");
-    git("commit", "-q", "-m", "init");
-    interruptedRun(h, R1, "session-a", []);
-    const runDir = join(ledgerDirFor(h, PROJECT), R1);
-    takeSnapshot(root, join(runDir, "reconcile", "call_1"));
-    // The runner ran and Pi was killed before its tool_result.
-    writeFileSync(join(root, "a.txt"), "runner\n");
+    const root = gitRepo(h);
+    const runDir = pendingRun(h, root);
     mkdirSync(join(runDir, "reconcile", "call_2", "before"), { recursive: true });
 
-    const r = recoverRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, piSession: "session-b", entries: [], isAlive: dead });
-    const events: RunEvent[] = [];
-    const notes = replayClaimed(r, h, PROJECT, { append: (e) => void events.push(RunEvent.parse(e)) }, SELF);
+    recoverRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, piSession: "session-b", entries: [], isAlive: dead });
+    const s = sinkOf();
+    const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
     expect(notes).toEqual([expect.stringMatching(new RegExp(`^Interrupted factory run ${R1}: Reverted on the answer route .*reverted a\\.txt`))]);
-    expect(events).toEqual([expect.objectContaining({ type: "reconciled", runId: SELF, toolCallId: "call_1", reverted: ["a.txt"] })]);
+    expect(s.events).toEqual([expect.objectContaining({ type: "reconciled", runId: SELF, toolCallId: "call-1", reverted: ["a.txt"] })]);
     expect(existsSync(join(runDir, "reconcile", "call_2"))).toBe(false);
     expect(existsSync(join(runDir, "reconcile", "call_1", "after", "a.txt"))).toBe(true);
+  });
+
+  it("fix round 1 (I3): a run marked interrupted by a recovering session that died before replaying is replayed at the next startup", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    pendingRun(h, root);
+    // The recovering session claims and marks R1, then dies before its replay.
+    const claimer = "20261104T110000Z-50";
+    expect(recoverRuns({ factoryHome: h, projectId: PROJECT, runId: claimer, entries: [], isAlive: dead }).claimed.map((c) => c.runId)).toEqual([R1]);
+    // The next startup no longer claims R1 (already marked), but still replays its pending manifest.
+    expect(recoverRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, entries: [], isAlive: dead }).claimed).toEqual([]);
+    const s = sinkOf();
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+    expect(s.events).toEqual([expect.objectContaining({ type: "reconciled", toolCallId: "call-1" })]);
+  });
+
+  it("fix round 1 (I3): a replay that failed stays retryable until its manifest is done, and a done run is not replayed again", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    const runDir = pendingRun(h, root);
+    renameSync(root, `${root}.gone`);
+    const first = sinkOf();
+    const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: "20261104T110000Z-50", isAlive: dead }, first.ledger);
+    expect(notes.join("\n")).toContain("failed");
+    expect(loadSnapshot(join(runDir, "reconcile", "call_1")).status).not.toBe("done");
+    renameSync(`${root}.gone`, root);
+    // The failed claimant (pid 50) is gone: the next startup retries.
+    const second = sinkOf();
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, second.ledger);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+    expect(loadSnapshot(join(runDir, "reconcile", "call_1")).status).toBe("done");
+    const third = sinkOf();
+    expect(replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: "20261104T130000Z-77", isAlive: dead }, third.ledger)).toEqual([]);
+    expect(third.events).toEqual([]);
+  });
+
+  it("fix round 1 (I3): while the replay claimant is alive no other session replays the run; once it is gone, one does", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    const runDir = pendingRun(h, root);
+    const holder = "20261104T110000Z-50";
+    const alive = (pid: number) => pid === 50;
+    expect(claimReplay(runDir, holder, alive)).toBe(true);
+    // A second contender while the holder lives: refused, and nothing is replayed.
+    expect(claimReplay(runDir, SELF, alive)).toBe(false);
+    const s = sinkOf();
+    expect(replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: alive }, s.ledger)).toEqual([]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("runner\n");
+    // The holder died: the next startup takes over (a new claim generation) and replays; stale claims are pruned.
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+    expect(readdirSync(runDir).filter((n) => n.startsWith("replay-")).length).toBeLessThanOrEqual(2);
   });
 });

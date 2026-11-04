@@ -2,13 +2,19 @@
 // ledger is reconciled: runs that ended without `run_end` while their process is gone are marked `run_interrupted`
 // (claimed once per project, ledger.ts) and this Pi session's own interrupted earlier run is found independently of
 // that claim (review M5), so a continued session restores its route flagged (ruling 20). The new run records the runs
-// it resumed (`run_start.resumedFrom`); answer-route reconciliations the claimed runs left pending are finished
+// it resumed (`run_start.resumedFrom`); answer-route reconciliations interrupted runs left unfinished are finished
 // (reconcile.ts `replayInterrupted`); and the next agent run gets one prompt section naming each interrupted task's
 // phase and last checkpoint.
+//
+// Fix round 1: replay completion is tracked by the manifests themselves (a manifest stays retryable until it is `done`),
+// not by the interruption marker. Every startup looks at every interrupted run with unfinished reconciles and replays
+// it under a replay claim (`ledger.claimReplay`) that a live session holds exclusively and that a later startup takes
+// over once its holder is gone.
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RunEvent } from "../../../core/ledger/events.ts";
-import { ledgerDirFor, reconcile, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
-import { replayInterrupted, type Diagnose } from "./reconcile.ts";
+import { claimReplay, ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
+import { hasUnfinishedReconciles, replayInterrupted, type Diagnose } from "./reconcile.ts";
 import { ROUTE_ENTRY } from "./route-state.ts";
 
 /** Key of the resume section in `systemPromptOptions.sections`. */
@@ -51,7 +57,7 @@ export interface Recovery {
   resumedFrom: string[];
   /** This Pi session's previous run was interrupted: the restored route starts flagged (ruling 20). */
   sessionInterrupted: boolean;
-  /** Runs claimed here (marked `run_interrupted` by this run): their pending reconciliations are replayed by this run. */
+  /** Runs claimed here (marked `run_interrupted` by this run). */
   claimed: InterruptedRun[];
   /** One line per interrupted run with a task. */
   lines: string[];
@@ -83,16 +89,53 @@ interface Sink {
   append(e: RunEvent): void;
 }
 
+export interface ReplayInput {
+  factoryHome: string;
+  projectId: string;
+  /** The new run (it audits the replays). */
+  runId: string;
+  isAlive(pid: number): boolean;
+}
+
 /**
- * After `run_start`: finishes the answer-route reconciliations the claimed runs left behind, audited in this run's
- * ledger. Returns one note per replayed or kept directory, prefixed with the interrupted run's id.
+ * After `run_start`: finishes the answer-route reconciliations that interrupted runs of the project left unfinished,
+ * audited in this run's ledger. A run qualifies when its `reconcile/` holds unfinished work (reconcile.ts
+ * `hasUnfinishedReconciles`) and it is interrupted (`ledger.runInterrupted`), whoever detected it; it is replayed only
+ * under its replay claim, so a run a live session is replaying is skipped. Newest run first (reverse snapshot order
+ * across runs, as within one). A failure is reported (note, `diagnose`, ledger `error`) and left for a retry. Returns
+ * one note per replayed, kept or failed item, prefixed with the interrupted run's id.
  */
-export function replayClaimed(recovery: Recovery, factoryHome: string, projectId: string, ledger: Sink, runId: string, diagnose?: Diagnose): string[] {
-  const dir = ledgerDirFor(factoryHome, projectId);
+export function replayInterruptedRuns(input: ReplayInput, ledger: Sink, diagnose?: Diagnose): string[] {
+  const dir = ledgerDirFor(input.factoryHome, input.projectId);
+  let runIds: string[];
+  try {
+    runIds = readdirSync(dir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name !== input.runId)
+      .map((d) => d.name)
+      .sort()
+      .reverse();
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw e;
+  }
   const notes: string[] = [];
-  for (const run of recovery.claimed) {
-    for (const outcome of replayInterrupted(join(dir, run.runId), ledger, runId, diagnose)) {
-      for (const n of outcome.notes) notes.push(`Interrupted factory run ${run.runId}: ${n}`);
+  for (const runId of runIds) {
+    const runDir = join(dir, runId);
+    try {
+      if (!hasUnfinishedReconciles(runDir) || runInterrupted(dir, runId, input.isAlive) !== true) continue;
+      if (!claimReplay(runDir, input.runId, input.isAlive)) continue;
+      for (const outcome of replayInterrupted(runDir, ledger, input.runId, diagnose)) {
+        for (const n of outcome.notes) notes.push(`Interrupted factory run ${runId}: ${n}`);
+      }
+    } catch (e) {
+      const message = `the answer-route reconciles of ${runId} could not be replayed (${(e as Error).message}); they are kept for a retry at a later startup: check the working tree before continuing`;
+      diagnose?.(`factory: ${message}`);
+      try {
+        ledger.append({ v: 1, ts: new Date().toISOString(), runId: input.runId, type: "error", where: "reconcile-replay", message });
+      } catch {
+        // The note still reaches the person.
+      }
+      notes.push(`Interrupted factory run ${runId}: ${message}`);
     }
   }
   return notes;

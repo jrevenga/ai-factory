@@ -1353,6 +1353,31 @@ export function replayInterrupted(runDir: string, ledger: Sink, runId: string, d
   return out;
 }
 
+/**
+ * Fix round 1 (Task 13): `<runDir>/reconcile/` holds work for a replay: a manifest that is not `done` (or cannot be
+ * read), or a directory without one. A missing directory has none; any other failure to list it counts as work, so
+ * the replay reports it.
+ */
+export function hasUnfinishedReconciles(runDir: string): boolean {
+  const base = path.join(runDir, "reconcile");
+  let names: string[];
+  try {
+    names = readdirSync(base);
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+  for (const name of names) {
+    const dir = path.join(base, name);
+    try {
+      if (kindOf(dir) !== "dir") continue;
+      if (loadSnapshot(dir).status !== "done") return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Reverse snapshot order: `seq` when both have one, else `createdAt` (then manifest mtime, then name), newest first. */
 function replayOrder(a: { name: string; snapshot: Snapshot; mtime: number }, b: { name: string; snapshot: Snapshot; mtime: number }): number {
   const sa = a.snapshot.seq;

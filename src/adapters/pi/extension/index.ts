@@ -9,7 +9,7 @@
 // allowlisted runners on the answer route are snapshotted before they run and reconciled at their `tool_result`
 // (reconcile.ts, Task 11); `run_end` is written at session_shutdown. Before `run_start`, interrupted runs of the project
 // are marked and this session's own interrupted run is found (resume.ts, Task 13): the restored route then starts
-// flagged, the claimed runs' pending reconciliations are finished, and the next agent run gets a resume section.
+// flagged, unfinished reconciliations of interrupted runs are finished, and the next agent run gets a resume section.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -38,7 +38,7 @@ import { registerEvidence, type EvidenceSession } from "./evidence.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
 import { Reconciler } from "./reconcile.ts";
-import { recoverRuns, replayClaimed, RESUME_SECTION_KEY, resumeSection } from "./resume.ts";
+import { recoverRuns, replayInterruptedRuns, RESUME_SECTION_KEY, resumeSection } from "./resume.ts";
 import { registerRouteState, type RouteSession } from "./route-state.ts";
 import { storeWritable } from "./store-probe.ts";
 import { registerTaskState, type TaskSession } from "./task-state.ts";
@@ -258,7 +258,7 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     piSession,
     ...(recovery.resumedFrom.length > 0 ? { resumedFrom: recovery.resumedFrom } : {}),
   });
-  const replayNotes = replayClaimed(recovery, factoryHome, projectId, ledger, runId);
+  const replayNotes = replayInterruptedRuns({ factoryHome, projectId, runId, isAlive: pidAlive }, ledger);
   const section = resumeSection([...recovery.lines, ...replayNotes]);
   return {
     ledger,
