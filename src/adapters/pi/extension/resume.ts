@@ -15,7 +15,7 @@ import { join } from "node:path";
 import type { RunEvent } from "../../../core/ledger/events.ts";
 import { claimReplay, ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
 import { hasUnfinishedReconciles, replayInterrupted, type Diagnose } from "./reconcile.ts";
-import { ROUTE_ENTRY } from "./route-state.ts";
+import { lastRouteEntryRunId } from "./route-state.ts";
 
 /** Key of the resume section in `systemPromptOptions.sections`. */
 export const RESUME_SECTION_KEY = "factory-resume";
@@ -29,17 +29,7 @@ export function resumeLine(run: InterruptedRun): string | undefined {
   return `Interrupted factory run ${run.runId}: task ${taskId}, phase ${phase ?? "unknown"}, last checkpoint ${sha ?? "none"}. Resume from the checkpoint; re-declare the route with set_route.`;
 }
 
-/** `runId` of the session branch's last `factory-route` entry (stored since Task 13), when it has one. */
-export function lastRouteEntryRunId(entries: readonly unknown[]): string | undefined {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i] as { type?: unknown; customType?: unknown; data?: unknown } | null;
-    if (e?.type === "custom" && e.customType === ROUTE_ENTRY) {
-      const runId = (e.data as { runId?: unknown } | null | undefined)?.runId;
-      return typeof runId === "string" ? runId : undefined;
-    }
-  }
-  return undefined;
-}
+export { lastRouteEntryRunId };
 
 export interface RecoveryInput {
   factoryHome: string;

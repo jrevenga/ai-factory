@@ -93,6 +93,23 @@ export interface RouteSession {
   runId: string;
   facts: RouteFacts;
   io?: RouteIo;
+  /**
+   * Fix round 1 (Task 13): whether the run that wrote a restored `factory-route` entry was interrupted (an unreadable
+   * ledger counts as interrupted). Branch navigation restores such an entry flagged (ruling 20). Absent: never.
+   */
+  runInterrupted?(runId: string): boolean;
+}
+
+/** `runId` of the session branch's last `factory-route` entry (stored since Task 13), when it has one. */
+export function lastRouteEntryRunId(entries: readonly unknown[]): string | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as { type?: unknown; customType?: unknown; data?: unknown } | null;
+    if (e?.type === "custom" && e.customType === ROUTE_ENTRY) {
+      const runId = (e.data as { runId?: unknown } | null | undefined)?.runId;
+      return typeof runId === "string" ? runId : undefined;
+    }
+  }
+  return undefined;
 }
 
 const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
@@ -283,6 +300,11 @@ function toolResult(text: string, details: RouteState | undefined, isError = fal
 
 export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStateHandle {
   const parameters = setRouteParams();
+  /**
+   * Fix round 1 (Task 13, ruling 20): a restore after an interruption owes a `set_route` declaration. Until one
+   * succeeds, every restore (branch navigation included) starts flagged, whichever entry it restores.
+   */
+  let reclassificationOwed = false;
   pi.registerTool({
     name: SET_ROUTE_TOOL,
     label: "Set route",
@@ -310,6 +332,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
         return toolResult(`set_route failed: the route change could not be recorded (${(e as Error).message})`, currentRoute(), true);
       }
       setRoute(next);
+      reclassificationOwed = false;
       return toolResult(announce(next), next);
     },
   });
@@ -361,6 +384,9 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
   });
 
   const restore = (s: RouteSession, ctx: NoticeCtx, opts: { interrupted: boolean }): void => {
+    // At session start this also clears what a previous session owed; on branch navigation `interrupted` already
+    // includes it.
+    reclassificationOwed = opts.interrupted;
     let r: RestoredRoute;
     try {
       r = restoreRoute(ctx.sessionManager.getBranch(), s.facts, opts, s.io ?? ROUTE_IO);
@@ -387,9 +413,21 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
   };
 
   // Branch navigation (/tree) changes which entries are current: the route follows the branch (Pi docs).
+  // Fix round 1: an entry written by an interrupted run, or any entry while a reclassification is owed, restores flagged.
   pi.on("session_tree", async (_event, ctx) => {
     const s = await deps.session();
-    if (s !== undefined) restore(s, ctx, { interrupted: false });
+    if (s === undefined) return;
+    let interrupted = reclassificationOwed;
+    if (!interrupted) {
+      const runId = lastRouteEntryRunId(ctx.sessionManager.getBranch());
+      try {
+        interrupted = runId !== undefined && runId !== s.runId && s.runInterrupted?.(runId) === true;
+      } catch {
+        // The run's state cannot be checked: fail safe.
+        interrupted = true;
+      }
+    }
+    restore(s, ctx, { interrupted });
   });
 
   const verifyTools = (): void => verifyRegisteredTool(pi, SET_ROUTE_TOOL, parameters, deps.factoryTools);

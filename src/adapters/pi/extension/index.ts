@@ -36,7 +36,7 @@ import { FactoryState } from "../../../core/state/schema.ts";
 import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, GatedChecks, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
 import { registerEvidence, type EvidenceSession } from "./evidence.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
-import { ledgerDirFor, RunLedger } from "./ledger.ts";
+import { ledgerDirFor, RunLedger, sessionInterruptedRuns } from "./ledger.ts";
 import { Reconciler } from "./reconcile.ts";
 import { recoverRuns, replayInterruptedRuns, RESUME_SECTION_KEY, resumeSection } from "./resume.ts";
 import { registerRouteState, type RouteSession } from "./route-state.ts";
@@ -156,6 +156,8 @@ interface Session {
   reconciler: Reconciler;
   /** Task 13: this Pi session's previous run was interrupted (the restored route starts flagged, ruling 20). */
   sessionInterrupted: boolean;
+  /** Fix round 1 (Task 13): whether a run of this project (one that wrote a route entry) was interrupted. */
+  runInterrupted(runId: string): boolean;
   /** Task 13: what startup recovery tells the person and, once, the next agent run (cleared when injected). */
   resume: { messages: string[]; section?: string };
 }
@@ -280,6 +282,8 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     gatedChecks: new GatedChecks(),
     reconciler: new Reconciler(dirname(ledger.file)),
     sessionInterrupted: recovery.sessionInterrupted,
+    // An unreadable ledger counts as interrupted (`sessionInterruptedRuns` returns it with an error): fails safe.
+    runInterrupted: (other) => sessionInterruptedRuns(factoryHome, projectId, runId, { routeRunId: other }, pidAlive).some((r) => r.runId === other),
     resume: { messages: [...recovery.errors, ...recovery.lines, ...replayNotes], ...(section !== undefined ? { section } : {}) },
   };
 }
@@ -289,6 +293,7 @@ function routeSession(s: Session): RouteSession {
     ledger: s.ledger,
     runId: s.runId,
     facts: { projectRoot: s.projectRoot, home: s.home, piAgentDir: s.piAgentDir, factoryHome: s.factoryHome, gitDirs: s.gitDirs },
+    runInterrupted: s.runInterrupted,
   };
 }
 
