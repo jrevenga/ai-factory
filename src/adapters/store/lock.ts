@@ -32,10 +32,9 @@
 import lockfile from "proper-lockfile";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rm, stat, utimes } from "node:fs/promises";
-import { join } from "node:path";
 import { writeJsonAtomic } from "../platform/json-file.ts";
 import type { FactoryPaths } from "../platform/paths.ts";
-import { processGroupAlive, recordedProcessGroups, recordProcessGroupsIn } from "../platform/process.ts";
+import { liveRecordedProcessGroups, recordProcessGroupsIn } from "../platform/process.ts";
 
 const DEFAULT_STALE_MS = 10_000;
 const DEFAULT_UPDATE_MS = 5_000;
@@ -169,11 +168,7 @@ async function inUseByWriter(paths: FactoryPaths): Promise<Locked | undefined> {
   if (lease?.fresh) return new Locked(paths.lock, lease.pid);
   if (lease !== undefined) await rm(borrowerLeasePath(paths), { force: true });
   if (process.platform === "win32") return undefined;
-  const alive: number[] = [];
-  for (const pgid of await recordedProcessGroups(writerGroupsPath(paths))) {
-    if (processGroupAlive(pgid)) alive.push(pgid);
-    else await rm(join(writerGroupsPath(paths), String(pgid)), { force: true });
-  }
+  const alive = await liveRecordedProcessGroups(writerGroupsPath(paths));
   if (alive.length === 0) return undefined;
   const which = alive.length === 1 ? `process group ${alive[0]}` : `process groups ${alive.join(", ")}`;
   return new Locked(

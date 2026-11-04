@@ -17,7 +17,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
-import { acquireLock, borrowerLeasePath, isPidAlive, Locked } from "../../src/adapters/store/lock.ts";
+import { acquireLock, borrowerLeasePath, isPidAlive, Locked, writerGroupsPath } from "../../src/adapters/store/lock.ts";
+import { recordedProcessGroups } from "../../src/adapters/platform/process.ts";
 import { readTxn } from "../../src/adapters/store/transaction.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
@@ -54,7 +55,7 @@ async function until<T>(fn: () => T | undefined | Promise<T | undefined>, timeou
   }
 }
 
-type Mode = "honor-abort" | "ignore-abort" | "stubborn";
+type Mode = "honor-abort" | "ignore-abort" | "stubborn" | "die-before-record";
 
 interface Started {
   lender: ChildProcess;
@@ -154,6 +155,28 @@ describe("borrowed lock lifetime (R17 amended)", () => {
     expectInstallerStoppedBeforeRelease(s.output());
     expect(existsSync(borrowerLeasePath(paths))).toBe(false); // the lender removed its dead borrower's lease
     await (await acquireLock(paths)).release();
+  });
+
+  it.skipIf(isWindows)("schedule: the borrower is SIGKILLed after spawning an installer but before recording it → the installer never runs, no orphan, the lender releases cleanly (R20)", async () => {
+    const lender = spawn(process.execPath, ["--import", "jiti/register", LENDER, "die-before-record"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    children.push(lender);
+    let out = "";
+    lender.stdout?.on("data", (d: Buffer) => (out += d.toString()));
+    lender.stderr?.on("data", (d: Buffer) => (out += d.toString()));
+    const code = await new Promise<number | null>((r) => lender.once("exit", (c) => r(c)));
+    const gatePid = Number(readFileSync(join(paths.home, "gate.pid"), "utf8"));
+    pids.push(gatePid);
+    expect(code, out).toBe(1); // the borrower was killed
+    expect(out).toContain("lender: released");
+    // The gate saw EOF on its control pipe and exited without starting the installer.
+    await until(() => gone(gatePid), 5_000, "the gate to exit");
+    await new Promise((r) => setTimeout(r, 500));
+    expect(existsSync(join(paths.home, "installer.pid")), "the installer must never have run").toBe(false);
+    expect(await recordedProcessGroups(writerGroupsPath(paths))).toEqual([]);
+    expect(existsSync(borrowerLeasePath(paths))).toBe(false);
+    await (await acquireLock(paths)).release();
+    expect(existsSync(paths.state)).toBe(false);
+    expect((await readTxn(paths))?.id).toBe("lender-txn");
   });
 
   it("a lender killed with SIGKILL: the borrower stops its installer, aborts on its own and only then frees the lock", async () => {

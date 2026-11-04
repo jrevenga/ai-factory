@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
 import { acquireLock, borrowerLeasePath, isPidAlive, Locked, LockLost, ownerFilePath, readLockHolder, writerGroupsPath } from "../../../src/adapters/store/lock.ts";
 import { deadPid } from "../../helpers/dead-pid.ts";
+import { WRITER_TOKEN_ENV } from "../../../src/adapters/platform/process.ts";
 import { isolatedEnv } from "../../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
@@ -316,10 +317,11 @@ describe("borrower lease and writer groups (R17 amended)", () => {
   });
 
   it.skipIf(process.platform === "win32")("a recorded writer process group that is still alive blocks the lock; dead entries are cleaned", async () => {
-    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore", env: { ...process.env, [WRITER_TOKEN_ENV]: "tok-l" } });
     children.push(sleeper);
     await mkdir(writerGroupsPath(paths), { recursive: true });
-    await writeFile(join(writerGroupsPath(paths), String(sleeper.pid)), "");
+    await writeFile(join(writerGroupsPath(paths), String(sleeper.pid)), "tok-l");
+    await new Promise((r) => setTimeout(r, 200));
     const err = await acquireLock(paths).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Locked);
     expect((err as Error).message).toContain(`process group ${sleeper.pid}`);

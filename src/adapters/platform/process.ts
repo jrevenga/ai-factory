@@ -13,10 +13,20 @@
 // once the group is gone). A lender stops every recorded group after its borrower exits, and an
 // acquirer refuses the lock while one is alive, so the lock never becomes reusable while an installer
 // (npm, Pi) started in its own group may still write.
+//
+// R20: such a child starts through the writer gate (writer-gate.mjs), which runs the real command only
+// once its group is recorded, so no writer exists unrecorded even if we are killed right after spawn.
+// Each recorded group gets a random token, stored in its entry and set as FACTORY_WRITER_TOKEN in the
+// environment of every process of the group. Cleanup and acquirers check it before trusting a pgid:
+// on Linux a live group none of whose members carries the token is not ours (its pgid was reused) and
+// is never signalled; elsewhere no cheap check exists, so a live recorded group is assumed to be ours.
+// Windows: no gate and no registry; non-detached children die with their parent's job object.
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { readdir, rm } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { assertCmdSafe, quoteCmdArgs } from "./cmd-quote.ts";
 
 export interface RunOptions {
@@ -43,6 +53,8 @@ export interface ProcessDeps {
   /** Starts the Windows tree-kill command for `pid` (default `taskkill /PID <pid> /T /F`). */
   spawnTaskkill: (pid: number) => ChildProcess;
   taskkillTimeoutMs: number;
+  /** Test seam (R20): called right after spawn, before the child's group is recorded. */
+  beforeRecord?: (pid: number) => void;
 }
 
 export class ProcessTeardownFailed extends Error {
@@ -188,6 +200,78 @@ export function processGroupAlive(pgid: number): boolean {
   return Number.isInteger(pgid) && pgid > 1 && groupAlive(pgid);
 }
 
+/** The gate every recorded writer starts through (R20). */
+export const WRITER_GATE = fileURLToPath(new URL("./writer-gate.mjs", import.meta.url));
+/** Environment variable carrying a writer group's identity token to every process of the group. */
+export const WRITER_TOKEN_ENV = "FACTORY_WRITER_TOKEN";
+
+/** Linux: pids of the processes in group `pgid` (from /proc/<pid>/stat), or undefined without /proc. */
+function linuxGroupMembers(pgid: number): number[] | undefined {
+  let names: string[];
+  try {
+    names = readdirSync("/proc");
+  } catch {
+    return undefined;
+  }
+  const out: number[] = [];
+  for (const name of names) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const stat = readFileSync(`/proc/${name}/stat`, "utf8");
+      // pid (comm) state ppid pgrp …: comm may contain spaces and parentheses, so parse after the last ')'.
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (Number(fields[2]) === pgid) out.push(Number(name));
+    } catch {
+      // exited meanwhile, or not readable
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether recorded group `pgid` with identity `token` is ours and alive: "gone" (no process left),
+ * "foreign" (Linux: alive, but no member carries the token: the pgid was reused), "ours" (Linux: a
+ * member carries it), or "unknown" (alive; no cheap identity check on this platform).
+ */
+function writerGroupStatus(pgid: number, token: string, platform: NodeJS.Platform): "gone" | "foreign" | "ours" | "unknown" {
+  if (!processGroupAlive(pgid)) return "gone";
+  if (platform !== "linux" || token === "") return "unknown";
+  const members = linuxGroupMembers(pgid);
+  if (members === undefined) return "unknown";
+  if (members.length === 0) return "gone";
+  for (const pid of members) {
+    try {
+      if (readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`${WRITER_TOKEN_ENV}=${token}`)) return "ours";
+    } catch {
+      // another user's process, or exited: cannot be ours
+    }
+  }
+  return "foreign";
+}
+
+async function entryToken(dir: string, pgid: number): Promise<string> {
+  try {
+    return (await readFile(join(dir, String(pgid)), "utf8")).trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The recorded groups that are still alive and ours (or cannot be told apart from ours); entries of
+ * gone or foreign groups are removed. Used by acquirers: any result keeps the lock unavailable.
+ */
+export async function liveRecordedProcessGroups(dir: string, platform: NodeJS.Platform = process.platform): Promise<number[]> {
+  if (platform === "win32") return [];
+  const live: number[] = [];
+  for (const pgid of await recordedProcessGroups(dir)) {
+    const status = writerGroupStatus(pgid, await entryToken(dir, pgid), platform);
+    if (status === "ours" || status === "unknown") live.push(pgid);
+    else await rm(join(dir, String(pgid)), { force: true });
+  }
+  return live;
+}
+
 /** The pgids recorded in a writer-group registry (missing directory → none). */
 export async function recordedProcessGroups(dir: string): Promise<number[]> {
   let names: string[];
@@ -201,8 +285,8 @@ export async function recordedProcessGroups(dir: string): Promise<number[]> {
 }
 
 /**
- * POSIX: stops every group recorded in `dir` that is still alive (SIGTERM, SIGKILL after the grace
- * period, awaited) and removes the entries of groups that are gone. An entry whose group could not be
+ * POSIX: stops every group recorded in `dir` that is still alive and ours (SIGTERM, SIGKILL after the
+ * grace period, awaited; see writerGroupStatus) and removes the entries of groups that are gone or foreign. An entry whose group could not be
  * torn down is kept, so the lock stays unavailable. Returns the pgids still alive. No-op on Windows,
  * where children die with their parent's job object instead.
  */
@@ -211,7 +295,9 @@ export async function stopRecordedProcessGroups(dir: string, platform: NodeJS.Pl
   const survivors: number[] = [];
   for (const pgid of await recordedProcessGroups(dir)) {
     try {
-      if (groupAlive(pgid)) await killGroup(pgid);
+      const status = writerGroupStatus(pgid, await entryToken(dir, pgid), platform);
+      // A foreign group (reused pgid) is never signalled; "unknown" is assumed ours (no cheap check).
+      if (status === "ours" || status === "unknown") await killGroup(pgid);
       await rm(join(dir, String(pgid)), { force: true });
     } catch {
       survivors.push(pgid);
@@ -367,15 +453,20 @@ export function runBounded(cmd: string, args: string[], opts: RunOptions = {}, d
   const d: ProcessDeps = { ...DEFAULT_DEPS, ...deps };
   return new Promise((resolve, reject) => {
     const { file, argv, verbatim } = invocation(cmd, args, d.platform);
-    const child = spawn(file, argv, {
+    // R20: under a writer registry (POSIX), start through the gate and authorise once recorded.
+    const registry = d.platform !== "win32" ? registries[registries.length - 1] : undefined;
+    const token = registry === undefined ? undefined : randomBytes(12).toString("hex");
+    const baseEnv = opts.env ?? process.env;
+    const child = spawn(token === undefined ? file : process.execPath, token === undefined ? argv : [WRITER_GATE, file, ...argv], {
       cwd: opts.cwd,
-      env: opts.env,
-      stdio: ["pipe", "pipe", "pipe"],
+      env: token === undefined ? opts.env : { ...baseEnv, [WRITER_TOKEN_ENV]: token },
+      stdio: token === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "pipe"],
       shell: false,
       detached: d.platform !== "win32",
       windowsHide: true,
       windowsVerbatimArguments: verbatim,
     });
+    const control = token === undefined ? undefined : (child.stdio[3] as import("node:net").Socket | null);
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -383,17 +474,34 @@ export function runBounded(cmd: string, args: string[], opts: RunOptions = {}, d
     let orphans = false;
     let settled = false;
 
-    // Writer-group registry entry (POSIX: the child leads its own group), removed once the group is gone.
-    const registry = d.platform !== "win32" && child.pid !== undefined ? registries[registries.length - 1] : undefined;
-    const entryFile = registry === undefined ? undefined : join(registry, String(child.pid));
+    // Writer-group registry entry (POSIX: the gate leads the group), removed once the group is gone.
+    const entryFile = registry === undefined || child.pid === undefined ? undefined : join(registry, String(child.pid));
     let recordError: unknown;
     if (entryFile !== undefined && registry !== undefined) {
+      d.beforeRecord?.(child.pid as number);
       try {
         mkdirSync(registry, { recursive: true });
-        writeFileSync(entryFile, "");
+        writeFileSync(entryFile, token ?? "");
       } catch (e) {
         recordError = e;
       }
+    }
+    // The gate's reply after authorisation: "ok", or the error spawning the real command (e.g. ENOENT).
+    let gateError: Error | undefined;
+    if (control) {
+      let reply = "";
+      control.setEncoding("utf8");
+      control.on("data", (chunk: string) => (reply += chunk));
+      control.on("end", () => {
+        if (reply === "" || reply === "ok") return;
+        try {
+          const parsed = JSON.parse(reply) as { error?: { code?: string; message?: string } };
+          gateError = Object.assign(new Error(parsed.error?.message ?? "the writer gate could not start the command"), { code: parsed.error?.code });
+        } catch {
+          gateError = new Error(`the writer gate replied ${JSON.stringify(reply)}`);
+        }
+      });
+      control.on("error", () => {});
     }
 
     const finish = (outcome: { result: RunResult } | { error: unknown }) => {
@@ -454,18 +562,21 @@ export function runBounded(cmd: string, args: string[], opts: RunOptions = {}, d
     });
     child.on("close", (code) => {
       void Promise.resolve(terminating).then(() =>
-        finish({ result: { code: interrupted ? null : (code ?? 1), stdout, stderr, timedOut, orphans } }),
+        finish(gateError !== undefined && !interrupted ? { error: gateError } : { result: { code: interrupted ? null : (code ?? 1), stdout, stderr, timedOut, orphans } }),
       );
     });
 
     child.stdin.on("error", () => {});
     child.stdin.end(opts.input ?? "");
     if (recordError !== undefined) {
-      // An unrecorded writer could outlive us unnoticed: do not let it run.
+      // Not recorded, so never authorised: the gate sees EOF and exits without running the command.
       const error = recordError;
+      control?.destroy();
       void terminate().then(() => finish({ error }));
       return;
     }
+    // Recorded: now the real command may run.
+    control?.write("1");
     if (opts.signal?.aborted) onAbort();
     else opts.signal?.addEventListener("abort", onAbort, { once: true });
   });

@@ -2,7 +2,8 @@
 // lender's lock) with a fake Pi whose package install runs installer.mjs through the real runBounded (its
 // own process group, recorded as a writer group), which ends once `<FACTORY_HOME>/go` exists.
 // Modes: honor-abort (the install stops when the lock's `lost` signal aborts), ignore-abort (it does
-// not), stubborn (honor-abort with an installer that ignores SIGTERM).
+// not), stubborn (honor-abort with an installer that ignores SIGTERM), die-before-record (the borrower
+// SIGKILLs itself right after spawning the installer, before its group is recorded; R20).
 // usage: node --import jiti/register borrower.ts <lenderPid> <mode>
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -26,10 +27,19 @@ class InstallingPi extends PiRuntime {
   }
   override async installPackage(_cli: string, _ref: string, opts: PiRunOptions = {}): Promise<void> {
     const pidFile = join(paths.home, "installer.pid");
-    const run = runBounded(process.execPath, [INSTALLER, pidFile, join(paths.home, "go"), mode === "stubborn" ? "stubborn" : ""], {
-      signal: mode === "ignore-abort" ? undefined : opts.signal,
-      timeoutMs: 120_000,
-    });
+    const beforeRecord =
+      mode === "die-before-record"
+        ? (pid: number): void => {
+            writeFileSync(join(paths.home, "gate.pid"), String(pid));
+            process.kill(process.pid, "SIGKILL");
+          }
+        : undefined;
+    const run = runBounded(
+      process.execPath,
+      [INSTALLER, pidFile, join(paths.home, "go"), mode === "stubborn" ? "stubborn" : ""],
+      { signal: mode === "ignore-abort" ? undefined : opts.signal, timeoutMs: 120_000 },
+      { beforeRecord },
+    );
     while (!existsSync(pidFile)) await new Promise((r) => setTimeout(r, 20));
     writeFileSync(join(paths.home, "blocked"), "");
     const r = await run;
