@@ -158,6 +158,75 @@ export function killProcessTree(child: ChildProcess, deps: Partial<ProcessDeps> 
   return terminateTree(child, { ...DEFAULT_DEPS, ...deps });
 }
 
+/** Exit code a shell reports for a process ended by `sig`. */
+const SUPERVISED_SIGNALS = [
+  ["SIGINT", 130],
+  ["SIGTERM", 143],
+  ["SIGHUP", 129],
+] as const;
+/** How long a supervised child may take to tear down its own subprocesses before it is killed (> MAX_TEARDOWN_MS + GRACE_MS). */
+const SUPERVISED_STOP_MS = MAX_TEARDOWN_MS + GRACE_MS + 3000;
+
+export interface SupervisedOptions {
+  env?: NodeJS.ProcessEnv;
+  /** "inherit" hands the terminal's stdin to the child (a factory CLI with a question to ask); default "ignore". */
+  stdin?: "inherit" | "ignore";
+}
+
+/**
+ * Runs `cmd args` with the terminal's stdout/stderr (no shell, not detached: it stays in the terminal's
+ * process group, so it can read the terminal) for a child that borrows this process's factory lock
+ * (controller ruling R17). While it runs, SIGINT/SIGTERM/SIGHUP sent to this process do not end it:
+ * the child is stopped first and awaited, and the promise then resolves to 128 + the signal number, so
+ * the caller releases the lock only after the child is gone. POSIX: SIGTERM to the child, whose own
+ * signal handlers tear down its bounded subprocesses (runBounded), then SIGKILL if it is still running
+ * after SUPERVISED_STOP_MS. Windows: an awaited `taskkill /T /F` of the child's tree.
+ * Otherwise resolves to the child's exit code (1 when it was ended by a signal).
+ */
+export function runSupervised(cmd: string, args: string[], opts: SupervisedOptions = {}, deps: Partial<ProcessDeps> = {}): Promise<number> {
+  const d: ProcessDeps = { ...DEFAULT_DEPS, ...deps };
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { env: opts.env, stdio: [opts.stdin ?? "ignore", "inherit", "inherit"], shell: false, windowsHide: true });
+    let received: { sig: NodeJS.Signals; code: number } | undefined;
+    const gone = new Promise<void>((r) => child.once("exit", () => r()));
+    const stop = async (): Promise<void> => {
+      if (d.platform === "win32") {
+        try {
+          await taskkillTree(child, child.pid as number, d);
+          return;
+        } catch {
+          child.kill("SIGKILL");
+          return;
+        }
+      }
+      child.kill("SIGTERM");
+      const timer = setTimeout(() => child.kill("SIGKILL"), SUPERVISED_STOP_MS);
+      await gone;
+      clearTimeout(timer);
+    };
+    const listeners = SUPERVISED_SIGNALS.map(([sig, code]) => {
+      const listener = (): void => {
+        if (received !== undefined || exited(child)) return;
+        received = { sig, code };
+        void stop();
+      };
+      return { sig, listener };
+    });
+    const detach = (): void => {
+      for (const { sig, listener } of listeners) process.off(sig, listener);
+    };
+    for (const { sig, listener } of listeners) process.on(sig, listener);
+    child.once("error", (e) => {
+      detach();
+      reject(e);
+    });
+    child.once("exit", (code, signal) => {
+      detach();
+      resolve(received !== undefined ? received.code : (code ?? (signal ? 1 : 0)));
+    });
+  });
+}
+
 // Children currently running. Each has ONE cancellation path (timeout, abort and parent signals all go
 // through it). Parent SIGINT/SIGTERM handlers exist only while this set is non-empty.
 interface ActiveChild {

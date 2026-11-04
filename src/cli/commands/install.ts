@@ -1,10 +1,10 @@
 // `factory install`: checks the minimum requirements, then either applies this release or, when run
 // through `npx` (whose cache is temporary), bootstraps a global install first and hands over to it.
-import { spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { npm } from "../../adapters/platform/npm.ts";
+import { runSupervised } from "../../adapters/platform/process.ts";
 import { npmInstallSpec } from "../../core/release/manifest.ts";
 import { MIGRATIONS } from "../../core/state/migrations.ts";
 import { applyPreflight, applyRelease, ApplyFailed, ApplyRefused, TXN_PENDING_MESSAGE, type ApplyContext } from "./apply-release.ts";
@@ -38,15 +38,13 @@ function ownCliPath(): string {
 }
 
 /**
- * `node <args>` with output going straight to the terminal (no shell). stdin is closed unless
- * `interactive`, which hands the terminal to a factory CLI that has a question to ask (never to Pi).
+ * `node <args>` for a factory CLI that borrows our lock, with output going straight to the terminal (no
+ * shell). stdin is closed unless `interactive`, which hands the terminal to a factory CLI that has a
+ * question to ask (never to Pi). A signal sent to us meanwhile stops the child and awaits it before we
+ * go on to release the lock (R17); the result is then 128 + the signal number.
  */
 export function runNodeInherited(args: string[], env: NodeJS.ProcessEnv, opts: { interactive?: boolean } = {}): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, { env, stdio: [opts.interactive === true ? "inherit" : "ignore", "inherit", "inherit"], windowsHide: true });
-    child.once("error", reject);
-    child.once("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0)));
-  });
+  return runSupervised(process.execPath, args, { env, stdin: opts.interactive === true ? "inherit" : "ignore" });
 }
 
 export async function install(ctx: ApplyContext, opts: InstallOptions, overrides: Partial<InstallDeps> = {}): Promise<number> {

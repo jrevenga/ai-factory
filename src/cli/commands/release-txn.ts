@@ -70,9 +70,10 @@ export interface HeldLock {
 
 /**
  * Runs `body` holding the factory lock, after checking (under the lock, so none can register meanwhile)
- * that no factory-launched Pi session is running. The lock is released in every case; a release failure
- * (e.g. the lock was compromised while a borrowing child ran, which the child cannot see) makes the
- * result non-zero, because another process may have held the lock meanwhile.
+ * that no factory-launched Pi session is running. The lock is released in every case, and only after a
+ * borrowing child has exited (the hand-over runner stops and awaits it on SIGINT/SIGTERM/SIGHUP; R17);
+ * a release failure (e.g. the lock was compromised while a borrowing child ran) makes the result
+ * non-zero, because another process may have held the lock meanwhile.
  */
 export async function withTxnLock(ctx: ReleaseContext, deps: ReleaseDeps, body: (held: HeldLock) => Promise<number>): Promise<number> {
   const { io, paths } = ctx;

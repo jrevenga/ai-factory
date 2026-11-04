@@ -74,6 +74,23 @@ export async function beginTxn(paths: FactoryPaths, t: BeginTxn): Promise<void> 
   await handle.close();
 }
 
-export async function clearTxn(paths: FactoryPaths): Promise<void> {
+/** The journal belongs to another transaction than the one trying to clear it (R17). */
+export class TxnMismatch extends Error {
+  readonly path: string;
+  constructor(path: string, expected: string, found: string) {
+    super(`The journal ${path} records transaction ${found}, not ${expected}; it belongs to another factory process and was left in place`);
+    this.name = "TxnMismatch";
+    this.path = path;
+  }
+}
+
+/**
+ * Removes the journal of transaction `id` (the one this process started or adopted). An absent journal
+ * is fine; a journal of another transaction is never removed (TxnMismatch).
+ */
+export async function clearTxn(paths: FactoryPaths, id: string): Promise<void> {
+  const current = await readTxn(paths);
+  if (current === undefined) return;
+  if (current.id !== id) throw new TxnMismatch(paths.txn, id, current.id);
   await rm(paths.txn, { force: true });
 }

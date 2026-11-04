@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { UnsafeCmdArgument } from "../../../src/adapters/platform/cmd-quote.ts";
-import { ProcessTeardownFailed, runBounded, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
+import { ProcessTeardownFailed, runBounded, runSupervised, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
 const FIXTURES = fileURLToPath(new URL("../../fixtures/proc/", import.meta.url));
@@ -242,5 +242,52 @@ describe("runBounded Windows teardown", () => {
   it("rejects with ProcessTeardownFailed when taskkill does not finish in time", async () => {
     const failure = await expectTeardownFailure({ spawnTaskkill: fakeTaskkill("setInterval(() => {}, 1000)"), taskkillTimeoutMs: 300 });
     expect(failure.reason).toMatch(/did not finish within 300 ms/);
+  });
+});
+
+describe("runSupervised (R17)", () => {
+  /** Delivers `sig` to this process's listeners only (no real signal), with other listeners set aside. */
+  function emitSignal(sig: NodeJS.Signals): void {
+    const others = process.listeners(sig).slice(0, -1);
+    for (const l of others) process.off(sig, l);
+    try {
+      process.emit(sig, sig);
+    } finally {
+      for (const l of others) process.on(sig, l);
+    }
+  }
+
+  it("resolves to the child's exit code and leaves no signal listener behind", async () => {
+    const before = process.listenerCount("SIGTERM");
+    expect(await runSupervised(process.execPath, ["-e", "process.exit(5)"])).toBe(5);
+    expect(process.listenerCount("SIGTERM")).toBe(before);
+  });
+
+  it("on a signal, POSIX: stops the child and resolves 128 + signal only after it exited", async () => {
+    if (isWindows) return;
+    const marker = join(tmp.dir, "child-done");
+    const script = `process.on("SIGTERM", () => setTimeout(() => { require("fs").writeFileSync(${JSON.stringify(marker)}, ""); process.exit(0); }, 300)); setInterval(() => {}, 1000); console.log("ready");`;
+    const running = runSupervised(process.execPath, ["-e", script], {});
+    await new Promise((r) => setTimeout(r, 500));
+    emitSignal("SIGHUP");
+    expect(await running).toBe(129);
+    await expect(stat(marker)).resolves.toBeDefined();
+  });
+
+  it("on a signal, Windows branch: awaits taskkill of the child's tree", async () => {
+    let killed: number | undefined;
+    const deps: Partial<ProcessDeps> = {
+      platform: "win32",
+      spawnTaskkill: (pid) => {
+        killed = pid;
+        return spawn(process.execPath, ["-e", `process.kill(${pid}, "SIGKILL")`], { stdio: "ignore" });
+      },
+    };
+    const running = runSupervised(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {}, deps);
+    await new Promise((r) => setTimeout(r, 300));
+    emitSignal("SIGTERM");
+    expect(await running).toBe(143);
+    expect(killed).toBeTypeOf("number");
+    expect(killProbe(killed as number)).toBe("ESRCH");
   });
 });

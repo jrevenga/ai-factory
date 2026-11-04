@@ -185,6 +185,8 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
       held.live();
       const snap = await createSnapshot(paths, { from: current, to: plan.target, kind: "rollback", now: ctx.now() });
       rollbackSnapshot = snap.id;
+      /** The journal this rollback finishes: the one it recovers, or the one it starts now. */
+      const txnId = plan.recovery?.id ?? snap.id;
       if (plan.recovery === undefined) {
         held.live();
         await beginTxn(paths, { id: snap.id, kind: "rollback", from: current, to: plan.target, snapshot: snap.id, now: ctx.now() });
@@ -205,8 +207,8 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
       // The target's `_apply-release` clears the journal after writing state.json; make sure it is gone
       // (still under our lock), but only if state.json really records the target.
       if ((await readState(paths))?.version === plan.target) {
-        held.live();
-        await clearTxn(paths);
+        await held.lock.verify();
+        await clearTxn(paths, txnId);
       } else {
         io.err(`factory ${plan.target} reported success but ${paths.state} does not record it. ${failedMessage(plan, rollbackSnapshot)}`);
         return 1;

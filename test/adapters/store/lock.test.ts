@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths, type FactoryPaths } from "../../../src/adapters/platform/paths.ts";
-import { acquireLock, isPidAlive, Locked, ownerFilePath, readLockHolder } from "../../../src/adapters/store/lock.ts";
+import { acquireLock, isPidAlive, Locked, LockLost, ownerFilePath, readLockHolder } from "../../../src/adapters/store/lock.ts";
 import { deadPid } from "../../helpers/dead-pid.ts";
 import { isolatedEnv } from "../../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
@@ -128,19 +128,19 @@ describe("acquireLock", () => {
     await owner.release();
   });
 
-  it("does not borrow from a different holder, and acquires normally when the lock is free", async () => {
+  it("does not borrow from a different holder", async () => {
     const child = await childHolder();
     const err = await acquireLock(paths, { ownerPid: process.pid }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(Locked);
     expect((err as Locked).pid).toBe(child.pid);
+  });
 
-    const exited = new Promise((r) => child.once("exit", r));
-    child.kill("SIGKILL");
-    await exited;
-    await rm(paths.lock, { recursive: true, force: true });
-    const lock = await acquireLock(paths, { ownerPid: 12345 });
-    expect(lock.borrowed).toBe(false);
-    await lock.release();
+  it("a borrower whose lender no longer holds the lock never takes the lock itself (R17)", async () => {
+    const dead = await deadPid();
+    const err = await acquireLock(paths, { ownerPid: dead }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LockLost);
+    expect((err as Error).message).toContain(`process ${dead}`);
+    expect(existsSync(paths.lock)).toBe(false);
   });
 
   it("records a compromised lock without crashing and release() throws it", async () => {
@@ -216,5 +216,59 @@ describe("acquireLock", () => {
       birthtimeNs: st.birthtimeNs.toString(),
     });
     await lock.release();
+  });
+});
+
+describe("borrowed lock lifetime (R17)", () => {
+  const POLL = { borrowCheck: 100 };
+
+  it("verify() passes while the lender holds the same lock directory", async () => {
+    const owner = await acquireLock(paths);
+    const borrowed = await acquireLock(paths, { ownerPid: process.pid }, POLL);
+    await expect(borrowed.verify()).resolves.toBeUndefined();
+    expect(borrowed.lost.aborted).toBe(false);
+    expect(borrowed.compromised).toBeUndefined();
+    await borrowed.release();
+    await owner.release();
+  });
+
+  it("detects a replaced lock directory: verify() throws LockLost and the lost signal aborts", async () => {
+    const owner = await acquireLock(paths);
+    const borrowed = await acquireLock(paths, { ownerPid: process.pid }, POLL);
+    await owner.release();
+    const other = await acquireLock(paths); // a concurrent rollback took the lock (same pid, new directory)
+    try {
+      await expect(borrowed.verify()).rejects.toBeInstanceOf(LockLost);
+      await until(async () => (borrowed.lost.aborted ? true : undefined), 5_000);
+      expect(borrowed.lost.reason).toBeInstanceOf(LockLost);
+      expect(borrowed.compromised).toBeInstanceOf(LockLost);
+      await borrowed.release(); // stops the watchdog; never touches the other holder's lock
+      expect((await readLockHolder(paths))?.pid).toBe(process.pid);
+    } finally {
+      await other.release();
+    }
+  });
+
+  it("detects a lender that died (SIGKILL) while its stale lock directory is still in place", async () => {
+    const child = await childHolder();
+    const borrowed = await acquireLock(paths, { ownerPid: child.pid as number }, { ...FAST, ...POLL });
+    expect(borrowed.borrowed).toBe(true);
+    const exited = new Promise((r) => child.once("exit", r));
+    child.kill("SIGKILL");
+    await exited;
+    expect(existsSync(paths.lock)).toBe(true);
+    await until(async () => (borrowed.lost.aborted ? true : undefined), 5_000);
+    const err = await borrowed.verify().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(LockLost);
+    expect((err as Error).message).toContain(`${child.pid}`);
+    await borrowed.release();
+  });
+
+  it("an owned lock's verify() throws once its directory was replaced", async () => {
+    const lock = await acquireLock(paths);
+    await rm(paths.lock, { recursive: true, force: true });
+    await mkdir(paths.lock);
+    await expect(lock.verify()).rejects.toBeInstanceOf(LockLost);
+    await rm(paths.lock, { recursive: true, force: true });
   });
 });

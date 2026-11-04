@@ -383,6 +383,60 @@ describe("failure handling", () => {
     }
   });
 
+  it("a borrowed lock lost to a concurrent rollback during the Pi install → commits nothing; the rollback's state and journal stay (R17)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, PREVIOUS_STATE);
+    await writeFile(paths.txn, TXN);
+    let lender = await acquireLock(paths);
+    const rollbackState = PREVIOUS_STATE.replace('"0.0.9","installedAt"', '"0.0.8","installedAt"');
+    const rollbackTxn = TXN.replace('"id":"t"', '"id":"rollback"');
+    const signals: boolean[] = [];
+    const pi = new (class extends FakePi {
+      override async installPackage(cli: string, ref: string, opts: PiRunOptions = {}): Promise<void> {
+        signals.push(opts.signal instanceof AbortSignal && !opts.signal.aborted);
+        // The lender ends (its lock is released) and a concurrent rollback takes the lock and commits.
+        await lender.release();
+        lender = await acquireLock(paths);
+        await writeFile(paths.state, rollbackState);
+        await writeFile(paths.txn, rollbackTxn);
+        await super.installPackage(cli, ref, opts);
+      }
+    })();
+    try {
+      const e = await applyRelease(ctx(pi, { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9", parentLockPid: process.pid }).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(Error);
+      expect(signals).toEqual([true]);
+      expect(readFileSync(paths.state, "utf8")).toBe(rollbackState);
+      expect(readFileSync(paths.txn, "utf8")).toBe(rollbackTxn);
+      expect(existsSync(paths.config)).toBe(false);
+      expect(err.join("\n")).toMatch(/Install did not complete: The factory lock .* is no longer held for this process/);
+    } finally {
+      await lender.release();
+    }
+  });
+
+  it("removes only the journal of the transaction it started under: another transaction's journal is kept (R17)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.txn, TXN);
+    const other = TXN.replace('"id":"t"', '"id":"other"');
+    const held = await acquireLock(paths);
+    const pi = new (class extends FakePi {
+      override async installPackage(cli: string, ref: string, opts: PiRunOptions = {}): Promise<void> {
+        await writeFile(paths.txn, other);
+        await super.installPackage(cli, ref, opts);
+      }
+    })();
+    try {
+      const e = await applyRelease(ctx(pi, { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9", parentLockPid: process.pid }).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(Error);
+      expect(readFileSync(paths.txn, "utf8")).toBe(other);
+      expect(err.join("\n")).toContain("records transaction other, not t");
+      expect(err.join("\n")).not.toContain("remove it");
+    } finally {
+      await held.release();
+    }
+  });
+
   it("--parent-lock borrows the parent's lock and leaves it held", async () => {
     const held = await acquireLock(paths);
     try {
