@@ -20,6 +20,13 @@ const PI_SCOPE = "@earendil-works/";
 /** Ruling 14: host-provided by Pi (docs/packages.md); the extension value-imports it for tool parameter schemas. */
 const EXTENSION_HOST_PACKAGES = ["typebox"];
 
+/**
+ * Ruling R36: the only adapter modules the extension zone may import (Phase 1's bounded process teardown). They may
+ * themselves import only node builtins and each other (rule `extension-shared-builtins-only`), so the exception never
+ * pulls another adapter or package into Pi.
+ */
+const EXTENSION_SHARED_ADAPTERS: readonly string[] = ["src/adapters/platform/process.ts", "src/adapters/platform/cmd-quote.ts"];
+
 function isHostPackage(spec: string): boolean {
   return EXTENSION_HOST_PACKAGES.some((p) => spec === p || spec.startsWith(`${p}/`));
 }
@@ -136,6 +143,11 @@ export function checkLayers(root: string): LayerViolation[] {
       const add = (rule: string) => violations.push({ file: rel, line: ref.line, specifier: ref.specifier, rule });
       const spec = ref.specifier;
       const isRelative = spec.startsWith("./") || spec.startsWith("../");
+      if (EXTENSION_SHARED_ADAPTERS.includes(rel)) {
+        const target = isRelative ? posix.normalize(posix.join(posix.dirname(rel), spec)) : undefined;
+        const ok = target !== undefined ? EXTENSION_SHARED_ADAPTERS.includes(target) : isBuiltin(spec);
+        if (!ok) add("extension-shared-builtins-only");
+      }
       if (isRelative) {
         const target = posix.normalize(posix.join(posix.dirname(rel), spec));
         const tz = zoneOf(target);
@@ -144,7 +156,7 @@ export function checkLayers(root: string): LayerViolation[] {
         else if (zone === "core" && tz === "cli") add("core-no-cli");
         if ((zone === "adapters" || zone === "extension") && tz === "cli") add("adapters-no-cli");
         if (tz === "extension" && zone !== "extension") add("no-import-extension");
-        if (zone === "extension" && tz !== "core" && tz !== "extension") add("extension-core-only");
+        if (zone === "extension" && tz !== "core" && tz !== "extension" && !EXTENSION_SHARED_ADAPTERS.includes(target)) add("extension-core-only");
         continue;
       }
       // Ruling R6: the extension runs inside Pi and needs Node builtins (fs/path/os) for the handshake.

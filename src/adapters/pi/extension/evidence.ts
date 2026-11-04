@@ -25,6 +25,7 @@ import { autonomyAllowsSkip, type AutonomyLevel } from "../../../core/policy/aut
 import { isSecretPath } from "../../../core/policy/paths.ts";
 import { LineRedactor, redact, summarizeCommand } from "../../../core/policy/redact.ts";
 import { currentRoute, RUN_CHECK_TOOL, type GatedChecks, type LedgerSink } from "./enforce.ts";
+import { killProcessTree, type ProcessDeps } from "../../platform/process.ts";
 import { canonicalDir, hostPlatform } from "./facts.ts";
 import { RunLedger } from "./ledger.ts";
 import { verifyRegisteredTool } from "./route-state.ts";
@@ -42,10 +43,8 @@ const TAIL_LINE_CHARS = 1000;
 const TAIL_BUFFER_CHARS = 256 * 1024;
 /** The log is the full output up to this size; beyond it the log says how much was dropped. */
 const LOG_MAX_BYTES = 64 * 1024 * 1024;
+/** After a failed teardown, pipes still held by a surviving process are released this late. */
 const KILL_GRACE_MS = 2000;
-const KILL_MAX_MS = 15_000;
-const TASKKILL_TIMEOUT_MS = 10_000;
-const POLL_MS = 50;
 const MAX_TEXT = 4000;
 const TREE_ID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 /** Ruling 11: task files change with progress, not with the work; they never count. */
@@ -215,74 +214,9 @@ export function resolveExecutable(argv0: string, cwd: string, deps: ResolveDeps 
 }
 
 // --- Process tree teardown (decision 5) ------------------------------------------------------------------------
-// The equivalent of Phase 1's `killProcessTree` (src/adapters/platform/process.ts), which the extension zone may not
-// import (layer rule `extension-core-only`): POSIX SIGTERM to the process group, SIGKILL after a grace period, poll
-// until gone; Windows an awaited, bounded `taskkill /PID <pid> /T /F`.
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
-
-function groupAlive(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function killGroup(pid: number): Promise<string | undefined> {
-  const send = (sig: NodeJS.Signals) => {
-    try {
-      process.kill(-pid, sig);
-    } catch {
-      // Group already gone.
-    }
-  };
-  const t0 = Date.now();
-  send("SIGTERM");
-  let killed = false;
-  while (groupAlive(pid)) {
-    if (Date.now() - t0 >= KILL_MAX_MS) return `process group ${pid} still alive after ${KILL_MAX_MS} ms`;
-    if (!killed && Date.now() - t0 >= KILL_GRACE_MS) {
-      send("SIGKILL");
-      killed = true;
-    }
-    await sleep(POLL_MS);
-  }
-  return undefined;
-}
-
-function taskkill(pid: number): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    const exe = process.env.SystemRoot ? `${process.env.SystemRoot}\\System32\\taskkill.exe` : "taskkill.exe";
-    let k: ChildProcess;
-    try {
-      k = spawn(exe, ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, shell: false });
-    } catch (e) {
-      resolve(`taskkill could not start: ${(e as Error).message}`);
-      return;
-    }
-    const timer = setTimeout(() => {
-      k.kill();
-      resolve(`taskkill did not finish within ${TASKKILL_TIMEOUT_MS} ms`);
-    }, TASKKILL_TIMEOUT_MS);
-    k.on("error", (e) => {
-      clearTimeout(timer);
-      resolve(`taskkill could not start: ${e.message}`);
-    });
-    k.on("close", () => {
-      clearTimeout(timer);
-      resolve(undefined);
-    });
-  });
-}
-
-/** Tears down the child's whole tree; resolves with a failure message when it could not. */
-function killTree(child: ChildProcess): Promise<string | undefined> {
-  const pid = child.pid;
-  if (pid === undefined) return Promise.resolve(undefined);
-  return process.platform === "win32" ? taskkill(pid) : killGroup(pid);
-}
+// Phase 1's `killProcessTree` (src/adapters/platform/process.ts, importable here by ruling R36): POSIX SIGTERM to the
+// process group, SIGKILL after a grace period, poll until gone; Windows an awaited, bounded `taskkill /PID <pid> /T /F`
+// whose non-zero exit is a teardown failure. `ProcessDeps` is its test seam.
 
 // --- Output: redacted log + bounded tail -----------------------------------------------------------------------
 
@@ -375,7 +309,7 @@ function signalCode(sig: NodeJS.Signals | null): number {
   return n === undefined ? 1 : 128 + n;
 }
 
-function runOne(step: ResolvedStep, cwd: string, deadline: number, signal: AbortSignal | undefined, out: CheckOutput): Promise<RunOutcome> {
+function runOne(step: ResolvedStep, cwd: string, deadline: number, signal: AbortSignal | undefined, out: CheckOutput, teardownDeps: Partial<ProcessDeps>): Promise<RunOutcome> {
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
@@ -404,15 +338,19 @@ function runOne(step: ResolvedStep, cwd: string, deadline: number, signal: Abort
       resolve({ exitCode: 127, timedOut: false, aborted: false });
       return;
     }
+    // killProcessTree releases the pipes itself after a successful teardown. After a failed one the tree may still
+    // run: the failure is noted, the pipes are released and the check ends now instead of waiting for `close`.
     const teardown = () =>
-      (killing ??= killTree(child).then((failure) => {
-        if (failure !== undefined) out.note(`process tree teardown failed: ${failure}`);
-        // A process outside the reachable tree may still hold the pipes: release them so the run ends.
-        setTimeout(() => {
+      (killing ??= killProcessTree(child, teardownDeps).then(
+        () => undefined,
+        (e: unknown) => {
+          out.note(`process tree teardown failed: ${(e as Error).message}`);
           child.stdout?.destroy();
           child.stderr?.destroy();
-        }, KILL_GRACE_MS).unref();
-      }));
+          out.flush();
+          finish({ exitCode: timedOut ? 124 : aborted ? 130 : (child.exitCode ?? 1), timedOut, aborted });
+        },
+      ));
     const onAbort = () => {
       aborted = true;
       void teardown();
@@ -434,13 +372,15 @@ function runOne(step: ResolvedStep, cwd: string, deadline: number, signal: Abort
       out.note(`could not start ${step.display}: ${e.message}`);
       finish({ exitCode: 127, timedOut: false, aborted: false });
     });
-    // POSIX: descendants left in the group when the leader exits would hold the pipes; a check leaves nothing behind.
+    // POSIX: descendants left in the group when the leader exits would hold the pipes; a check leaves nothing behind
+    // in its process group (a no-op when the group is already gone).
     child.on("exit", () => {
-      if (process.platform !== "win32" && child.pid !== undefined && groupAlive(child.pid)) void teardown();
+      if (process.platform !== "win32" && child.pid !== undefined) void teardown();
     });
     child.on("close", (code, sig) => {
       void (async () => {
         if (killing !== undefined) await killing;
+        if (settled) return;
         out.flush();
         const exitCode = timedOut ? 124 : aborted ? 130 : code ?? signalCode(sig);
         finish({ exitCode, timedOut, aborted });
@@ -449,12 +389,12 @@ function runOne(step: ResolvedStep, cwd: string, deadline: number, signal: Abort
   });
 }
 
-async function runSteps(steps: ResolvedStep[], cwd: string, timeoutMs: number, signal: AbortSignal | undefined, out: CheckOutput): Promise<RunOutcome> {
+async function runSteps(steps: ResolvedStep[], cwd: string, timeoutMs: number, signal: AbortSignal | undefined, out: CheckOutput, teardownDeps: Partial<ProcessDeps> = {}): Promise<RunOutcome> {
   const deadline = Date.now() + timeoutMs;
   let last: RunOutcome = { exitCode: 0, timedOut: false, aborted: false };
   for (const step of steps) {
     out.log(`$ ${step.display}\n`);
-    last = await runOne(step, cwd, deadline, signal, out);
+    last = await runOne(step, cwd, deadline, signal, out, teardownDeps);
     if (last.exitCode !== 0 || last.timedOut || last.aborted) {
       if (last.timedOut) out.note(`timed out after ${Math.round(timeoutMs / 1000)} s; the process tree was torn down`);
       if (last.aborted) out.note("cancelled; the process tree was torn down");
@@ -482,6 +422,8 @@ export interface EvidenceSession {
   projectCommands: string[][];
   declared: readonly DeclaredCommand[];
   gatedChecks: GatedChecks;
+  /** Test seam for `killProcessTree` (platform, taskkill); production uses its defaults. */
+  teardown?: Partial<ProcessDeps>;
 }
 
 export interface EvidenceDeps {
@@ -666,7 +608,7 @@ async function runCheck(s: EvidenceSession, toolCallId: string, params: { comman
   let outcome: RunOutcome;
   try {
     out.log(`# run_check ${id}\n# cwd: ${cwd}\n# command: ${summarizeCommand(cleared.command)}\n# fingerprint before: ${before}\n`);
-    outcome = await runSteps(steps, cwd, timeoutSec * 1000, signal, out);
+    outcome = await runSteps(steps, cwd, timeoutSec * 1000, signal, out, s.teardown);
   } catch (e) {
     out.note(`run failed: ${(e as Error).message}`);
     out.close();

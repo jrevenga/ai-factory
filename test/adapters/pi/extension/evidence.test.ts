@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,6 +67,7 @@ const SCRIPTS: Record<string, string> = {
     'const c = spawn(process.execPath, ["scripts/sleeper.mjs"], { stdio: "ignore" });',
     'mkdirSync("out", { recursive: true });',
     'writeFileSync("out/grandchild.pid", String(c.pid));',
+    'writeFileSync("out/hang.pid", String(process.pid));',
     'console.log("hanging");',
     "setInterval(() => {}, 1000);",
   ].join("\n"),
@@ -90,7 +92,15 @@ interface ToolLike {
 
 let seq = 0;
 
-async function world(opts: { declared?: Array<{ name: string; argv: string[] }>; autonomy?: AutonomyLevel; softened?: SoftGateId[]; effectiveTools?: () => Array<{ name: string; parameters: unknown }> } = {}) {
+async function world(
+  opts: {
+    declared?: Array<{ name: string; argv: string[] }>;
+    autonomy?: AutonomyLevel;
+    softened?: SoftGateId[];
+    effectiveTools?: () => Array<{ name: string; parameters: unknown }>;
+    teardown?: EvidenceSession["teardown"];
+  } = {},
+) {
   const t = await makeTmp("evidence");
   cleanups.push(t.cleanup);
   const dir = realpathSync.native(t.dir);
@@ -131,6 +141,7 @@ async function world(opts: { declared?: Array<{ name: string; argv: string[] }>;
     projectCommands: declared.map((d) => d.argv),
     declared,
     gatedChecks,
+    ...(opts.teardown !== undefined ? { teardown: opts.teardown } : {}),
   };
   const tools: ToolLike[] = [];
   const pi = {
@@ -470,6 +481,32 @@ describe("run_check", () => {
     const pid = Number(readFileSync(join(x.project, "out", "grandchild.pid"), "utf8"));
     expect(pid).toBeGreaterThan(0);
     expect(alive(pid)).toBe(false);
+  }, 30_000);
+
+  it.skipIf(isWin)("R36: a failed teardown (taskkill exiting non-zero) is noted in the log and does not hang the check", async () => {
+    const failing = () => {
+      const k = new EventEmitter() as EventEmitter & { kill(): void };
+      k.kill = () => undefined;
+      setTimeout(() => k.emit("close", 1, null), 10);
+      return k as never;
+    };
+    const x = await world({ teardown: { platform: "win32", spawnTaskkill: failing, taskkillTimeoutMs: 1000 } });
+    setRoute(x.small);
+    const r = await x.check("node scripts/hang.mjs", { timeoutSec: 1 });
+    try {
+      expect(r.record).toMatchObject({ exitCode: 124, timedOut: true });
+      const log = readFileSync(r.record!.logPath, "utf8");
+      expect(log).toContain("process tree teardown failed");
+      expect(log).toContain("taskkill exited with 1");
+    } finally {
+      // The fake taskkill left the tree running: end it here.
+      const leader = Number(readFileSync(join(x.project, "out", "hang.pid"), "utf8"));
+      try {
+        process.kill(-leader, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
   }, 30_000);
 
   it.skipIf(isWin)("refuses a check log directory that is a symbolic link", async () => {
