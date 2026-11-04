@@ -144,8 +144,12 @@ function writeAction(ev: ToolCallLike, tool: "write" | "edit", f: ActionFacts): 
     else if (tool === "write") touches = touchesMachine(currentText, content!);
     else touches = editTouchesMachine(currentText, edits!);
   }
-  const display = tool === "edit" ? `edit ${p} (${edits!.length} replacement(s))` : `write ${p}`;
-  const summary = summarizeCommand(display);
+  const summary = summarizeCommand(tool === "edit" ? `edit ${p} (${edits!.length} replacement(s))` : `write ${p}`);
+  // N3: the owner approves what is written, not only where.
+  const display =
+    tool === "edit"
+      ? [`edit ${p}`, ...edits!.flatMap((e, i) => [`--- replacement ${i + 1}: old text ---`, e.oldText, `--- replacement ${i + 1}: new text ---`, e.newText])].join("\n")
+      : [`write ${p}`, "--- content ---", content!].join("\n");
   const action: ToolAction = { kind: "write", tool, path: fact, touchesMachineSection: touches, targetExists };
   if (!protectedFile || cur.kind === "error") return { action, summary, display };
   return { action, summary, display, machine: { file: fact.resolved, input: p, before: cur.kind === "text" ? cur.text : undefined } };
@@ -316,30 +320,76 @@ export interface GateUi {
 }
 
 /**
- * R31: allowed calls that may change the filesystem, from their decision until their result. Pi's default parallel
- * tool execution runs every `tool_call` hook of a batch before executing any call, so the facts of a later call
- * would predate an earlier call's effects; while this set is not empty, further top-level calls are blocked.
+ * R31 (amended): every allowed call, with whether it may change the filesystem, from its decision until its result.
+ * Pi's default parallel tool execution runs every `tool_call` hook of a batch before executing any call, so facts
+ * of one call could predate another call's effects. Within a group (the top-level calls, or the nested calls of
+ * one running parent), a call is denied while a mutating call is in flight, and a mutating call is denied while
+ * any call is in flight. A nested call is also checked against its ancestors' groups, the ancestors excluded.
  * Sequential execution is unaffected (`tool_result` fires before the next `tool_call`).
  */
 export class InFlightCalls {
-  private readonly ids = new Set<string>();
+  private static readonly TOP = "";
+  /** group key (TOP or a parent's toolCallId) → (toolCallId → may mutate). */
+  private readonly groups = new Map<string, Map<string, boolean>>();
+  private readonly groupOf = new Map<string, string>();
 
-  add(toolCallId: string): void {
-    this.ids.add(toolCallId);
+  /** The group a call with this parent joins: the parent's when the parent is in flight, else the top level. */
+  groupFor(parentToolCallId: string | undefined): string {
+    return parentToolCallId !== undefined && this.groupOf.has(parentToolCallId) ? parentToolCallId : InFlightCalls.TOP;
   }
-  /** Called at `tool_result` and `tool_execution_end` (the latter also fires for calls another hook blocked). */
+
+  /** Why a call joining `group` must wait, or undefined. */
+  conflict(group: string, mutating: boolean): string | undefined {
+    let key = group;
+    let exclude: string | undefined;
+    for (;;) {
+      for (const [id, m] of this.groups.get(key) ?? []) {
+        if (id === exclude) continue;
+        if (m) return "another call that may change files is still running";
+        if (mutating) return "this call may change files while other calls are still running";
+      }
+      if (key === InFlightCalls.TOP) return undefined;
+      exclude = key;
+      key = this.groupOf.get(key) ?? InFlightCalls.TOP;
+    }
+  }
+
+  add(toolCallId: string, group: string, mutating: boolean): void {
+    let g = this.groups.get(group);
+    if (g === undefined) this.groups.set(group, (g = new Map()));
+    g.set(toolCallId, mutating);
+    this.groupOf.set(toolCallId, group);
+  }
+
+  /** Called at `tool_result` and `tool_execution_end`; also drops the call's own nested calls. */
   done(toolCallId: string): void {
-    this.ids.delete(toolCallId);
+    const group = this.groupOf.get(toolCallId);
+    if (group !== undefined) {
+      this.groups.get(group)?.delete(toolCallId);
+      this.groupOf.delete(toolCallId);
+    }
+    const nested = this.groups.get(toolCallId);
+    if (nested !== undefined) {
+      this.groups.delete(toolCallId);
+      for (const id of [...nested.keys()]) {
+        this.groupOf.delete(id);
+        this.done(id);
+      }
+    }
   }
+
   has(toolCallId: string): boolean {
-    return this.ids.has(toolCallId);
+    return this.groupOf.has(toolCallId);
   }
+
   get size(): number {
-    return this.ids.size;
+    return this.groupOf.size;
   }
+
   /** Backstop at `agent_settled` / `session_shutdown`. */
   clear(): void {
-    this.ids.clear();
+    this.groups.clear();
+    this.groupOf.clear();
   }
 }
 
@@ -388,6 +438,20 @@ interface Outcome {
 
 const deny = (reason: string): Outcome => ({ decision: "deny", reason, block: `${BLOCK_PREFIX}: ${reason}` });
 
+/** Control, format (bidi, zero-width) and non-space separator characters other than space, tab and newline. */
+const HIDDEN = /[^\S \t\n]|[\p{C}]/gu;
+
+/** R33/N3: every character a terminal could hide or reinterpret becomes a visible `\u{…}` escape. */
+export function visible(text: string): { text: string; escaped: boolean } {
+  let escaped = false;
+  const out = text.replace(HIDDEN, (ch) => {
+    if (ch === " " || ch === "\t" || ch === "\n") return ch;
+    escaped = true;
+    return `\\u{${ch.codePointAt(0)!.toString(16)}}`;
+  });
+  return { text: out, escaped };
+}
+
 async function resolveAsk(r: GateResult, tool: string, display: string, ui: GateUi | undefined): Promise<Outcome> {
   const label = r.hardGate ?? r.class ?? "unclassified";
   if (ui === undefined) return deny(`requires human approval (${label}): ${r.reason}`);
@@ -395,7 +459,17 @@ async function resolveAsk(r: GateResult, tool: string, display: string, ui: Gate
   if (display.length > MAX_APPROVAL_CHARS) {
     return deny(`too long to approve safely (${display.length} > ${MAX_APPROVAL_CHARS} characters; ${label}): ${r.reason}`);
   }
-  const message = [`Tool: ${tool}`, `Reason: ${r.reason}`, "", "Action (exactly as it will run):", display, "", "Allow this call?"].join("\n");
+  const shown = visible(display);
+  const message = [
+    `Tool: ${tool}`,
+    `Reason: ${r.reason}`,
+    "",
+    "Action (exactly as it will run):",
+    shown.text,
+    ...(shown.escaped ? ["", "Warning: control or invisible characters are shown as \\u{…} escapes."] : []),
+    "",
+    "Allow this call?",
+  ].join("\n");
   const ok = await confirmWithTimeout(ui, `Factory gate: ${label}`, message);
   if (ok) return { decision: "allow (approved)", reason: `approved by the user: ${r.reason}` };
   const reason = `rejected by the user or not answered within ${CONFIRM_TIMEOUT_MS / 1000} s (${label}): ${r.reason}`;
@@ -424,23 +498,21 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
   let summary = summarizeCommand(ev.toolName);
   let r: GateResult;
   let prepared: PreparedAction | undefined;
-  const nestedInFlight = ev.parentToolCallId !== undefined && deps.inFlight.has(ev.parentToolCallId);
+  const group = deps.inFlight.groupFor(ev.parentToolCallId);
+  let mutating = true;
   try {
     const policy = deps.policyContext();
     prepared = prepareAction(ev, { cwd: ctx.cwd, home: deps.home, projectCommands: policy.projectCommands, factoryTools: deps.factoryTools });
     summary = prepared.summary;
-    if (deps.inFlight.size > 0 && !nestedInFlight) {
-      r = {
-        decision: "deny",
-        reason: "another call that may change files is still running: re-issue this call after the previous call finishes (R31)",
-        reconcile: false,
-      };
-    } else {
-      r = evaluateGate(prepared.action, policy);
+    r = evaluateGate(prepared.action, policy);
+    mutating = mayMutate(prepared.action, r);
+    // R31: decided before any ask, so the owner is never asked about a call that would race another one.
+    const busy = r.decision === "deny" ? undefined : deps.inFlight.conflict(group, mutating);
+    if (busy !== undefined) {
+      r = { ...r, decision: "deny", reason: `${busy}: re-issue this call after the previous call finishes (R31)`, reconcile: false };
+    } else if (r.decision === "allow" && r.reconcile) {
       // R29: ruling 5 allows answer-route runners only with reconciliation, which Task 11 adds.
-      if (r.decision === "allow" && r.reconcile) {
-        r = { ...r, decision: "deny", reason: "answer-route runner reconciliation is not available yet: declare a change route with set_route", reconcile: false };
-      }
+      r = { ...r, decision: "deny", reason: "answer-route runner reconciliation is not available yet: declare a change route with set_route", reconcile: false };
     }
   } catch (e) {
     r = { decision: "deny", reason: `policy error (fail closed): ${(e as Error).message}`, reconcile: false };
@@ -475,7 +547,7 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
 
   if (outcome.block !== undefined || prepared === undefined) return { block: true, reason: outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}` };
   // Task 11: when the gate returns `reconcile: true`, take the snapshot here instead of the R29 deny above.
-  if (!nestedInFlight && mayMutate(prepared.action, r)) deps.inFlight.add(ev.toolCallId);
+  deps.inFlight.add(ev.toolCallId, group, mutating);
   if (prepared.machine !== undefined) deps.postChecks.remember(ev.toolCallId, prepared.machine);
   return undefined;
 }
