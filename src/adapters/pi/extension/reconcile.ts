@@ -5,8 +5,9 @@
 // run; the index file is the only `.git` file written, and only after it is backed up). Reconciliation never follows
 // a symlink: entries are examined with lstat, links are copied as links, and a restore below a parent directory that
 // became a symlink is refused (R39). Git-ignored outputs are left alone. `<backupDir>/manifest.json` holds everything
-// needed to finish the job after an interruption (Task 13: `loadSnapshot` + `reconcileAfter`); it holds hashes and
-// metadata, never file contents.
+// needed to finish the job after an interruption (Task 13: `loadSnapshot` + `reconcileAfter`), and `journal.jsonl`
+// the operations a reconcile completed, so a replay never discards preserved `after*` content; both hold hashes, paths
+// and metadata, never file contents.
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -42,8 +43,6 @@ export interface SnapshotLimits {
 }
 export const UNTRACKED_LIMITS: SnapshotLimits = { maxUntrackedFiles: 2000, maxUntrackedBytes: 50 * 1024 * 1024 };
 export const MANIFEST_FILE = "manifest.json";
-/** The note names at most this many paths per list; the ledger event and the manifest name all of them. */
-export const NOTE_MAX_PATHS = 100;
 /** Bound for git listings and for one blob read back from the object database. */
 const GIT_MAX_BUFFER = 1024 * 1024 * 1024;
 const CHUNK = 1024 * 1024;
@@ -97,13 +96,18 @@ export interface ReconcileResult {
   elsewhere?: Record<string, string>;
   /** True when nothing changed and the backup directory was removed. */
   backupRemoved?: boolean;
+  /** Proven unused but kept (`removeUnused: false`): the caller removes it once the result is audited. */
+  unused?: boolean;
 }
 
 /** The manifest (`<backupDir>/manifest.json`) and the in-memory snapshot are the same object. */
 export interface Snapshot {
   v: 1;
-  /** `pending` from the snapshot until `reconcileAfter` finishes; then `done` with `result`. */
-  status: "pending" | "done";
+  /**
+   * `pending` from the snapshot; `reconciling` once `reconcileAfter` started (operations so far are in
+   * `journal.jsonl`); `done` with `result` when it finished.
+   */
+  status: "pending" | "reconciling" | "done";
   createdAt: string;
   /** Realpath of the work tree top. */
   root: string;
@@ -508,16 +512,95 @@ export function loadSnapshot(backupDir: string): Snapshot {
 
 // --- Reconcile --------------------------------------------------------------------------------------------------
 
+/** `<backupDir>/journal.jsonl`: one line per completed operation, so a replay reports and never discards them. */
+export const JOURNAL_FILE = "journal.jsonl";
+
+/** One completed reconcile operation (journal line). `aside`: an entry copied or moved into `after*`. */
+export interface JournalOp {
+  op: "aside" | "moved" | "reverted" | "index";
+  path: string;
+  /** Absolute location of the copy for `aside` and `moved`. */
+  copy?: string;
+}
+
+export interface ReconcileOptions {
+  /**
+   * Default true: a backup directory proven unused (nothing changed, no journal, no `after*` content) is removed.
+   * The Reconciler passes false and removes it only once the `reconciled` event is in the ledger.
+   */
+  removeUnused?: boolean;
+  /** Test seam: called after every journaled operation; a throw simulates a crash at that point. */
+  onOperation?: (op: JournalOp) => void;
+}
+
+/** A throw from `onOperation`: it propagates past every per-entry error handler, like a crash. */
+class Interrupted extends Error {
+  readonly original: unknown;
+  constructor(original: unknown) {
+    super("interrupted");
+    this.original = original;
+  }
+}
+
+function rethrowInterrupt(e: unknown): void {
+  if (e instanceof Interrupted) throw e;
+}
+
+function readJournal(backupDir: string): JournalOp[] {
+  let text: string;
+  try {
+    text = readFileSync(path.join(backupDir, JOURNAL_FILE), "utf8");
+  } catch {
+    return [];
+  }
+  const ops: JournalOp[] = [];
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    try {
+      ops.push(JSON.parse(line) as JournalOp);
+    } catch {
+      // A torn last line from a crash mid-append: the operation is redone or found done.
+    }
+  }
+  return ops;
+}
+
+/** True when any `after` or `after-<n>` entry exists in the backup directory (preserved content). */
+function hasAfterContent(backupDir: string): boolean {
+  try {
+    return readdirSync(backupDir).some((n) => n === "after" || /^after-\d+$/.test(n));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * R39 for entries moved into `after*` (a rename keeps their modes): directories 0700 and files 0600, descendants
+ * included. Symlinks are skipped, never followed. Best effort on Windows.
+ */
+function privatizeTree(p: string): void {
+  const st = lstatSync(p);
+  if (st.isSymbolicLink()) return;
+  try {
+    chmodSync(p, st.isDirectory() ? DIR_MODE : FILE_MODE);
+  } catch (e) {
+    if (!isWin) throw e;
+  }
+  if (st.isDirectory()) for (const name of readdirSync(p)) privatizeTree(path.join(p, name));
+}
+
 class Restorer {
   readonly result: ReconcileResult;
   private readonly elsewhere: Record<string, string> = {};
-
   private readonly s: Snapshot;
   private readonly gitBytes: GitBytes;
+  private readonly onOperation: ((op: JournalOp) => void) | undefined;
+  journaled = 0;
 
-  constructor(s: Snapshot, gitBytes: GitBytes) {
+  constructor(s: Snapshot, gitBytes: GitBytes, onOperation?: (op: JournalOp) => void) {
     this.s = s;
     this.gitBytes = gitBytes;
+    this.onOperation = onOperation;
     this.result = { reverted: [], moved: [], notRestored: [], skipped: [...s.skipped], indexRestored: false, backupDir: s.backupDir };
   }
 
@@ -525,22 +608,33 @@ class Restorer {
     return this.elsewhere;
   }
 
+  /** Appends a completed operation to the journal (before anything else happens). */
+  record(op: JournalOp): void {
+    writeFileSync(path.join(this.s.backupDir, JOURNAL_FILE), `${JSON.stringify(op)}\n`, { flag: "a", mode: FILE_MODE });
+    this.journaled++;
+    if (this.onOperation !== undefined) {
+      try {
+        this.onOperation(op);
+      } catch (e) {
+        throw new Interrupted(e);
+      }
+    }
+  }
+
   /** `after/<rel>`, or `after-<n>/<rel>` when that place is taken (the location is recorded). */
-  private afterPath(rel: string, allowExistingDir = false): string {
+  private afterPath(rel: string): string {
     for (let n = 1; n < 1000; n++) {
       const base = path.join(this.s.backupDir, n === 1 ? "after" : `after-${n}`);
       const dst = abs(base, rel);
-      const parentsOk = (() => {
-        let cur = path.dirname(dst);
-        while (cur.length > base.length) {
-          const k = kindOf(cur);
-          if (k !== "dir" && k !== "missing") return false;
-          cur = path.dirname(cur);
+      let parentsOk = true;
+      for (let cur = path.dirname(dst); cur.length > base.length; cur = path.dirname(cur)) {
+        const k = kindOf(cur);
+        if (k !== "dir" && k !== "missing") {
+          parentsOk = false;
+          break;
         }
-        return true;
-      })();
-      const k = kindOf(dst);
-      if (parentsOk && (k === "missing" || (allowExistingDir && k === "dir"))) {
+      }
+      if (parentsOk && kindOf(dst) === "missing") {
         mkdirsPrivate(this.s.backupDir, path.dirname(dst));
         if (n > 1) this.elsewhere[rel] = dst;
         return dst;
@@ -553,33 +647,41 @@ class Restorer {
   private copyAside(rel: string): void {
     const dst = this.afterPath(rel);
     readRegular(abs(this.s.root, rel), "sha1", dst);
+    this.record({ op: "aside", path: rel, copy: dst });
   }
 
   /**
    * Moves the entry at `rel` (file, symlink, directory or other) to `after/`: a rename, or across filesystems a
-   * copy (links as links) followed by the removal of the original. An empty directory whose place in `after/` is
-   * already a directory (its content was moved there first) is removed.
+   * copy (links as links) followed by the removal of the original; either way the moved entries get the R39 modes.
+   * An empty directory whose place in `after/` is already a directory (its content was moved there first) is
+   * removed. Returns the copy location (undefined when nothing was there or the empty directory was removed).
    */
-  moveAside(rel: string): void {
+  moveAside(rel: string, record = true): string | undefined {
     const src = abs(this.s.root, rel);
     const k = kindOf(src);
-    if (k === "missing") return;
+    if (k === "missing") return undefined;
     if (k === "dir" && readdirSync(src).length === 0) {
       const dst = abs(path.join(this.s.backupDir, "after"), rel);
       if (kindOf(dst) === "dir") {
         rmdirSync(src);
-        return;
+        return undefined;
       }
     }
     const dst = this.afterPath(rel);
+    let renamed = false;
     try {
       renameSync(src, dst);
-      return;
+      renamed = true;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EXDEV") throw e;
     }
-    copyTree(src, dst);
-    rmSync(src, { recursive: true, force: false });
+    if (renamed) privatizeTree(dst);
+    else {
+      copyTree(src, dst);
+      rmSync(src, { recursive: true, force: false });
+    }
+    if (record) this.record({ op: "aside", path: rel, copy: dst });
+    return dst;
   }
 
   /**
@@ -668,72 +770,93 @@ class Restorer {
         }
       }
       const now = stateOf(this.s.root, rel, "sha1");
-      if (sameState(now, want)) this.result.reverted.push(rel);
-      else this.result.notRestored.push(`${rel} (it does not match the snapshot after the restore)`);
+      if (sameState(now, want)) {
+        this.result.reverted.push(rel);
+        this.record({ op: "reverted", path: rel });
+      } else this.result.notRestored.push(`${rel} (it does not match the snapshot after the restore)`);
     } catch (e) {
+      rethrowInterrupt(e);
       this.result.notRestored.push(`${rel} (${(e as Error).message})`);
     }
   }
 
-  /**
-   * Restores the index file from `backupDir/index` through `index.lock` (git's own lock protocol: a concurrent git
-   * command holding the lock wins and the index is reported as not restored). Runs first, so the replaced index is
-   * always `after/index`.
-   */
-  restoreIndex(): void {
-    const s = this.s;
-    const curKind = kindOf(s.indexFile);
-    const aside = path.join(s.backupDir, "after", "index");
-    if (curKind !== "missing" && curKind !== "file") {
-      this.result.notRestored.push(`(index) (${s.indexFile} is not a regular file)`);
-      return;
-    }
-    if (!s.indexExisted) {
-      if (curKind === "missing") return;
-      try {
-        this.copyFileTo(s.indexFile, aside);
-        unlinkSync(s.indexFile);
-        this.result.indexRestored = true;
-      } catch (e) {
-        this.result.notRestored.push(`(index) (${(e as Error).message})`);
-      }
-      return;
-    }
-    const want = readFileSync(path.join(s.backupDir, "index"));
-    if (curKind === "file" && readFileSync(s.indexFile).equals(want)) return;
-    const lock = `${s.indexFile}.lock`;
-    let fd: number;
-    try {
-      if (curKind === "file") this.copyFileTo(s.indexFile, aside);
-      fd = openSync(lock, "wx", 0o644);
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code;
-      this.result.notRestored.push(code === "EEXIST" ? `(index) (${lock} exists: another git command holds the index; it was not restored)` : `(index) (${(e as Error).message})`);
-      return;
-    }
-    try {
-      writeAll(fd, want);
-      closeSync(fd);
-      renameSync(lock, s.indexFile);
-      this.result.indexRestored = true;
-    } catch (e) {
-      try {
-        closeSync(fd);
-      } catch {
-        // Already closed.
-      }
-      try {
-        unlinkSync(lock);
-      } catch {
-        // Already renamed or gone.
-      }
-      this.result.notRestored.push(`(index) (${(e as Error).message})`);
+  /** `after/index`, or `after/index-<n>` when a replay already put an index there. */
+  private indexAside(): string {
+    const dir = path.join(this.s.backupDir, "after");
+    mkdirsPrivate(this.s.backupDir, dir);
+    for (let n = 1; ; n++) {
+      const dst = path.join(dir, n === 1 ? "index" : `index-${n}`);
+      if (kindOf(dst) === "missing") return dst;
     }
   }
 
-  private copyFileTo(src: string, dst: string): void {
-    mkdirsPrivate(this.s.backupDir, path.dirname(dst));
-    readRegular(src, "sha1", dst);
+  /**
+   * Restores the index file from `backupDir/index` under `index.lock` (git's own lock protocol), which is taken
+   * before the current index is inspected and held through its copy into `after/` and its replacement or removal.
+   * A concurrent git command holding the lock wins: the index is then neither inspected nor touched, and reported.
+   */
+  restoreIndex(): void {
+    const s = this.s;
+    const lock = `${s.indexFile}.lock`;
+    let fd: number;
+    try {
+      fd = openSync(lock, "wx", 0o644);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      this.result.notRestored.push(
+        code === "EEXIST" ? `(index) (${lock} exists: another git command holds the index; it was neither checked nor restored)` : `(index) (${(e as Error).message})`,
+      );
+      return;
+    }
+    let open = true;
+    let renamed = false;
+    try {
+      const curKind = kindOf(s.indexFile);
+      if (curKind !== "missing" && curKind !== "file") throw new Error(`${s.indexFile} is not a regular file`);
+      if (!s.indexExisted) {
+        if (curKind === "file") {
+          const dst = this.indexAside();
+          readRegular(s.indexFile, "sha1", dst);
+          this.record({ op: "aside", path: "(index)", copy: dst });
+          unlinkSync(s.indexFile);
+          this.result.indexRestored = true;
+          this.record({ op: "index", path: "(index)" });
+        }
+        return;
+      }
+      const want = readFileSync(path.join(s.backupDir, "index"));
+      if (curKind === "file" && readFileSync(s.indexFile).equals(want)) return;
+      if (curKind === "file") {
+        const dst = this.indexAside();
+        readRegular(s.indexFile, "sha1", dst);
+        this.record({ op: "aside", path: "(index)", copy: dst });
+      }
+      writeAll(fd, want);
+      closeSync(fd);
+      open = false;
+      renameSync(lock, s.indexFile);
+      renamed = true;
+      this.result.indexRestored = true;
+      this.record({ op: "index", path: "(index)" });
+    } catch (e) {
+      rethrowInterrupt(e);
+      this.result.notRestored.push(`(index) (${(e as Error).message})`);
+    } finally {
+      if (open) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Already closed.
+        }
+      }
+      if (!renamed) {
+        try {
+          unlinkSync(lock);
+        } catch {
+          // Gone already.
+        }
+      }
+    }
   }
 }
 
@@ -754,114 +877,173 @@ function copyTree(src: string, dst: string): void {
   }
 }
 
+function union(a: string[], b: string[]): string[] {
+  return [...new Set([...a, ...b])];
+}
+
 /**
- * Reverts what changed since `snapshot` in its work tree (`root` must be the snapshot's root): new untracked
- * non-ignored entries are moved to `after/`; tracked files and pre-existing untracked files whose state changed are
- * copied (or moved) to `after/` and restored from `before/` or from their index blob, each verified against its
- * snapshot hash before it is written and after; the index is copied to `after/index` and restored. A concurrent user
- * edit cannot be told apart from the command's: it is reverted too, with its content kept in `after/`. When nothing
- * changed the backup directory is removed. The manifest records the result (`status: "done"`).
+ * Reverts what changed since `snapshot` in its work tree (`root` must be the snapshot's root): the index is restored
+ * under `index.lock`; new untracked non-ignored entries are moved to `after/`; tracked files and pre-existing
+ * untracked files whose state changed are copied (or moved) to `after/` and restored from `before/` or from their
+ * index blob, each verified against its snapshot hash before it is written and after. A concurrent user edit cannot be
+ * told apart from the command's: it is reverted too, with its content kept in `after/`.
+ *
+ * Replay-safe (Task 13): the manifest says `reconciling` while this runs and every completed operation is journaled
+ * (`journal.jsonl`); a replay redoes what is left, reports the journaled operations too, and never removes `after*`
+ * content. The backup directory is removed only when it is proven unused (nothing changed in this run, no journal
+ * and no `after*` entry) and `removeUnused` is not false. Otherwise the manifest records the result (`done`).
  */
-export function reconcileAfter(root: string, snapshot: Snapshot): ReconcileResult {
+export function reconcileAfter(root: string, snapshot: Snapshot, opts: ReconcileOptions = {}): ReconcileResult {
   const s = snapshot;
   const top = realpathSync.native(root);
   if (top !== s.root) throw new Error(`reconcile root ${top} is not the snapshot root ${s.root}`);
   if (kindOf(s.root) !== "dir") throw new Error(`${s.root} is no longer a directory`);
-  const result = withSafeGit((_git, gitBytes) => {
-    const r = new Restorer(s, gitBytes);
-    const env = readEnv(s.backupDir);
-
-    // 0. The index (the listings below read the snapshot's copy, so the order does not change them).
-    r.restoreIndex();
-    const trackedPaths = new Set(s.tracked.map((t) => t.path));
-    const known = new Set(s.untracked.map((u) => u.path));
-    const skippedNested = new Set(s.skipped.filter((x) => x.endsWith(" (nested repository)")).map((x) => x.slice(0, -" (nested repository)".length)));
-
-    // 1. New untracked non-ignored entries (relative to the snapshot's index) are moved aside first: this also frees
-    //    paths where the command put a file, a directory or a symlink in place of a tracked file's parent.
-    for (const p of untrackedPaths(gitBytes, s.root, env)) {
-      const rel = p.endsWith("/") ? p.slice(0, -1) : p;
-      if (known.has(rel) || trackedPaths.has(rel) || skippedNested.has(rel)) continue;
+  const prior = readJournal(s.backupDir);
+  s.status = "reconciling";
+  saveManifest(s);
+  let journaled = 0;
+  let result: ReconcileResult;
+  try {
+    result = withSafeGit((_git, gitBytes) => {
+      const r = new Restorer(s, gitBytes, opts.onOperation);
       try {
-        const blocker = blockingParent(s.root, rel);
-        if (blocker !== undefined) {
-          r.result.notRestored.push(`${rel} (below ${blocker}, which is not a directory: left in place)`);
-          continue;
-        }
-        r.moveAside(rel);
-        r.result.moved.push(rel);
-      } catch (e) {
-        r.result.notRestored.push(`${rel} (could not be moved aside: ${(e as Error).message})`);
+        reconcilePhases(r, s, gitBytes);
+      } finally {
+        journaled = r.journaled;
       }
-    }
+      const elsewhere = r.elsewhereMap;
+      return Object.keys(elsewhere).length > 0 ? { ...r.result, elsewhere } : r.result;
+    });
+  } catch (e) {
+    if (e instanceof Interrupted) throw e.original;
+    throw e;
+  }
 
-    // 2. Tracked files. Each entry fails on its own: an unreadable file is reported, the others are still restored.
-    const cache = new Map<string, Kind>();
-    const changed: TrackedEntry[] = [];
-    for (const t of s.tracked) {
-      try {
-        if (!sameState(stateOf(s.root, t.path, "sha1", cache), t.state)) changed.push(t);
-      } catch (e) {
-        r.result.notRestored.push(`${t.path} (its current state cannot be read: ${(e as Error).message})`);
-      }
-    }
-    for (const t of changed) {
-      try {
-        // Fresh state: an earlier restore may have moved a blocker.
-        r.restore(t.path, t.state, stateOf(s.root, t.path, "sha1"), t.backup, t.oid);
-      } catch (e) {
-        r.result.notRestored.push(`${t.path} (${(e as Error).message})`);
-      }
-    }
-
-    // 3. Pre-existing untracked files (R38).
-    for (const u of s.untracked) {
-      try {
-        const cur = stateOf(s.root, u.path, "sha1");
-        if (!sameState(cur, u.state)) r.restore(u.path, u.state, cur, true, "");
-      } catch (e) {
-        r.result.notRestored.push(`${u.path} (${(e as Error).message})`);
-      }
-    }
-    const elsewhere = r.elsewhereMap;
-    return Object.keys(elsewhere).length > 0 ? { ...r.result, elsewhere } : r.result;
-  });
+  // Operations completed by an interrupted earlier run are part of this call's result.
+  result.reverted = union(prior.filter((o) => o.op === "reverted").map((o) => o.path), result.reverted);
+  result.moved = union(prior.filter((o) => o.op === "moved").map((o) => o.path), result.moved);
+  if (prior.some((o) => o.op === "index")) result.indexRestored = true;
 
   const nothing = result.reverted.length === 0 && result.moved.length === 0 && result.notRestored.length === 0 && !result.indexRestored;
-  if (nothing) {
-    // Every original is in place and unchanged: the copies are redundant.
+  const unused = nothing && prior.length === 0 && journaled === 0 && !hasAfterContent(s.backupDir);
+  if (unused && opts.removeUnused !== false) {
+    // Every original is in place and unchanged and nothing was ever set aside: the copies are redundant.
     rmSync(s.backupDir, { recursive: true, force: true });
     return { ...result, backupRemoved: true };
   }
+  if (unused) result.unused = true;
   s.status = "done";
   s.result = result;
   saveManifest(s);
   return result;
 }
 
-// --- Note and enforce wiring ------------------------------------------------------------------------------------
+function reconcilePhases(r: Restorer, s: Snapshot, gitBytes: GitBytes): void {
+  const env = readEnv(s.backupDir);
+  // 0. The index (the listings below read the snapshot's copy, so the order does not change them).
+  r.restoreIndex();
+  const trackedPaths = new Set(s.tracked.map((t) => t.path));
+  const known = new Set(s.untracked.map((u) => u.path));
+  const skippedNested = new Set(s.skipped.filter((x) => x.endsWith(" (nested repository)")).map((x) => x.slice(0, -" (nested repository)".length)));
 
-function list(paths: string[], backupDir: string): string {
-  if (paths.length <= NOTE_MAX_PATHS) return paths.join(", ");
-  return `${paths.slice(0, NOTE_MAX_PATHS).join(", ")} and ${paths.length - NOTE_MAX_PATHS} more (all listed in ${path.join(backupDir, MANIFEST_FILE)})`;
+  // 1. New untracked non-ignored entries (relative to the snapshot's index) are moved aside first: this also frees
+  //    paths where the command put a file, a directory or a symlink in place of a tracked file's parent.
+  for (const p of untrackedPaths(gitBytes, s.root, env)) {
+    const rel = p.endsWith("/") ? p.slice(0, -1) : p;
+    if (known.has(rel) || trackedPaths.has(rel) || skippedNested.has(rel)) continue;
+    try {
+      const blocker = blockingParent(s.root, rel);
+      if (blocker !== undefined) {
+        r.result.notRestored.push(`${rel} (below ${blocker}, which is not a directory: left in place)`);
+        continue;
+      }
+      const copy = r.moveAside(rel, false);
+      r.result.moved.push(rel);
+      r.record({ op: "moved", path: rel, ...(copy !== undefined ? { copy } : {}) });
+    } catch (e) {
+      rethrowInterrupt(e);
+      r.result.notRestored.push(`${rel} (could not be moved aside: ${(e as Error).message})`);
+    }
+  }
+
+  // 2. Tracked files. Each entry fails on its own: an unreadable file is reported, the others are still restored.
+  const cache = new Map<string, Kind>();
+  const changed: TrackedEntry[] = [];
+  for (const t of s.tracked) {
+    try {
+      if (!sameState(stateOf(s.root, t.path, "sha1", cache), t.state)) changed.push(t);
+    } catch (e) {
+      r.result.notRestored.push(`${t.path} (its current state cannot be read: ${(e as Error).message})`);
+    }
+  }
+  for (const t of changed) {
+    try {
+      // Fresh state: an earlier restore may have moved a blocker.
+      r.restore(t.path, t.state, stateOf(s.root, t.path, "sha1"), t.backup, t.oid);
+    } catch (e) {
+      rethrowInterrupt(e);
+      r.result.notRestored.push(`${t.path} (${(e as Error).message})`);
+    }
+  }
+
+  // 3. Pre-existing untracked files (R38).
+  for (const u of s.untracked) {
+    try {
+      const cur = stateOf(s.root, u.path, "sha1");
+      if (!sameState(cur, u.state)) r.restore(u.path, u.state, cur, true, "");
+    } catch (e) {
+      rethrowInterrupt(e);
+      r.result.notRestored.push(`${u.path} (${(e as Error).message})`);
+    }
+  }
 }
 
-/** The note appended to the tool result; undefined when there is nothing to tell. */
+// --- Note and enforce wiring ------------------------------------------------------------------------------------
+
+/** Paths per content block when a result names many files (every path is named; there is no cap). */
+export const NOTE_PATHS_PER_BLOCK = 500;
+
+/**
+ * The note appended to the tool result, as one or more text blocks; empty when there is nothing to tell. Every
+ * affected path is named: a short result is one block, a long one a summary block followed by blocks of at most
+ * `NOTE_PATHS_PER_BLOCK` paths.
+ */
+export function reconcileNotes(r: ReconcileResult): string[] {
+  const sections: Array<[string, string[]]> = [];
+  if (r.reverted.length > 0) sections.push(["reverted", r.reverted]);
+  if (r.moved.length > 0) sections.push(["moved aside (new files)", r.moved]);
+  if (r.notRestored.length > 0) sections.push(["not restored (check these before continuing):", r.notRestored]);
+  if (r.skipped.length > 0) sections.push(["not reconciled (skipped):", r.skipped]);
+  const flags = r.indexRestored ? ["index restored"] : [];
+  if (sections.length === 0 && flags.length === 0) return [];
+  const removed = r.backupRemoved === true;
+  const head = removed ? "Answer-route reconciliation: nothing to revert" : `Reverted on the answer route (copies in ${r.backupDir})`;
+  const sep = removed ? "; " : ": ";
+  const total = sections.reduce((n, [, ps]) => n + ps.length, 0);
+  if (total <= NOTE_PATHS_PER_BLOCK) {
+    return [`${head}${sep}${[...sections.map(([label, ps]) => `${label} ${ps.join(", ")}`), ...flags].join("; ")}`];
+  }
+  const blocks = [`${head}${sep}${[...sections.map(([label, ps]) => `${label} ${ps.length} path(s)`), ...flags].join("; ")}; every path follows`];
+  for (const [label, ps] of sections) {
+    for (let i = 0; i < ps.length; i += NOTE_PATHS_PER_BLOCK) {
+      blocks.push(`${label}${i > 0 ? " (continued)" : ""} ${ps.slice(i, i + NOTE_PATHS_PER_BLOCK).join(", ")}`);
+    }
+  }
+  return blocks;
+}
+
+/** The note as one string (blocks joined by newlines); undefined when there is nothing to tell. */
 export function reconcileNote(r: ReconcileResult): string | undefined {
-  const parts: string[] = [];
-  if (r.reverted.length > 0) parts.push(`reverted ${list(r.reverted, r.backupDir)}`);
-  if (r.moved.length > 0) parts.push(`moved aside (new files) ${list(r.moved, r.backupDir)}`);
-  if (r.indexRestored) parts.push("index restored");
-  if (r.notRestored.length > 0) parts.push(`not restored (check these before continuing): ${list(r.notRestored, r.backupDir)}`);
-  if (r.skipped.length > 0) parts.push(`not reconciled (skipped): ${list(r.skipped, r.backupDir)}`);
-  if (parts.length === 0) return undefined;
-  if (r.backupRemoved === true) return `Answer-route reconciliation: nothing to revert; ${parts.join("; ")}`;
-  return `Reverted on the answer route (copies in ${r.backupDir}): ${parts.join("; ")}`;
+  const blocks = reconcileNotes(r);
+  return blocks.length === 0 ? undefined : blocks.join("\n");
 }
 
 interface Sink {
   append(e: RunEvent): void;
 }
+
+/** Where a reconcile problem the model also sees is reported to the person (UI notification or stderr). */
+export type Diagnose = (message: string) => void;
 
 type Content = ToolResultEvent["content"];
 
@@ -879,7 +1061,6 @@ export interface ResultLike {
  */
 export class Reconciler {
   private readonly pending = new Map<string, { snapshot: Snapshot; parent?: string }>();
-
   private readonly runDir: string;
 
   constructor(runDir: string) {
@@ -915,63 +1096,80 @@ export class Reconciler {
     rmSync(p.snapshot.backupDir, { recursive: true, force: true });
   }
 
-  /** Reconciles the call (after its nested calls) and appends the note to its result; undefined when there is nothing to add. */
-  finish(ev: ResultLike, ledger: Sink, runId: string): { content: Content; structuredContent?: ToolResultEvent["structuredContent"] } | undefined {
-    const notes = this.finishTree(ev.toolCallId, ledger, runId);
+  /** Reconciles the call (after its nested calls) and appends the note blocks to its result; undefined when there is nothing to add. */
+  finish(ev: ResultLike, ledger: Sink, runId: string, diagnose?: Diagnose): { content: Content; structuredContent?: ToolResultEvent["structuredContent"] } | undefined {
+    const notes = this.finishTree(ev.toolCallId, ledger, runId, diagnose);
     if (notes.length === 0) return undefined;
     const content: Content = [...ev.content, ...notes.map((n) => ({ type: "text" as const, text: `\n[factory] ${n}` }))];
     return { content, ...(ev.structuredContent !== undefined ? { structuredContent: ev.structuredContent } : {}) };
   }
 
-  /** Reconciles a call that ended without a result the extension can amend. */
-  finishId(toolCallId: string, ledger: Sink, runId: string): void {
-    this.finishTree(toolCallId, ledger, runId);
+  /** Reconciles a call that ended without a result the extension can amend (problems go to `diagnose`). */
+  finishId(toolCallId: string, ledger: Sink, runId: string, diagnose?: Diagnose): void {
+    this.finishTree(toolCallId, ledger, runId, diagnose);
   }
 
   /** Backstop: every pending call, latest first. */
-  finishAll(ledger: Sink, runId: string): void {
-    for (const id of [...this.pending.keys()].reverse()) this.finishTree(id, ledger, runId);
+  finishAll(ledger: Sink, runId: string, diagnose?: Diagnose): void {
+    for (const id of [...this.pending.keys()].reverse()) this.finishTree(id, ledger, runId, diagnose);
   }
 
-  private finishTree(toolCallId: string, ledger: Sink, runId: string): string[] {
+  private finishTree(toolCallId: string, ledger: Sink, runId: string, diagnose: Diagnose | undefined): string[] {
     const notes: string[] = [];
     const children = [...this.pending.entries()].filter(([, p]) => p.parent === toolCallId).map(([id]) => id);
-    for (const id of children.reverse()) notes.push(...this.finishTree(id, ledger, runId));
+    for (const id of children.reverse()) notes.push(...this.finishTree(id, ledger, runId, diagnose));
     const p = this.pending.get(toolCallId);
     if (p === undefined) return notes;
     this.pending.delete(toolCallId);
     const backupDir = p.snapshot.backupDir;
+    const auditFailed = (what: string, error: string) => {
+      const message = `the ${what} for answer-route call ${toolCallId} could not be written to the run ledger (${error}); the snapshot, manifest and copies are kept in ${backupDir}`;
+      notes.push(message);
+      diagnose?.(`factory: ${message}`);
+    };
+    let r: ReconcileResult;
     try {
-      const r = reconcileAfter(p.snapshot.root, p.snapshot);
-      append(ledger, {
-        v: 1,
-        ts: new Date().toISOString(),
-        runId,
-        type: "reconciled",
-        toolCallId,
-        reverted: r.reverted,
-        moved: r.moved,
-        backupDir,
-        ...(r.notRestored.length > 0 ? { notRestored: r.notRestored } : {}),
-        ...(r.skipped.length > 0 ? { skipped: r.skipped } : {}),
-        ...(r.indexRestored ? { indexRestored: true } : {}),
-        ...(r.backupRemoved === true ? { backupRemoved: true } : {}),
-      });
-      const note = reconcileNote(r);
-      if (note !== undefined) notes.push(note);
+      r = reconcileAfter(p.snapshot.root, p.snapshot, { removeUnused: false });
     } catch (e) {
       const message = `reconciliation of answer-route call ${toolCallId} failed (${(e as Error).message}); the snapshot and copies are in ${backupDir}: check the working tree before continuing`;
-      append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile", message });
       notes.push(message);
+      diagnose?.(`factory: ${message}`);
+      const err = append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile", message });
+      if (err !== undefined) auditFailed("error event", err);
+      return notes;
     }
+    const remove = r.unused === true;
+    const err = append(ledger, {
+      v: 1,
+      ts: new Date().toISOString(),
+      runId,
+      type: "reconciled",
+      toolCallId,
+      reverted: r.reverted,
+      moved: r.moved,
+      backupDir,
+      ...(r.notRestored.length > 0 ? { notRestored: r.notRestored } : {}),
+      ...(r.skipped.length > 0 ? { skipped: r.skipped } : {}),
+      ...(r.indexRestored ? { indexRestored: true } : {}),
+      ...(remove ? { backupRemoved: true } : {}),
+    });
+    if (err === undefined && remove) {
+      // The audit says the backup was redundant; only now is it removed.
+      rmSync(backupDir, { recursive: true, force: true });
+      r = { ...r, backupRemoved: true };
+    }
+    notes.push(...reconcileNotes(r));
+    if (err !== undefined) auditFailed("reconciled event", err);
     return notes;
   }
 }
 
-function append(ledger: Sink, e: RunEvent): void {
+/** Appends the event; the error message when the ledger refused it. */
+function append(ledger: Sink, e: RunEvent): string | undefined {
   try {
     ledger.append(e);
-  } catch {
-    // The note still reaches the model; a ledger failure itself cannot be audited.
+    return undefined;
+  } catch (err) {
+    return (err as Error).message;
   }
 }

@@ -376,13 +376,15 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     });
   });
 
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx) => {
     const session = await sessionNow();
     if (session === undefined) return undefined;
     try {
       const post = session.postChecks.afterToolResult(event, session.ledger, session.runId);
       // Task 11: the call's own result reconciles its snapshot (and its nested calls'), after the post-check.
-      const reconciled = session.reconciler.finish(post === undefined ? event : { ...event, content: post.content ?? event.content }, session.ledger, session.runId);
+      const reconciled = session.reconciler.finish(post === undefined ? event : { ...event, content: post.content ?? event.content }, session.ledger, session.runId, (m) =>
+        report(ctx, m),
+      );
       return reconciled ?? post;
     } finally {
       session.inFlight.done(event.toolCallId);
@@ -391,26 +393,26 @@ export default function factoryExtension(pi: ExtensionAPI): void {
 
   // Fires for every call, also for one a later extension's hook blocked (which gets no tool_result); Pi emits it after
   // `tool_result`, so a call reconciled there is already gone.
-  pi.on("tool_execution_end", async (event) => {
+  pi.on("tool_execution_end", async (event, ctx) => {
     const session = await sessionNow();
     if (session === undefined) return;
-    session.reconciler.finishId(event.toolCallId, session.ledger, session.runId);
+    session.reconciler.finishId(event.toolCallId, session.ledger, session.runId, (m) => report(ctx, m));
     session.inFlight.done(event.toolCallId);
   });
 
   // Backstop (review M4): nothing is in flight once the agent has settled.
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (_event, ctx) => {
     const session = await sessionNow();
-    session?.reconciler.finishAll(session.ledger, session.runId);
+    session?.reconciler.finishAll(session.ledger, session.runId, (m) => report(ctx, m));
     session?.inFlight.clear();
     session?.postChecks.clear();
     session?.gatedChecks.clear();
   });
 
-  pi.on("session_shutdown", async (event) => {
+  pi.on("session_shutdown", async (event, ctx) => {
     const session = await sessionNow();
     if (session === undefined) return;
-    session.reconciler.finishAll(session.ledger, session.runId);
+    session.reconciler.finishAll(session.ledger, session.runId, (m) => report(ctx, m));
     session.inFlight.clear();
     session.postChecks.clear();
     session.gatedChecks.clear();

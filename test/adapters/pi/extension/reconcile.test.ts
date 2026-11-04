@@ -416,3 +416,164 @@ describe("Reconciler (enforce wiring)", () => {
     expect(rec.size).toBe(0);
   });
 });
+
+describe("fix round 1", () => {
+  it("I1: a replay after an interruption that began restoring never deletes preserved after/ content and reports the earlier operations", async () => {
+    const r = await repo();
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    // The runner only creates a new file: once it is moved aside, nothing is left to restore.
+    writeFileSync(join(r.root, "src", "new.txt"), "only copy of this content\n");
+    let ops = 0;
+    expect(() =>
+      reconcileAfter(r.root, snap, {
+        onOperation: () => {
+          if (++ops === 1) throw new Error("simulated crash");
+        },
+      }),
+    ).toThrow("simulated crash");
+    expect(existsSync(join(r.root, "src", "new.txt"))).toBe(false);
+    expect(read(join(bd, "after", "src", "new.txt"))).toBe("only copy of this content\n");
+    expect(loadSnapshot(bd).status).toBe("reconciling");
+
+    const res = reconcileAfter(r.root, loadSnapshot(bd));
+    expect(res.moved).toEqual(["src/new.txt"]);
+    expect(res.backupRemoved).toBeUndefined();
+    expect(read(join(bd, "after", "src", "new.txt"))).toBe("only copy of this content\n");
+    expect(loadSnapshot(bd).status).toBe("done");
+  });
+
+  it("I1: a replay after a crash between a move aside and the restore finishes the restore and keeps every copy", async () => {
+    const r = await repo();
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    writeFileSync(join(r.root, "src", "a.txt"), "runner a\n");
+    writeFileSync(join(r.root, "src", "b.txt"), "runner b\n");
+    writeFileSync(join(r.root, "created.txt"), "runner created\n");
+    let ops = 0;
+    expect(() =>
+      reconcileAfter(r.root, snap, {
+        onOperation: () => {
+          if (++ops === 2) throw new Error("simulated crash");
+        },
+      }),
+    ).toThrow("simulated crash");
+    const res = reconcileAfter(r.root, loadSnapshot(bd));
+    expect(res.moved).toEqual(["created.txt"]);
+    expect(res.reverted.sort()).toEqual(["src/a.txt", "src/b.txt"]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("a original\n");
+    expect(read(join(r.root, "src", "b.txt"))).toBe("b original\n");
+    expect(read(join(bd, "after", "created.txt"))).toBe("runner created\n");
+    expect(read(join(bd, "after", "src", "a.txt"))).toBe("runner a\n");
+    expect(read(join(bd, "after", "src", "b.txt"))).toBe("runner b\n");
+  });
+
+  it("I2: while another git command holds index.lock the current index is neither inspected nor copied nor replaced", async () => {
+    const r = await repo();
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    git(r.root, "update-index", "--add", "--cacheinfo", `100644,${git(r.root, "rev-parse", "HEAD:README.md")},staged.txt`);
+    const indexAfterRunner = readFileSync(join(r.root, ".git", "index"));
+    writeFileSync(join(r.root, ".git", "index.lock"), "");
+    const res = reconcileAfter(r.root, snap);
+    expect(res.indexRestored).toBe(false);
+    expect(res.notRestored).toEqual([expect.stringContaining("index.lock")]);
+    expect(existsSync(join(bd, "after", "index"))).toBe(false);
+    expect(readFileSync(join(r.root, ".git", "index")).equals(indexAfterRunner)).toBe(true);
+    expect(read(join(r.root, ".git", "index.lock"))).toBe("");
+  });
+
+  it("I2: an index created by the runner (none at snapshot) is moved aside only under index.lock", async () => {
+    const t = await makeTmp("reconcile-noindex");
+    cleanups.push(t.cleanup);
+    const root = join(realpathSync.native(t.dir), "project");
+    mkdirSync(root);
+    git(root, "init", "-q");
+    expect(existsSync(join(root, ".git", "index"))).toBe(false);
+    const bd = join(t.dir, "backup");
+    const snap = takeSnapshot(root, bd);
+    expect(snap.indexExisted).toBe(false);
+    writeFileSync(join(root, "f.txt"), "f\n");
+    git(root, "add", "f.txt");
+    writeFileSync(join(root, ".git", "index.lock"), "");
+    const held = reconcileAfter(root, snap);
+    expect(held.notRestored).toEqual([expect.stringContaining("index.lock")]);
+    expect(existsSync(join(root, ".git", "index"))).toBe(true);
+    unlinkSync(join(root, ".git", "index.lock"));
+    const res = reconcileAfter(root, loadSnapshot(bd));
+    expect(res.indexRestored).toBe(true);
+    expect(existsSync(join(root, ".git", "index"))).toBe(false);
+    expect(existsSync(join(root, ".git", "index.lock"))).toBe(false);
+    expect(existsSync(join(bd, "after", "index"))).toBe(true);
+  });
+
+  it.skipIf(isWin)("I3: entries moved into after/ by a same-filesystem rename get 0700 directories and 0600 files, descendants included, without following symlinks", async () => {
+    const r = await repo();
+    const outside = join(r.dir, "outside.txt");
+    writeFileSync(outside, "outside\n");
+    chmodSync(outside, 0o644);
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    // A tracked file replaced by a directory tree, and a new untracked tree.
+    unlinkSync(join(r.root, "README.md"));
+    mkdirSync(join(r.root, "README.md", "sub"), { recursive: true });
+    writeFileSync(join(r.root, "README.md", "sub", "deep.txt"), "deep\n");
+    chmodSync(join(r.root, "README.md", "sub", "deep.txt"), 0o755);
+    symlinkSync(outside, join(r.root, "README.md", "sub", "link"));
+    chmodSync(join(r.root, "README.md", "sub"), 0o755);
+    mkdirSync(join(r.root, "gen"));
+    writeFileSync(join(r.root, "gen", "x.txt"), "x\n");
+    chmodSync(join(r.root, "gen", "x.txt"), 0o644);
+    const res = reconcileAfter(r.root, snap);
+    expect(res.notRestored).toEqual([]);
+    const after = join(bd, "after");
+    const modes: Array<[string, number]> = [];
+    for (const rel of readdirSync(after, { recursive: true }) as string[]) {
+      const st = lstatSync(join(after, rel));
+      if (st.isSymbolicLink()) continue;
+      modes.push([rel, st.mode & 0o777]);
+      expect(st.mode & 0o777, rel).toBe(st.isDirectory() ? 0o700 : 0o600);
+    }
+    expect(modes.map(([p]) => p)).toEqual(expect.arrayContaining([join("README.md", "sub", "deep.txt"), join("gen", "x.txt")]));
+    expect(lstatSync(join(after, "README.md", "sub", "link")).isSymbolicLink()).toBe(true);
+    expect(statSync(outside).mode & 0o777).toBe(0o644);
+  });
+
+  it("I4: a ledger append failure is surfaced in the result and the diagnostics, also on a no-op reconcile, and the backup is kept", async () => {
+    const r = await repo();
+    const rec = new Reconciler(r.runDir);
+    const failing = { append: () => { throw new Error("disk full"); } };
+    const diagnostics: string[] = [];
+    const bd = rec.begin("c1", undefined, r.root);
+    const out = rec.finish({ toolCallId: "c1", content: [{ type: "text", text: "ok" }], isError: false }, failing, "run-1", (m) => diagnostics.push(m));
+    const text = JSON.stringify(out?.content);
+    expect(text).toContain("could not be written to the run ledger");
+    expect(text).toContain("disk full");
+    expect(diagnostics).toEqual([expect.stringContaining("disk full")]);
+    expect(existsSync(join(bd, MANIFEST_FILE))).toBe(true);
+
+    const bd2 = rec.begin("c2", undefined, r.root);
+    writeFileSync(join(r.root, "README.md"), "runner\n");
+    const out2 = rec.finish({ toolCallId: "c2", content: [], isError: false }, failing, "run-1", (m) => diagnostics.push(m));
+    expect(JSON.stringify(out2?.content)).toContain("could not be written to the run ledger");
+    expect(JSON.stringify(out2?.content)).toContain("README.md");
+    expect(existsSync(join(bd2, "after", "README.md"))).toBe(true);
+    expect(diagnostics).toHaveLength(2);
+  });
+
+  it("I5: the result names every affected file, without a cap", async () => {
+    const r = await repo();
+    for (let i = 0; i < 150; i++) writeFileSync(join(r.root, "src", `t${i}.txt`), `t${i}\n`);
+    git(r.root, "add", "-A");
+    git(r.root, "commit", "-q", "-m", "many");
+    const rec = new Reconciler(r.runDir);
+    rec.begin("c1", undefined, r.root);
+    for (let i = 0; i < 150; i++) writeFileSync(join(r.root, "src", `t${i}.txt`), "runner\n");
+    for (let i = 0; i < 700; i++) writeFileSync(join(r.root, `new-${i}.txt`), "n\n");
+    const out = rec.finish({ toolCallId: "c1", content: [], isError: false }, { append: () => undefined }, "run-1");
+    const text = (out?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("\n");
+    for (let i = 0; i < 150; i++) expect(text).toContain(`src/t${i}.txt`);
+    for (let i = 0; i < 700; i++) expect(text).toContain(`new-${i}.txt`);
+    expect(text).not.toContain("more (all listed in");
+  });
+});
