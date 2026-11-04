@@ -729,6 +729,72 @@ describe("Task 13: replayInterrupted (startup replay of an interrupted run's rec
     expect(read(join(base, "odd", "after", "x"))).toBe("keep\n");
   });
 
+  it("fix round 1 (I2): nested snapshots are replayed innermost first, by the persisted sequence, whatever the directory names", async () => {
+    const r = await repo();
+    const rec = new Reconciler(r.runDir);
+    // Directory names sort parent first ("a_parent" < "z-child"): replaying by name would end at the parent's
+    // intermediate content B instead of the original.
+    rec.begin("a|parent", undefined, r.root);
+    writeFileSync(join(r.root, "src", "a.txt"), "B parent intermediate\n");
+    rec.begin("z-child", "a|parent", r.root);
+    writeFileSync(join(r.root, "src", "a.txt"), "C child\n");
+    // Killed: neither call got its tool_result.
+    const parent = loadSnapshot(join(r.runDir, "reconcile", "a_parent"));
+    const child = loadSnapshot(join(r.runDir, "reconcile", "z-child"));
+    expect(parent).toMatchObject({ toolCallId: "a|parent", seq: 1 });
+    expect(child).toMatchObject({ toolCallId: "z-child", parentToolCallId: "a|parent", seq: 2 });
+    const s = sink();
+    const out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(out.map((o) => o.kind)).toEqual(["replayed", "replayed"]);
+    expect(s.events.map((e) => (e.type === "reconciled" ? e.toolCallId : e.type))).toEqual(["z-child", "a|parent"]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("a original\n");
+    expect(read(join(r.runDir, "reconcile", "z-child", "after", "src", "a.txt"))).toBe("C child\n");
+    expect(read(join(r.runDir, "reconcile", "a_parent", "after", "src", "a.txt"))).toBe("B parent intermediate\n");
+  });
+
+  it("fix round 1 (I2): manifests without a sequence (before this change) are replayed newest first by createdAt", async () => {
+    const r = await repo();
+    const base = join(r.runDir, "reconcile");
+    const older = takeSnapshot(r.root, join(base, "a-older"));
+    writeFileSync(join(r.root, "src", "a.txt"), "B intermediate\n");
+    const newer = takeSnapshot(r.root, join(base, "z-newer"));
+    writeFileSync(join(r.root, "src", "a.txt"), "C\n");
+    // Pin distinct creation times (the snapshots can fall in the same millisecond).
+    for (const [snap, at] of [[older, "2026-11-04T10:00:00.000Z"], [newer, "2026-11-04T10:00:01.000Z"]] as const) {
+      const file = join(snap.backupDir, "manifest.json");
+      const m = JSON.parse(read(file)) as Record<string, unknown>;
+      delete m.seq;
+      writeFileSync(file, JSON.stringify({ ...m, createdAt: at }));
+    }
+    const s = sink();
+    replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(s.events.map((e) => (e.type === "reconciled" ? e.toolCallId : e.type))).toEqual(["z-newer", "a-older"]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("a original\n");
+  });
+
+  it.skipIf(isWin || isRoot)("fix round 1 (I4): an unreadable reconcile directory is reported (notes, diagnostics, ledger error) and kept for a retry", async () => {
+    const r = await repo();
+    const bd = join(r.runDir, "reconcile", "call-x");
+    takeSnapshot(r.root, bd);
+    const base = join(r.runDir, "reconcile");
+    chmodSync(base, 0o000);
+    const s = sink();
+    const diag: string[] = [];
+    let out: ReturnType<typeof replayInterrupted>;
+    try {
+      out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9", (m) => diag.push(m));
+    } finally {
+      chmodSync(base, 0o700);
+    }
+    expect(out).toEqual([{ dir: base, kind: "kept", notes: [expect.stringMatching(/cannot be read \(EACCES.*kept for a retry/)] }]);
+    expect(diag).toEqual([expect.stringContaining("EACCES")]);
+    expect(s.events).toEqual([expect.objectContaining({ type: "error", where: "reconcile-replay", message: expect.stringContaining("EACCES") })]);
+    expect(loadSnapshot(bd).status).toBe("pending");
+    // A missing directory is the only "nothing to do".
+    rmSync(base, { recursive: true });
+    expect(replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9")).toEqual([]);
+  });
+
   it("a stale index.lock left by a SIGKILL is reported as index not checked and left in place", async () => {
     const r = await repo();
     const bd = join(r.runDir, "reconcile", "call-c");

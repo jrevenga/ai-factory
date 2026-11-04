@@ -126,6 +126,22 @@ export interface Snapshot {
   untracked: UntrackedEntry[];
   skipped: string[];
   result?: ReconcileResult;
+  /** Fix round 1 (Task 13): the call this snapshot belongs to (audited on a replay instead of the directory name). */
+  toolCallId?: string;
+  /** The running call the snapshotted call was nested in (`ctx.executeTool`), when it was nested. */
+  parentToolCallId?: string;
+  /**
+   * Snapshot order within the run (1, 2, ...): a nested call is always snapshotted after its parent, so a replay in
+   * descending order reconciles innermost first. Manifests written before this field fall back to `createdAt`.
+   */
+  seq?: number;
+}
+
+/** What `takeSnapshot` records about the call besides the work tree (fix round 1, Task 13). */
+export interface SnapshotMeta {
+  toolCallId?: string;
+  parentToolCallId?: string;
+  seq?: number;
 }
 
 // --- Filesystem helpers (never follow a symlink) ----------------------------------------------------------------
@@ -378,7 +394,7 @@ function readEnv(backupDir: string): Record<string, string> {
  * every tracked file, and the manifest. Throws `ReconcileRefusal` (and removes `backupDir`) on any failure or over
  * the untracked limits: the runner must not run without a valid snapshot.
  */
-export function takeSnapshot(root: string, backupDir: string, limits: SnapshotLimits = UNTRACKED_LIMITS): Snapshot {
+export function takeSnapshot(root: string, backupDir: string, limits: SnapshotLimits = UNTRACKED_LIMITS, meta: SnapshotMeta = {}): Snapshot {
   let top: string;
   try {
     top = realpathSync.native(root);
@@ -387,7 +403,7 @@ export function takeSnapshot(root: string, backupDir: string, limits: SnapshotLi
   }
   createBackupDir(backupDir);
   try {
-    return withSafeGit((git, gitBytes) => snapshotIn(git, gitBytes, top, backupDir, limits));
+    return withSafeGit((git, gitBytes) => snapshotIn(git, gitBytes, top, backupDir, limits, meta));
   } catch (e) {
     rmSync(backupDir, { recursive: true, force: true });
     if (e instanceof ReconcileRefusal) throw e;
@@ -395,7 +411,7 @@ export function takeSnapshot(root: string, backupDir: string, limits: SnapshotLi
   }
 }
 
-function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string, limits: SnapshotLimits): Snapshot {
+function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string, limits: SnapshotLimits, meta: SnapshotMeta): Snapshot {
   const show = git(top, ["rev-parse", "--show-toplevel"]);
   if (show.status !== 0 || show.stdout.trim() === "") throw new ReconcileRefusal(`${top} is not a git work tree: answer-route runners are reconciled with git`);
   const repoTop = realpathSync.native(path.resolve(top, show.stdout.trim()));
@@ -488,6 +504,9 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
     tracked,
     untracked,
     skipped,
+    ...(meta.toolCallId !== undefined ? { toolCallId: meta.toolCallId } : {}),
+    ...(meta.parentToolCallId !== undefined ? { parentToolCallId: meta.parentToolCallId } : {}),
+    ...(meta.seq !== undefined ? { seq: meta.seq } : {}),
   };
   saveManifest(snapshot);
   return snapshot;
@@ -1137,6 +1156,8 @@ export interface ResultLike {
 export class Reconciler {
   private readonly pending = new Map<string, { snapshot: Snapshot; parent?: string }>();
   private readonly runDir: string;
+  /** Snapshot order of this run, persisted in each manifest (`seq`) for a startup replay. */
+  private seq = 0;
 
   constructor(runDir: string) {
     this.runDir = runDir;
@@ -1158,7 +1179,11 @@ export class Reconciler {
 
   /** Takes the snapshot for `toolCallId`; throws `ReconcileRefusal` when the runner must not run. Returns the backup dir. */
   begin(toolCallId: string, parentToolCallId: string | undefined, root: string): string {
-    const snapshot = takeSnapshot(root, this.dirFor(toolCallId));
+    const snapshot = takeSnapshot(root, this.dirFor(toolCallId), UNTRACKED_LIMITS, {
+      toolCallId,
+      ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
+      seq: ++this.seq,
+    });
     this.pending.set(toolCallId, { snapshot, ...(parentToolCallId !== undefined ? { parent: parentToolCallId } : {}) });
     return snapshot.backupDir;
   }
@@ -1267,45 +1292,81 @@ export interface ReplayOutcome {
  * is never removed. A directory without a manifest is a snapshot that never completed, so its runner never ran: it is
  * removed, unless it holds a journal or `after*` content (then it is kept and reported). `done` manifests are left.
  * A stale `index.lock` (from a git command, or from a reconcile killed while it held the lock) is reported as "index
- * not checked" and never removed. Call it only for a run this process claimed (`ledger.reconcile`).
+ * not checked" and never removed.
+ *
+ * Fix round 1: the manifests are replayed in reverse snapshot order (`seq`, descending), which is innermost first as in
+ * `Reconciler.finishTree`; directory names never decide the order. Manifests written before `seq` existed are ordered
+ * by `createdAt` (then the manifest's mtime), newest first. Only a missing `reconcile/` directory means "nothing to
+ * do": any other failure to list it or an entry is reported (notes, `diagnose`, a ledger `error` event) and the
+ * content is left for a retry. Call it only while holding the run's replay claim (`ledger.claimReplay`).
  */
 export function replayInterrupted(runDir: string, ledger: Sink, runId: string, diagnose?: Diagnose): ReplayOutcome[] {
   const base = path.join(runDir, "reconcile");
+  const out: ReplayOutcome[] = [];
+  const failed = (dir: string, message: string): void => {
+    diagnose?.(`factory: ${message}`);
+    const err = append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile-replay", message });
+    out.push({ dir, kind: "kept", notes: [err === undefined ? message : `${message} (the error could not be written to the run ledger: ${err})`] });
+  };
   let names: string[];
   try {
     names = readdirSync(base).sort();
-  } catch {
-    return [];
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return [];
+    failed(base, `the reconcile directory ${base} cannot be read (${(e as Error).message}): its answer-route reconciles were kept for a retry at a later startup; check the working tree before continuing`);
+    return out;
   }
-  const out: ReplayOutcome[] = [];
+  const pending: Array<{ name: string; snapshot: Snapshot; mtime: number }> = [];
   for (const name of names) {
     const dir = path.join(base, name);
-    if (kindOf(dir) !== "dir") continue;
-    if (kindOf(path.join(dir, MANIFEST_FILE)) === "missing") {
-      if (kindOf(path.join(dir, JOURNAL_FILE)) === "missing" && !hasAfterContent(dir)) {
-        rmSync(dir, { recursive: true, force: true });
-        out.push({ dir, kind: "removed", notes: [] });
-      } else {
-        const message = `${dir} holds reconcile copies but no manifest: it was kept; check it before continuing`;
-        diagnose?.(`factory: ${message}`);
-        out.push({ dir, kind: "kept", notes: [message] });
-      }
-      continue;
-    }
-    let snapshot: Snapshot;
     try {
-      snapshot = loadSnapshot(dir);
+      if (kindOf(dir) !== "dir") continue;
+      const manifest = path.join(dir, MANIFEST_FILE);
+      if (kindOf(manifest) === "missing") {
+        if (kindOf(path.join(dir, JOURNAL_FILE)) === "missing" && !hasAfterContent(dir)) {
+          rmSync(dir, { recursive: true, force: true });
+          out.push({ dir, kind: "removed", notes: [] });
+        } else {
+          const message = `${dir} holds reconcile copies but no manifest: it was kept; check it before continuing`;
+          diagnose?.(`factory: ${message}`);
+          out.push({ dir, kind: "kept", notes: [message] });
+        }
+        continue;
+      }
+      let snapshot: Snapshot;
+      try {
+        snapshot = loadSnapshot(dir);
+      } catch (e) {
+        failed(dir, `the reconcile manifest in ${dir} cannot be read (${(e as Error).message}): it was kept; check the working tree before continuing`);
+        continue;
+      }
+      if (snapshot.status !== "pending" && snapshot.status !== "reconciling") continue;
+      pending.push({ name, snapshot, mtime: lstatSync(manifest).mtimeMs });
     } catch (e) {
-      const message = `the reconcile manifest in ${dir} cannot be read (${(e as Error).message}): it was kept; check the working tree before continuing`;
-      diagnose?.(`factory: ${message}`);
-      append(ledger, { v: 1, ts: new Date().toISOString(), runId, type: "error", where: "reconcile-replay", message });
-      out.push({ dir, kind: "kept", notes: [message] });
-      continue;
+      failed(dir, `${dir} cannot be examined (${(e as Error).message}): it was kept for a retry at a later startup; check the working tree before continuing`);
     }
-    if (snapshot.status !== "pending" && snapshot.status !== "reconciling") continue;
-    out.push({ dir, kind: "replayed", notes: reconcileAudited(name, snapshot, ledger, runId, diagnose) });
+  }
+  pending.sort(replayOrder);
+  for (const p of pending) {
+    out.push({ dir: p.snapshot.backupDir, kind: "replayed", notes: reconcileAudited(p.snapshot.toolCallId ?? p.name, p.snapshot, ledger, runId, diagnose) });
   }
   return out;
+}
+
+/** Reverse snapshot order: `seq` when both have one, else `createdAt` (then manifest mtime, then name), newest first. */
+function replayOrder(a: { name: string; snapshot: Snapshot; mtime: number }, b: { name: string; snapshot: Snapshot; mtime: number }): number {
+  const sa = a.snapshot.seq;
+  const sb = b.snapshot.seq;
+  if (typeof sa === "number" && typeof sb === "number" && sa !== sb) return sb - sa;
+  const time = (x: typeof a) => {
+    const t = Date.parse(x.snapshot.createdAt);
+    return Number.isNaN(t) ? x.mtime : t;
+  };
+  const ta = time(a);
+  const tb = time(b);
+  if (ta !== tb) return tb - ta;
+  if (a.mtime !== b.mtime) return b.mtime - a.mtime;
+  return a.name < b.name ? 1 : a.name > b.name ? -1 : 0;
 }
 
 /** Appends the event; the error message when the ledger refused it. */
