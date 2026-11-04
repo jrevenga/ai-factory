@@ -1,10 +1,12 @@
 // Command router and composition root of the `factory` CLI.
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { factoryPaths } from "../adapters/platform/paths.ts";
 import { PiRuntime } from "../adapters/pi/runtime.ts";
+import { withAbsoluteDirs } from "../core/paths/homes.ts";
 import { ReleaseManifest } from "../core/release/manifest.ts";
 import { APPLY_REASONS, applyRelease, ApplyFailed, type ApplyContext, type ApplyDeps, type ApplyReason } from "./commands/apply-release.ts";
 import { configExplain } from "./commands/config.ts";
@@ -29,6 +31,7 @@ export interface MainDeps {
   releaseDeps?: Partial<ReleaseDeps>;
   /** Test seams for the launcher and init/config. */
   doctor?: () => Promise<DoctorCheck[]>;
+  /** The caller's directory: the project for init/config, and the base of relative directory overrides. */
   cwd?: string;
 }
 
@@ -54,7 +57,8 @@ const COMMANDS = new Set(["version", "doctor", "install", "_apply-release", "upd
  * unexpected filesystem error) is printed as one line and exits 1; FACTORY_DEBUG=1 adds the stack.
  */
 export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDeps = {}): Promise<number> {
-  const env = deps.env ?? process.env;
+  // I4: directory overrides are made absolute once, here; every path and every child uses this env.
+  const env = withAbsoluteDirs(deps.env ?? process.env, homedir(), deps.cwd ?? process.cwd());
   try {
     return await run(argv, io, deps, env);
   } catch (e) {
