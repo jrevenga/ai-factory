@@ -3,7 +3,7 @@
 // (`npm install -g --legacy-peer-deps <spec>`, then its `_apply-release`, which borrows our lock; R5).
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { npm } from "../../adapters/platform/npm.ts";
 import type { FactoryPaths } from "../../adapters/platform/paths.ts";
 import { acquireLock, Locked, type Lock } from "../../adapters/store/lock.ts";
@@ -12,7 +12,7 @@ import type { StateDocProblem } from "../../adapters/store/state-store.ts";
 import { cloneTag, lsRemoteTags } from "../../adapters/vcs/git.ts";
 import { npmInstallSpec, ReleaseManifest, tagFor } from "../../core/release/manifest.ts";
 import type { CliIO } from "../io.ts";
-import { locateGlobalCli, runNodeInherited } from "./install.ts";
+import { expectInstalledVersion, locateGlobalCli, runNodeInherited } from "./install.ts";
 
 /** Seams for tests; production uses the real implementations. */
 export interface ReleaseDeps {
@@ -154,23 +154,6 @@ export async function fetchRelease(ctx: ReleaseContext, deps: ReleaseDeps, sourc
     } catch (e) {
       ctx.io.err(`warning: could not remove the temporary checkout ${dir}: ${msg(e)}. You can delete it.`);
     }
-  }
-}
-
-/**
- * The CLI at npm's global root must be the release just installed (its own release.json), or another
- * install raced ours or npm kept a stale copy; handing over to it would apply the wrong release.
- */
-async function expectInstalledVersion(globalCli: string, version: string): Promise<void> {
-  const file = join(dirname(dirname(globalCli)), "release.json");
-  let found: unknown;
-  try {
-    found = (JSON.parse(await readFile(file, "utf8")) as { factory?: unknown }).factory;
-  } catch (e) {
-    throw new Error(`npm reported success but ${file} is unreadable (${msg(e)}); not handing over to it.`, { cause: e });
-  }
-  if (found !== version) {
-    throw new Error(`npm reported success but the global factory CLI (${file}) holds factory ${String(found)}, not ${version}; not handing over to it.`);
   }
 }
 

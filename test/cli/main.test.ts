@@ -43,6 +43,7 @@ describe("main router", () => {
   it.each([
     [["install", "--bogus"]],
     [["install", "extra"]],
+    [["install", "--parent-lock", "abc"]],
     [["_apply-release"]],
     [["_apply-release", "--reason", "bogus"]],
     [["_apply-release", "--reason", "update", "--parent-lock", "abc"]],
@@ -118,6 +119,33 @@ describe("main _apply-release", () => {
       expect(code, c.err.join("\n")).toBe(0);
       expect(asked).toHaveLength(questions);
     } finally {
+      await t.cleanup();
+    }
+  });
+
+  it("install --parent-lock borrows the bootstrapping process's lock and leaves it held (R18)", async () => {
+    const t = await makeTmp("main-install-borrow");
+    const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "http://127.0.0.1:1/x/ai-factory.git", PI_OFFLINE: "1" };
+    const paths = factoryPaths(env);
+    const pi = new (class extends PiRuntime {
+      override async ensurePinned(): Promise<string> {
+        return "/fake/cli.js";
+      }
+      override async installPackage(): Promise<void> {}
+    })();
+    const held = await acquireLock(paths);
+    try {
+      const c = capture();
+      const code = await main(["install", "--yes", "--parent-lock", String(process.pid)], c.io, {
+        env,
+        pi,
+        applyDeps: { detectLogins: async () => ({ claude: "absent", codex: "present" }), runDoctor: async () => [] },
+      });
+      expect(code, c.err.join("\n")).toBe(0);
+      expect(JSON.parse(readFileSync(paths.state, "utf8")).history.at(-1).reason).toBe("install");
+      expect(existsSync(paths.lock)).toBe(true);
+    } finally {
+      await held.release();
       await t.cleanup();
     }
   });

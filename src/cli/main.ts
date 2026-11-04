@@ -104,22 +104,23 @@ async function run(argv: string[], io: CliIO, deps: MainDeps, env: NodeJS.Proces
   if (cmd === "install" || cmd === "_apply-release") {
     let flags: { yes?: boolean; profile?: string; reason?: string; from?: string; "parent-lock"?: string };
     try {
-      const options = { yes: { type: "boolean" }, profile: { type: "string" } } as const;
-      const applyOptions = { ...options, reason: { type: "string" }, from: { type: "string" }, "parent-lock": { type: "string" } } as const;
+      const options = { yes: { type: "boolean" }, profile: { type: "string" }, "parent-lock": { type: "string" } } as const;
+      const applyOptions = { ...options, reason: { type: "string" }, from: { type: "string" } } as const;
       flags = parseArgs({ args: rest, options: cmd === "install" ? options : applyOptions, allowPositionals: false, strict: true }).values;
     } catch (e) {
       return usage((e as Error).message);
-    }
-    const ctx: ApplyContext = { paths: factoryPaths(env), env, manifest, io, pi: deps.pi ?? new PiRuntime(), now: () => new Date(), root, deps: deps.applyDeps };
-    if (cmd === "install") return install(ctx, { yes: flags.yes === true, profile: flags.profile });
-
-    if (flags.reason === undefined || !(APPLY_REASONS as readonly string[]).includes(flags.reason)) {
-      return usage(`_apply-release needs --reason ${APPLY_REASONS.join("|")}`);
     }
     let parentLockPid: number | undefined;
     if (flags["parent-lock"] !== undefined) {
       parentLockPid = /^\d+$/.test(flags["parent-lock"]) ? Number(flags["parent-lock"]) : Number.NaN;
       if (!Number.isSafeInteger(parentLockPid) || parentLockPid <= 0) return usage(`--parent-lock must be a process id, got ${flags["parent-lock"]}`);
+    }
+    const ctx: ApplyContext = { paths: factoryPaths(env), env, manifest, io, pi: deps.pi ?? new PiRuntime(), now: () => new Date(), root, deps: deps.applyDeps };
+    // `install --parent-lock` is the npx bootstrap's hand-over (R18); it is not part of the usage text.
+    if (cmd === "install") return install(ctx, { yes: flags.yes === true, profile: flags.profile, parentLockPid });
+
+    if (flags.reason === undefined || !(APPLY_REASONS as readonly string[]).includes(flags.reason)) {
+      return usage(`_apply-release needs --reason ${APPLY_REASONS.join("|")}`);
     }
     try {
       await applyRelease(ctx, { reason: flags.reason as ApplyReason, from: flags.from, parentLockPid, profile: flags.profile, yes: flags.yes === true });

@@ -1,10 +1,16 @@
 // `factory install`: checks the minimum requirements, then either applies this release or, when run
 // through `npx` (whose cache is temporary), bootstraps a global install first and hands over to it.
+//
+// The bootstrap holds the factory lock from its state/journal recheck through `npm install -g` and the
+// hand-over, whose `install --parent-lock` borrows it (controller ruling R18), so it never replaces the
+// global CLI while an update or rollback runs, nor after one installed a newer release.
 import { existsSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { npm } from "../../adapters/platform/npm.ts";
 import { runSupervised } from "../../adapters/platform/process.ts";
+import { acquireLock, Locked, type Lock } from "../../adapters/store/lock.ts";
 import { npmInstallSpec } from "../../core/release/manifest.ts";
 import { MIGRATIONS } from "../../core/state/migrations.ts";
 import { applyPreflight, applyRelease, ApplyFailed, ApplyRefused, TXN_PENDING_MESSAGE, type ApplyContext } from "./apply-release.ts";
@@ -23,6 +29,8 @@ export interface InstallDeps {
 export interface InstallOptions {
   yes: boolean;
   profile?: string;
+  /** Pid of the bootstrapping factory process whose lock this install borrows (R18). */
+  parentLockPid?: number;
 }
 
 const NPM_TIMEOUT_MS = 10 * 60_000;
@@ -58,13 +66,8 @@ export async function install(ctx: ApplyContext, opts: InstallOptions, overrides
   }
 
   // I2: refuse a downgrade or an unmigratable document before anything changes, including the npx
-  // bootstrap's global npm install (applyRelease repeats this under the factory lock).
-  try {
-    await applyPreflight(ctx.paths, manifest, ctx.deps?.migrations ?? MIGRATIONS, "install");
-  } catch (e) {
-    io.err(e instanceof ApplyRefused ? e.message : `Install did not start: ${msg(e)}. Nothing was changed.`);
-    return 1;
-  }
+  // bootstrap's global npm install (the bootstrap and applyRelease repeat this under the factory lock).
+  if (!(await preflight(ctx))) return 1;
 
   const failed = (await deps.requirements({ env, manifest })).filter((c) => c.status === "fail");
   if (failed.length > 0) {
@@ -80,11 +83,39 @@ export async function install(ctx: ApplyContext, opts: InstallOptions, overrides
   if (isNpxPath(deps.cliPath)) return bootstrap(ctx, opts, deps);
 
   try {
-    await applyRelease(ctx, { reason: "install", profile: opts.profile, yes: opts.yes });
+    await applyRelease(ctx, { reason: "install", profile: opts.profile, yes: opts.yes, parentLockPid: opts.parentLockPid });
     return 0;
   } catch (e) {
     if (!(e instanceof ApplyFailed)) io.err(`Install did not complete: ${msg(e)}`);
     return 1;
+  }
+}
+
+/** The install preflight; prints the refusal and returns false when the install must not start. */
+async function preflight(ctx: ApplyContext): Promise<boolean> {
+  try {
+    await applyPreflight(ctx.paths, ctx.manifest, ctx.deps?.migrations ?? MIGRATIONS, "install");
+    return true;
+  } catch (e) {
+    ctx.io.err(e instanceof ApplyRefused ? e.message : `Install did not start: ${msg(e)}. Nothing was changed.`);
+    return false;
+  }
+}
+
+/**
+ * The CLI at npm's global root must be the release just installed (its own release.json), or another
+ * install raced ours or npm kept a stale copy; handing over to it would apply the wrong release.
+ */
+export async function expectInstalledVersion(globalCli: string, version: string): Promise<void> {
+  const file = join(dirname(dirname(globalCli)), "release.json");
+  let found: unknown;
+  try {
+    found = (JSON.parse(await readFile(file, "utf8")) as { factory?: unknown }).factory;
+  } catch (e) {
+    throw new Error(`npm reported success but ${file} is unreadable (${msg(e)}); not handing over to it.`, { cause: e });
+  }
+  if (found !== version) {
+    throw new Error(`npm reported success but the global factory CLI (${file}) holds factory ${String(found)}, not ${version}; not handing over to it.`);
   }
 }
 
@@ -109,27 +140,69 @@ export async function locateGlobalCli(npmFn: typeof npm, env: NodeJS.ProcessEnv)
 }
 
 /**
- * Running from the npx cache: install this release globally (`--legacy-peer-deps`, ruling 5), then run
- * the global CLI's `install` with the same flags so the installed copy does the work.
+ * Running from the npx cache: under the factory lock, recheck the journal and the installed state, install
+ * this release globally (`--legacy-peer-deps`, ruling 5), check that the global CLI is this release, then
+ * run its `install` with the same flags and `--parent-lock`, so the installed copy does the work under
+ * our lock (R18). The lock is released only after that child has exited.
  */
 async function bootstrap(ctx: ApplyContext, opts: InstallOptions, deps: InstallDeps): Promise<number> {
-  const { io, env, manifest } = ctx;
-  const spec = npmInstallSpec(manifest, env);
-  io.out(`Installing the factory CLI globally (${spec})…`);
-  const installed = await deps.npm(["install", "-g", "--legacy-peer-deps", spec], { env, timeoutMs: NPM_TIMEOUT_MS });
-  if (installed.code !== 0) {
-    const how = installed.timedOut ? "timed out" : `failed with exit ${installed.code}`;
-    io.err(`npm install -g of ${spec} ${how}. Check your network and access to the repository, then retry.\n${installed.stderr.trim()}`);
+  const { io, paths } = ctx;
+  let lock: Lock;
+  try {
+    lock = await acquireLock(paths);
+  } catch (e) {
+    io.err(e instanceof Locked ? e.message : `Could not take the factory lock ${paths.lock}: ${msg(e)}. Nothing was changed.`);
     return 1;
   }
+  let code = 1;
+  try {
+    code = await bootstrapLocked(ctx, opts, deps, lock);
+  } finally {
+    try {
+      await lock.release();
+    } catch (e) {
+      io.err(`The factory lock ${paths.lock} could not be released cleanly: ${msg(e)}. Another factory process may have run meanwhile; run "factory doctor".`);
+      if (code === 0) code = 1;
+    }
+  }
+  return code;
+}
+
+async function bootstrapLocked(ctx: ApplyContext, opts: InstallOptions, deps: InstallDeps, lock: Lock): Promise<number> {
+  const { io, env, manifest, paths } = ctx;
+  // Rechecked under the lock: an update or rollback may have started or finished since the first check.
+  if (existsSync(paths.txn)) {
+    io.err(TXN_PENDING_MESSAGE);
+    return 1;
+  }
+  if (!(await preflight(ctx))) return 1;
+
+  const spec = npmInstallSpec(manifest, env);
   let globalCli: string;
   try {
+    await lock.verify();
+    io.out(`Installing the factory CLI globally (${spec})…`);
+    const installed = await deps.npm(["install", "-g", "--legacy-peer-deps", spec], { env, timeoutMs: NPM_TIMEOUT_MS, signal: lock.lost });
+    if (installed.code !== 0) {
+      const how = installed.timedOut ? "timed out" : `failed with exit ${installed.code}`;
+      io.err(`npm install -g of ${spec} ${how}. Check your network and access to the repository, then retry.\n${installed.stderr.trim()}`);
+      return 1;
+    }
     globalCli = await locateGlobalCli(deps.npm, env);
+    await expectInstalledVersion(globalCli, manifest.factory);
+    await lock.verify();
   } catch (e) {
     io.err(msg(e));
     return 1;
   }
-  const args = [globalCli, "install", ...(opts.yes ? ["--yes"] : []), ...(opts.profile === undefined ? [] : ["--profile", opts.profile])];
+  const args = [
+    globalCli,
+    "install",
+    ...(opts.yes ? ["--yes"] : []),
+    ...(opts.profile === undefined ? [] : ["--profile", opts.profile]),
+    "--parent-lock",
+    String(process.pid),
+  ];
   // R15: the global CLI may have to confirm the proposed profile, so it gets the terminal when one is there.
   const interactive = io.isTTY && !opts.yes && opts.profile === undefined;
   try {
