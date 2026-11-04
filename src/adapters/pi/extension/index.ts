@@ -4,16 +4,18 @@
 // guard (ruling 8). While the handshake has failed, its own tool_call handler blocks every tool except
 // the read-only ones, which covers "loaded but handshake failed" even without the guard file.
 // Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger), restores the route
-// of the session branch (route-state.ts), registers `task_progress` (task-state.ts) and enforces the GatePolicy on every tool call (enforce.ts); `run_end`
-// is written at session_shutdown.
+// of the session branch (route-state.ts), registers `task_progress` (task-state.ts) and the evidence tools `run_check`,
+// `record_review` and `record_decision` (evidence.ts), and enforces the GatePolicy on every tool call (enforce.ts);
+// `run_end` is written at session_shutdown.
 import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import path, { join } from "node:path";
+import path, { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveConfig } from "../../../core/config/resolve.ts";
-import { CoreConfig, PersonalConfig } from "../../../core/config/schema.ts";
+import { CoreConfig, PersonalConfig, ProjectConfig, type SoftGateId } from "../../../core/config/schema.ts";
+import { declaredCommands, type DeclaredCommand } from "../../../core/evidence/check-plan.ts";
 import {
   evaluateHandshake,
   HANDSHAKE_EVENT,
@@ -28,7 +30,8 @@ import type { GateContext } from "../../../core/policy/gate.ts";
 import { INITIAL_ROUTE } from "../../../core/route/route.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { FactoryState } from "../../../core/state/schema.ts";
-import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
+import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, GatedChecks, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
+import { registerEvidence, type EvidenceSession } from "./evidence.ts";
 import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
 import { ledgerDirFor, RunLedger } from "./ledger.ts";
 import { registerRouteState, type RouteSession } from "./route-state.ts";
@@ -121,8 +124,14 @@ interface Session {
   gitDirs: string[];
   tmpCandidates: string[];
   autonomy: AutonomyLevel;
+  /** Effective `gates.soften` (core, personal and project layers; ruling 13). */
+  softened: SoftGateId[];
+  /** `.factory/config.json` `commands`, tokenized (Task 10); the gate and `run_check` use the same list. */
+  declared: DeclaredCommand[];
+  projectCommands: string[][];
   postChecks: MachinePostChecks;
   inFlight: InFlightCalls;
+  gatedChecks: GatedChecks;
 }
 
 function within(child: string, parent: string): boolean {
@@ -158,11 +167,29 @@ function policyContext(s: Session, ctx: ExtensionContext): GateContext {
     projectRoot: s.projectRoot,
     tmpRoots: usableTmpRoots(s, route),
     ledgerDir: s.ledgerDir,
-    // Project-declared runners arrive with Task 10 (`.factory/config.json` commands).
-    projectCommands: [],
+    projectCommands: s.projectCommands,
     taskFileExists: taskFileExists(route),
     gitDirs: s.gitDirs,
   };
+}
+
+type ProjectRead = { ok: true; config: ProjectConfig | undefined } | { ok: false; error: string };
+
+/** `<projectRoot>/.factory/config.json`, read once per run (the gate write-protects it, ruling 7). */
+function projectConfig(projectRoot: string): ProjectRead {
+  let raw: string;
+  try {
+    raw = readFileSync(join(projectRoot, ".factory", "config.json"), "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, config: undefined };
+    return { ok: false, error: (e as Error).message };
+  }
+  try {
+    const parsed = ProjectConfig.safeParse(JSON.parse(raw));
+    return parsed.success ? { ok: true, config: parsed.data } : { ok: false, error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
 }
 
 /** Opens the factory run: realpathed facts, effective autonomy, run ledger with `run_start`. Throws on failure. */
@@ -179,7 +206,14 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     }
   }
   const core = CoreConfig.parse(JSON.parse(readFileSync(CORE_DEFAULTS, "utf8")));
-  const autonomy = resolveConfig({ core, ...(personal ? { personal } : {}) }).value.autonomy;
+  // An unreadable or invalid project config fails closed for what it would grant: no declared runners, no softened gates.
+  const project = projectConfig(projectRoot);
+  if (!project.ok) report(ctx, `factory: .factory/config.json is invalid (${project.error}); declared commands and softened gates are ignored`);
+  const effective = resolveConfig({ core, ...(personal ? { personal } : {}), ...(project.ok && project.config ? { project: project.config } : {}) }).value;
+  const autonomy = effective.autonomy;
+  const softened = project.ok ? [...effective.gates.soften] : [];
+  const commands = project.ok ? declaredCommands(project.config?.commands) : { declared: [], ignored: [] };
+  if (commands.ignored.length > 0) report(ctx, `factory: ignored declared commands in .factory/config.json: ${commands.ignored.join("; ")}`);
   const projectId = projectIdFor(projectRoot, sha256hex);
   const runId = runIdFor(new Date(), process.pid);
   const ledger = new RunLedger(ledgerDirFor(factoryHome, projectId), runId);
@@ -206,8 +240,12 @@ function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined
     gitDirs: dirs,
     tmpCandidates: [canonicalDir(tmpdir())],
     autonomy,
+    softened,
+    declared: commands.declared,
+    projectCommands: commands.declared.map((d) => [...d.argv]),
     postChecks: new MachinePostChecks(),
     inFlight: new InFlightCalls(),
+    gatedChecks: new GatedChecks(),
   };
 }
 
@@ -221,6 +259,22 @@ function routeSession(s: Session): RouteSession {
 
 function taskSession(s: Session): TaskSession {
   return { ledger: s.ledger, runId: s.runId, projectRoot: s.projectRoot, home: s.home, piAgentDir: s.piAgentDir, postChecks: s.postChecks };
+}
+
+function evidenceSession(s: Session): EvidenceSession {
+  return {
+    ledger: s.ledger,
+    runId: s.runId,
+    runDir: dirname(s.ledger.file),
+    projectRoot: s.projectRoot,
+    home: s.home,
+    piAgentDir: s.piAgentDir,
+    autonomy: s.autonomy,
+    softened: s.softened,
+    projectCommands: s.projectCommands,
+    declared: s.declared,
+    gatedChecks: s.gatedChecks,
+  };
 }
 
 interface Started {
@@ -251,9 +305,17 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     },
     factoryTools,
   });
+  const evidence = registerEvidence(pi, {
+    session: async () => {
+      const s = await sessionNow();
+      return s === undefined ? undefined : evidenceSession(s);
+    },
+    factoryTools,
+  });
   const verifyTools = (): void => {
     routes.verifyTools();
     tasks.verifyTools();
+    evidence.verifyTools();
   };
 
   const start = (ctx: ExtensionContext): Promise<Started> => {
@@ -303,6 +365,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
       postChecks: session.postChecks,
       inFlight: session.inFlight,
       factoryTools,
+      gatedChecks: session.gatedChecks,
       ...(ui ? { ui } : {}),
     });
   });
@@ -327,6 +390,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     const session = await sessionNow();
     session?.inFlight.clear();
     session?.postChecks.clear();
+    session?.gatedChecks.clear();
   });
 
   pi.on("session_shutdown", async (event) => {
@@ -334,6 +398,7 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     if (session === undefined) return;
     session.inFlight.clear();
     session.postChecks.clear();
+    session.gatedChecks.clear();
     try {
       session.ledger.append({ v: 1, ts: new Date().toISOString(), runId: session.runId, type: "run_end", reason: event.reason });
     } catch (e) {

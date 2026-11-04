@@ -102,18 +102,19 @@ function gitError(what: string, r: { status: number | null; stderr: string }): R
   return new Refusal(`${what} failed${r.status === null ? " (git could not run or timed out)" : ` (exit ${r.status})`}${detail !== "" ? `: ${detail}` : ""}`);
 }
 
-type Git = (cwd: string, args: string[], input?: string) => GitRun;
+export type Git = (cwd: string, args: string[], input?: string, env?: Record<string, string>) => GitRun;
 
 /**
  * Git with repository hooks disabled (an empty hooks directory), no fsmonitor command and no commit signing: a
  * factory checkpoint must not run configured or project-defined code (hooks can live in the worktree, e.g. husky)
  * nor wait for a signing prompt. Filter drivers selected by `.gitattributes` (e.g. git-lfs) still run (README).
+ * Inherited git location and pathspec variables are stripped (`gitRun`); `env` adds factory-owned ones.
  */
-function withSafeGit<T>(fn: (git: Git) => T): T {
+export function withSafeGit<T>(fn: (git: Git) => T): T {
   const hooks = mkdtempSync(join(tmpdir(), "factory-no-hooks-"));
   try {
     const safe = ["-c", `core.hooksPath=${hooks}`, "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false"];
-    return fn((cwd, args, input) => gitRun(cwd, [...safe, ...args], GIT_WRITE_TIMEOUT_MS, input));
+    return fn((cwd, args, input, env) => gitRun(cwd, [...safe, ...args], GIT_WRITE_TIMEOUT_MS, input, env));
   } finally {
     rmSync(hooks, { recursive: true, force: true });
   }

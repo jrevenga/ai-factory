@@ -3,8 +3,9 @@
 // audits every decision as one ledger `gate` event, and runs ruling 8's machine-section post-check at
 // `tool_result`. It fails closed: any exception (facts, policy context, config, ledger) blocks the call.
 import { lstatSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import path, { join } from "node:path";
 import type { ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
+import { planCheck } from "../../../core/evidence/check-plan.ts";
 import type { RunEvent } from "../../../core/ledger/events.ts";
 import { classifyCommandLine, isPathLikeArg } from "../../../core/policy/command.ts";
 import { evaluateGate, type GateContext, type GateResult, type ToolAction } from "../../../core/policy/gate.ts";
@@ -24,6 +25,11 @@ const DEFAULT_CWD_TOOLS: ReadonlySet<string> = new Set(["grep", "find", "ls"]);
 /** R30: a command the owner cannot read in full is not offered for approval. */
 export const MAX_APPROVAL_CHARS = 4000;
 const TASK_FILE_DIRS = [".factory", "knowledge", "tasks"];
+/**
+ * Task 10: `run_check` runs a command, so the gate decides it exactly as it decides `bash` for the same command line
+ * (same facts, hard gates, ask path and R29 deny), resolved against the directory the check runs in.
+ */
+export const RUN_CHECK_TOOL = "run_check";
 
 // --- Route state ---------------------------------------------------------------------------------------------
 // Task 8 (`set_route`, restore, reclassification) owns transitions; until then every session starts on the
@@ -57,6 +63,23 @@ export interface ActionFacts {
    * extension, an MCP bridge) is `unknown`.
    */
   factoryTools?: ReadonlySet<string>;
+  /** `run_check`: where the command runs (default `cwd`) and the task file whose machine section it must not change. */
+  runCheck?: RunCheckFacts;
+}
+
+export interface RunCheckFacts {
+  /** The route's write root, or the project root on the answer route (`runCheckFacts`). */
+  cwd: string;
+  /** Feature/project: `<worktree>/.factory/knowledge/tasks/<taskId>.md` (ruling 8 post-check after the check). */
+  taskFile?: string;
+}
+
+/** Where `run_check` runs for the gate context's route, and the task file it protects. */
+export function runCheckFacts(ctx: Pick<GateContext, "route" | "projectRoot">): RunCheckFacts {
+  const { route } = ctx;
+  const cwd = route.writeRoots[0] ?? ctx.projectRoot;
+  const tiered = (route.route === "feature" || route.route === "project") && route.worktree !== undefined && route.taskId !== undefined;
+  return tiered ? { cwd, taskFile: join(route.worktree!, ...TASK_FILE_DIRS, `${route.taskId!}.md`) } : { cwd };
 }
 
 /** The pre-call copy of a file whose machine section the post-check protects. */
@@ -76,6 +99,8 @@ export interface PreparedAction {
   display: string;
   /** Set for write/edit on a task file or on a file that holds machine markers (ruling 8 post-check). */
   machine?: MachineCopy;
+  /** `run_check`: the command and the directory it runs in, cleared for execution once the gate allows it. */
+  runCheck?: { command: string; cwd: string };
 }
 
 function str(v: unknown): string | undefined {
@@ -176,6 +201,26 @@ function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionF
   return { action: { kind: "command", tool, command, pathFacts: facts }, summary, display };
 }
 
+/**
+ * `run_check` is gated as the `bash` command it runs (Task 10, decision 1), with facts resolved in the directory it
+ * runs in. A check can rewrite the task file through project code the gate cannot see, so its machine section gets
+ * the ruling-8 post-check like a write.
+ */
+function runCheckAction(ev: ToolCallLike, f: ActionFacts): PreparedAction {
+  const rc = f.runCheck ?? { cwd: f.cwd };
+  const prepared = commandAction(ev, "bash", { ...f, cwd: rc.cwd });
+  const command = str(ev.input.command);
+  if (prepared.action.kind !== "command" || command === undefined) return prepared;
+  const display = `run_check in ${rc.cwd}:\n${prepared.display}`;
+  let machine: MachineCopy | undefined;
+  if (rc.taskFile !== undefined) {
+    const fact = pathFacts(rc.taskFile, rc.cwd, f.home);
+    const cur = readTarget(fact.resolved);
+    if (cur.kind !== "error") machine = { file: fact.resolved, input: rc.taskFile, before: cur.kind === "text" ? cur.text : undefined };
+  }
+  return { ...prepared, display, runCheck: { command, cwd: rc.cwd }, ...(machine !== undefined ? { machine } : {}) };
+}
+
 function rawInput(ev: ToolCallLike): string {
   try {
     return JSON.stringify(ev.input, null, 2) ?? "";
@@ -192,6 +237,7 @@ function malformed(ev: ToolCallLike, tool: string): PreparedAction {
 export function prepareAction(ev: ToolCallLike, f: ActionFacts): PreparedAction {
   const tool = ev.toolName;
   if (f.factoryTools?.has(tool) === true) {
+    if (tool === RUN_CHECK_TOOL) return runCheckAction(ev, f);
     const display = `${tool} ${rawInput(ev)}`;
     return { action: { kind: "factory", tool }, summary: summarizeCommand(display), display };
   }
@@ -430,6 +476,34 @@ export class InFlightCalls {
   }
 }
 
+/**
+ * Task 10: `run_check` calls the gate allowed, by toolCallId, with the exact command and cwd. The tool runs only a
+ * call found here (consumed once), so a `run_check` that did not pass through this hook, or whose input changed
+ * after it, never runs.
+ */
+export class GatedChecks {
+  private readonly cleared = new Map<string, { command: string; cwd: string }>();
+
+  clear(): void {
+    this.cleared.clear();
+  }
+
+  approve(toolCallId: string, check: { command: string; cwd: string }): void {
+    this.cleared.set(toolCallId, { ...check });
+  }
+
+  /** The cleared check for this call, removed; undefined when the gate did not allow it. */
+  take(toolCallId: string): { command: string; cwd: string } | undefined {
+    const c = this.cleared.get(toolCallId);
+    this.cleared.delete(toolCallId);
+    return c;
+  }
+
+  get size(): number {
+    return this.cleared.size;
+  }
+}
+
 export interface EnforceDeps {
   /** Built per call: route, mode and facts can change between calls. May throw (config error → deny). */
   policyContext(): GateContext;
@@ -443,6 +517,8 @@ export interface EnforceDeps {
   factoryTools: ReadonlySet<string>;
   /** Present only when Pi has a dialog-capable UI (`ctx.hasUI`); otherwise `ask` denies (ruling 4). */
   ui?: GateUi;
+  /** Task 10: where allowed `run_check` calls are cleared for execution. Without it no `run_check` can run. */
+  gatedChecks?: GatedChecks;
 }
 
 export type BlockResult = { block: true; reason: string };
@@ -545,10 +621,22 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
   let mutating = true;
   try {
     const policy = deps.policyContext();
-    prepared = prepareAction(ev, { cwd: ctx.cwd, home: deps.home, projectCommands: policy.projectCommands, factoryTools: deps.factoryTools });
+    prepared = prepareAction(ev, {
+      cwd: ctx.cwd,
+      home: deps.home,
+      projectCommands: policy.projectCommands,
+      factoryTools: deps.factoryTools,
+      runCheck: runCheckFacts(policy),
+    });
     summary = prepared.summary;
     r = evaluateGate(prepared.action, policy);
-    mutating = mayMutate(prepared.action, r);
+    if (prepared.runCheck !== undefined && r.decision !== "deny") {
+      // Denied before any ask: the owner is never asked about a command run_check would refuse to run.
+      const plan = planCheck(prepared.runCheck.command, policy.projectCommands);
+      if (!plan.ok) r = { ...r, decision: "deny", reason: plan.error, reconcile: false };
+    }
+    // Decision 1: run_check writes a log and takes fingerprints; it is a writing call for R31 whatever it runs.
+    mutating = prepared.runCheck !== undefined || mayMutate(prepared.action, r);
     // R31: decided before any ask, so the owner is never asked about a call that would race another one.
     const busy = r.decision === "deny" ? undefined : deps.inFlight.conflict(group, mutating);
     if (busy !== undefined) {
@@ -604,5 +692,6 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
   if (outcome.block !== undefined || prepared === undefined) return block(outcome.block ?? `${BLOCK_PREFIX}: ${outcome.reason}`);
   // Task 11: when the gate returns `reconcile: true`, take the snapshot here instead of the R29 deny above.
   if (prepared.machine !== undefined) deps.postChecks.remember(ev.toolCallId, prepared.machine);
+  if (prepared.runCheck !== undefined) deps.gatedChecks?.approve(ev.toolCallId, prepared.runCheck);
   return undefined;
 }

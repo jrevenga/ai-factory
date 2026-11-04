@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redact, summarizeCommand } from "../../../src/core/policy/redact.ts";
+import { LineRedactor, redact, summarizeCommand } from "../../../src/core/policy/redact.ts";
 
 describe("redact", () => {
   it("replaces each secret pattern", () => {
@@ -90,5 +90,37 @@ describe("summarizeCommand", () => {
     const out = summarizeCommand("a".repeat(499) + "\u{1F600}" + "b");
     expect(out).toBe("a".repeat(499));
     expect(summarizeCommand("a".repeat(498) + "\u{1F600}b")).toBe("a".repeat(498) + "\u{1F600}");
+  });
+});
+
+describe("LineRedactor", () => {
+  const TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+  it("redacts a secret split across chunks (lines are redacted whole)", () => {
+    const r = new LineRedactor();
+    let out = r.push(`token: ${TOKEN.slice(0, 10)}`);
+    expect(out).toBe("");
+    out += r.push(`${TOKEN.slice(10)} end\nnext`);
+    out += r.end();
+    expect(out).toBe("token: *** end\nnext");
+    expect(out).not.toContain(TOKEN.slice(4));
+  });
+
+  it("masks a private key block spanning lines and chunks, keeping what follows its END line", () => {
+    const r = new LineRedactor();
+    const out = [
+      r.push("before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA"),
+      r.push("AAAA\nAAAABG5vbmU\n-----END OPENSSH PRIVATE KEY----- tail\nafter\n"),
+      r.end(),
+    ].join("");
+    expect(out).toBe("before\n***\n tail\nafter\n");
+    expect(out).not.toContain("b3BlbnNzaC1rZXktdjEA");
+  });
+
+  it("stays bounded on output without newlines", () => {
+    const r = new LineRedactor();
+    const out = r.push("x".repeat(200 * 1024));
+    expect(out.length).toBeGreaterThan(0);
+    expect(out.length + r.end().length).toBe(200 * 1024);
   });
 });

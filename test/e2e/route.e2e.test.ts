@@ -246,4 +246,35 @@ describe("route state (e2e, faux provider)", () => {
       ["set_route", false, undefined],
     ]);
   }, 180_000);
+
+  it("Task 10: run_check runs a command declared in .factory/config.json after the gate clears it and records it in the ledger; a prefix match is denied", async () => {
+    const s = await setup();
+    mkdirSync(join(s.project, "scripts"));
+    writeFileSync(join(s.project, "scripts", "ok.mjs"), 'console.log("checks passed");\n');
+    mkdirSync(join(s.project, ".factory"));
+    writeFileSync(join(s.project, ".factory", "config.json"), JSON.stringify({ schema: 1, commands: { test: "node scripts/ok.mjs" } }));
+    git(s.project, "add", "-A");
+    git(s.project, "commit", "-q", "-m", "declare the test command");
+    s.env.FAUX_SCRIPT = JSON.stringify([
+      { tool: "set_route", args: { route: "small", reason: "verify" } },
+      { tool: "run_check", args: { command: "node scripts/ok.mjs" } },
+      { tool: "run_check", args: { command: "node scripts/ok.mjs --extra" } },
+    ]);
+    const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.project, env: s.env, extensions: [FAUX, EXTENSION, OBSERVER] });
+    expect(r.timedOut).toBe(false);
+    expect(r.code, r.stderr).toBe(0);
+    const res = results(s.log);
+    expect(res.map(([n, e]) => [n, e])).toEqual([
+      ["set_route", false],
+      ["run_check", false],
+      ["run_check", true],
+    ]);
+    expect(res[1]?.[2]).toContain("exit 0");
+    expect(res[1]?.[2]).toContain("checks passed");
+    expect(res[2]?.[2]).toContain("run_check runs only read-only, allowlisted or project-declared commands");
+    const [events] = ledgerRuns(s.home);
+    const checks = events!.filter((e) => e.type === "check").map((e) => e.record as Record<string, unknown>);
+    expect(checks).toEqual([expect.objectContaining({ exitCode: 0, mutated: false, declaredAs: "test", cwd: s.realProject })]);
+    expect(readFileSync(checks[0]!.logPath as string, "utf8")).toContain("checks passed");
+  }, 180_000);
 });

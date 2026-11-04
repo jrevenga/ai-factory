@@ -15,6 +15,24 @@
     "conventions": {
       "type": "string"
     },
+    "commands": {
+      "type": "object",
+      "properties": {
+        "test": {
+          "type": "string"
+        },
+        "build": {
+          "type": "string"
+        },
+        "lint": {
+          "type": "string"
+        },
+        "typecheck": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
     "overrides": {
       "type": "object",
       "properties": {

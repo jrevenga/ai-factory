@@ -43,3 +43,57 @@ export function summarizeCommand(cmd: string): string {
   // Do not leave a lone high surrogate at the cut.
   return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
 }
+
+const KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
+const KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
+/** A "line" without a newline is cut here, so a stream that never prints one stays bounded in memory. */
+const MAX_PENDING = 64 * 1024;
+
+/**
+ * Line-wise `redact` for streamed command output (Task 10: no secrets in check logs). Complete lines are redacted
+ * as they arrive; a private key block spanning lines is masked from its BEGIN line through its END line.
+ */
+export class LineRedactor {
+  private pending = "";
+  private inKey = false;
+
+  /** Redacted complete lines of `text` (with their newlines); the unterminated rest is kept for the next call. */
+  push(text: string): string {
+    this.pending += text;
+    let out = "";
+    for (;;) {
+      const nl = this.pending.indexOf("\n");
+      if (nl < 0) {
+        if (this.pending.length <= MAX_PENDING) break;
+        out += this.line(this.pending.slice(0, MAX_PENDING));
+        this.pending = this.pending.slice(MAX_PENDING);
+        continue;
+      }
+      out += this.line(this.pending.slice(0, nl + 1));
+      this.pending = this.pending.slice(nl + 1);
+    }
+    return out;
+  }
+
+  /** The redacted unterminated rest. */
+  end(): string {
+    const rest = this.pending;
+    this.pending = "";
+    return rest === "" ? "" : this.line(rest);
+  }
+
+  private line(line: string): string {
+    if (this.inKey) {
+      const m = KEY_END.exec(line);
+      if (m === null) return "";
+      this.inKey = false;
+      return redact(line.slice(m.index + m[0].length));
+    }
+    const begin = KEY_BEGIN.exec(line);
+    if (begin !== null && !KEY_END.test(line.slice(begin.index))) {
+      this.inKey = true;
+      return `${redact(line.slice(0, begin.index))}${MASK}${line.endsWith("\n") ? "\n" : ""}`;
+    }
+    return redact(line);
+  }
+}

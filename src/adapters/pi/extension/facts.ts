@@ -263,14 +263,17 @@ export function canonicalDir(p: string): string {
   return realTarget(path.resolve(p));
 }
 
-/** The process env for git: no prompts, and no inherited location variables. */
-function gitEnv(): NodeJS.ProcessEnv {
+/**
+ * The process env for git: no prompts, and no inherited location variables. `extra` is applied after the stripping
+ * (e.g. a factory-owned `GIT_INDEX_FILE` for the fingerprint's temporary index).
+ */
+function gitEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" };
   for (const k of Object.keys(env)) {
     const u = k.toUpperCase();
     if (GIT_LOCATION_VARS.includes(u) || GIT_PATHSPEC_VARS.includes(u)) delete env[k];
   }
-  return env;
+  return { ...env, ...extra };
 }
 
 export interface GitRun {
@@ -282,12 +285,13 @@ export interface GitRun {
 
 /**
  * Non-interactive git with its output and status (factory tools that change git state): no shell, bounded. `input`
- * is written to git's stdin (e.g. `--pathspec-from-file=-`); without it stdin is closed.
+ * is written to git's stdin (e.g. `--pathspec-from-file=-`); without it stdin is closed. `env` adds variables after
+ * the inherited git location and pathspec variables are stripped.
  */
-export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS, input?: string): GitRun {
+export function gitRun(cwd: string, args: string[], timeoutMs = GIT_TIMEOUT_MS, input?: string, env?: Record<string, string>): GitRun {
   const r = spawnSync("git", args, {
     cwd,
-    env: gitEnv(),
+    env: gitEnv(env),
     encoding: "utf8",
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     ...(input === undefined ? {} : { input }),
