@@ -1,5 +1,5 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   claimReplay,
@@ -43,7 +43,7 @@ class MemFs {
         this.files.delete(from);
         this.files.set(to, text);
       },
-      list: (dir) => [...this.files.keys()].filter((p) => p.startsWith(`${dir}/`)).map((p) => p.slice(dir.length + 1)),
+      list: (dir) => [...this.files.keys()].filter((p) => p.startsWith(`${dir}${sep}`)).map((p) => p.slice(dir.length + 1)),
       read: (p) => {
         if (this.unreadable.has(p)) throw errno("EACCES", p);
         const text = this.files.get(p);
@@ -60,10 +60,10 @@ class MemFs {
     return this.list();
   }
   list(): string[] {
-    return [...this.files.keys()].filter((p) => p.startsWith(`${DIR}/`)).map((p) => p.slice(DIR.length + 1)).sort();
+    return [...this.files.keys()].filter((p) => p.startsWith(`${DIR}${sep}`)).map((p) => p.slice(DIR.length + 1)).sort();
   }
   entryOf(runId: string): string | undefined {
-    return this.list().find((n) => !n.startsWith(".") && (JSON.parse(this.files.get(`${DIR}/${n}`) ?? "{}") as { runId?: string }).runId === runId);
+    return this.list().find((n) => !n.startsWith(".") && (JSON.parse(this.files.get(`${DIR}${sep}${n}`) ?? "{}") as { runId?: string }).runId === runId);
   }
 }
 
@@ -125,7 +125,7 @@ class Contender {
 /** Seeds the leftover entry of X, a session that died while it owned the replay. */
 function deadX(fs: MemFs, probe: Probe): string {
   const name = `40-s40-${"dead".padStart(16, "0")}`;
-  fs.files.set(`${DIR}/${name}`, JSON.stringify({ runId: X, pid: 40, start: "s40", createdAt: "2026-11-04T10:00:00.000Z" }));
+  fs.files.set(`${DIR}${sep}${name}`, JSON.stringify({ runId: X, pid: 40, start: "s40", createdAt: "2026-11-04T10:00:00.000Z" }));
   probe.dead.add(pidOf(X));
   return name;
 }
@@ -147,7 +147,7 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
     expect(claim).toBeDefined();
     const names = fs.names();
     expect(names).toEqual([`50-s50-${"1".padStart(16, "0")}`]);
-    expect(JSON.parse(fs.files.get(`${DIR}/${names[0]}`) ?? "")).toEqual({ runId: A, pid: 50, start: "s50", createdAt: "2026-11-04T12:00:00.000Z" });
+    expect(JSON.parse(fs.files.get(`${DIR}${sep}${names[0]}`) ?? "")).toEqual({ runId: A, pid: 50, start: "s50", createdAt: "2026-11-04T12:00:00.000Z" });
     expect(claim?.owns()).toBe(true);
     claim?.release();
     expect(claim?.owns()).toBe(false);
@@ -189,7 +189,7 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
   it("an entry without a recorded start identity is judged by its pid alone", () => {
     const fs = new MemFs();
     const probe = new Probe();
-    fs.files.set(`${DIR}/60-none-ffff`, JSON.stringify({ runId: B, pid: 60, createdAt: "x" }));
+    fs.files.set(`${DIR}${sep}60-none-ffff`, JSON.stringify({ runId: B, pid: 60, createdAt: "x" }));
     expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A))).toBeUndefined();
     probe.dead.add(60);
     expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A))).toBeDefined();
@@ -199,8 +199,8 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
     for (const bad of ["unreadable", "{not json", JSON.stringify({ runId: B }), ""]) {
       const fs = new MemFs();
       const probe = new Probe();
-      fs.files.set(`${DIR}/60-s60-junk`, bad);
-      if (bad === "unreadable") fs.unreadable.add(`${DIR}/60-s60-junk`);
+      fs.files.set(`${DIR}${sep}60-s60-junk`, bad);
+      if (bad === "unreadable") fs.unreadable.add(`${DIR}${sep}60-s60-junk`);
       expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A)), bad).toBeUndefined();
       expect(fs.names()).toEqual(["60-s60-junk"]);
     }
@@ -209,8 +209,8 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
   it("a leftover temp file of a dead writer is pruned; a live writer's temp is not an entry and does not block", () => {
     const fs = new MemFs();
     const probe = new Probe();
-    fs.files.set(`${DIR}/.40-s40-aaaa.tmp`, "{");
-    fs.files.set(`${DIR}/.60-s60-bbbb.tmp`, "{");
+    fs.files.set(`${DIR}${sep}.40-s40-aaaa.tmp`, "{");
+    fs.files.set(`${DIR}${sep}.60-s60-bbbb.tmp`, "{");
     probe.dead.add(40);
     const claim = claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A));
     expect(claim).toBeDefined();
@@ -268,13 +268,13 @@ describe("claimReplay: schedules of Codex's re-reviews r2 and r3, adapted (never
     // B owns and is replaying; X died later, leaving its entry.
     const b = new Contender(B, fs, probe);
     expect(b.run()).toBeDefined();
-    owner.set(`${DIR}/${fs.entryOf(B)}`, B);
+    owner.set(`${DIR}${sep}${fs.entryOf(B)}`, B);
     deadX(fs, probe);
-    owner.set(`${DIR}/${fs.entryOf(X)}`, X);
+    owner.set(`${DIR}${sep}${fs.entryOf(X)}`, X);
     // A lists (a view about to go stale: X dead, B live) and pauses before classifying.
     const a = new Contender(A, fs, probe);
     a.until("listed");
-    owner.set(`${DIR}/${fs.entryOf(A)}`, A);
+    owner.set(`${DIR}${sep}${fs.entryOf(A)}`, A);
     // C runs in that window and prunes X; A's view of X is now stale.
     const c = new Contender(C, fs, probe);
     expect(c.run()).toBeUndefined();
@@ -292,7 +292,7 @@ describe("claimReplay: schedules of Codex's re-reviews r2 and r3, adapted (never
     const owner = new Map<string, string>();
     const record = (runId: string) => {
       const n = fs.entryOf(runId);
-      if (n !== undefined) owner.set(`${DIR}/${n}`, runId);
+      if (n !== undefined) owner.set(`${DIR}${sep}${n}`, runId);
     };
     deadX(fs, probe);
     record(X);
@@ -369,7 +369,7 @@ function runSchedule(runIds: string[], order: number[], kill?: { actor: number; 
   const probe = new Probe();
   const owner = new Map<string, string>();
   deadX(fs, probe);
-  owner.set(`${DIR}/${fs.entryOf(X)}`, X);
+  owner.set(`${DIR}${sep}${fs.entryOf(X)}`, X);
   const cs = runIds.map((r) => new Contender(r, fs, probe));
   const phase = cs.map(() => 0);
   let everOwned = 0;
@@ -380,7 +380,7 @@ function runSchedule(runIds: string[], order: number[], kill?: { actor: number; 
     if (!c.finished) {
       c.step();
       const n = fs.entryOf(c.runId);
-      if (n !== undefined) owner.set(`${DIR}/${n}`, c.runId);
+      if (n !== undefined) owner.set(`${DIR}${sep}${n}`, c.runId);
       if (c.finished && c.claim !== undefined) everOwned++;
     } else if (c.owning && phase[i] === 0) {
       expect(c.claim?.owns()).toBe(true); // replaying a manifest
