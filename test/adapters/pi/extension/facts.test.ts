@@ -61,7 +61,7 @@ describe("pathFacts (tool paths, Pi resolveToCwd semantics)", () => {
     mkdirSync(outside);
     linkDir(outside, join(root, "link"));
     const f = pathFacts("link/new dir/file.txt", root, t);
-    expect(f).toEqual({ input: "link/new dir/file.txt", resolved: join(outside, "new dir", "file.txt"), platform: host, exists: false, directory: false });
+    expect(f).toEqual({ input: "link/new dir/file.txt", resolved: join(outside, "new dir", "file.txt"), platform: host, exists: false, directory: false, lexical: join(root, "link", "new dir", "file.txt") });
   });
 
   it.skipIf(isWin)("a dangling symlink resolves to its (missing) target, not to the link", async () => {
@@ -194,7 +194,7 @@ describe("command path facts (bash semantics)", () => {
     mkdirSync(root);
     linkDir(join(t, "outside", "deep"), join(root, "link"));
     expect(commandPathFacts("link/../x.txt", root, t)).toEqual([
-      { input: "link/../x.txt", resolved: join(t, "outside", "x.txt"), platform: host, exists: false, directory: false },
+      { input: "link/../x.txt", resolved: join(t, "outside", "x.txt"), platform: host, exists: false, directory: false, lexical: join(root, "x.txt") },
     ]);
   });
 
