@@ -575,6 +575,37 @@ describe("task_progress on the small route", () => {
     expect(existsSync(join(x.project, ".factory"))).toBe(false);
   });
 
+  it("R55: a changed tracked secret file skips the undo point and no object holds the token", async () => {
+    const x = await wired();
+    writeFileSync(join(x.project, ".npmrc"), "//registry/:_authToken=old\n");
+    git(x.project, "add", ".npmrc");
+    git(x.project, "commit", "-q", "-m", "npmrc");
+    setRoute({ ...x.small, base: git(x.project, "rev-parse", "HEAD") });
+    writeFileSync(join(x.project, ".npmrc"), `//registry/:_authToken=${TOKEN}\n`);
+    writeFileSync(join(x.project, "README.md"), "changed\n");
+    const r = await x.progress({ phase: "fix", checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    expect(r.content[0]!.text).toContain("undo point skipped: changed secret files .npmrc");
+    expect(() => git(x.project, "rev-parse", "--verify", "--quiet", "refs/factory/undo/fix-1")).toThrow();
+    const objects = git(x.project, "cat-file", "--batch-all-objects", "--batch-check").split("\n").map((l) => l.split(" ")[0]!);
+    for (const o of objects) {
+      const type = git(x.project, "cat-file", "-t", o);
+      if (type === "blob") expect(git(x.project, "cat-file", "-p", o)).not.toContain(TOKEN);
+    }
+  });
+
+  it("F9: the undo point is created with the fallback identity when git has none", async () => {
+    const x = await wired();
+    git(x.project, "config", "user.name", "");
+    git(x.project, "config", "user.email", "");
+    setRoute(x.small);
+    writeFileSync(join(x.project, "README.md"), "changed\n");
+    const r = await x.progress({ phase: "fix", checkpoint: true });
+    expect(r.isError).not.toBe(true);
+    const ref = git(x.project, "rev-parse", "refs/factory/undo/fix-1");
+    expect(git(x.project, "show", `${ref}:README.md`)).toBe("changed");
+  });
+
   it("M3: the undo ref keeps a reflog, so an earlier undo point stays reachable", async () => {
     const x = await wired();
     setRoute(x.small);

@@ -75,6 +75,8 @@ export interface Checkpoint {
   changed: boolean;
   /** R34: changed secret-path files left out of the commit (worktree-relative). */
   excluded: string[];
+  /** R55: small route only; changed secret files that made the undo point be skipped (no ref was written). */
+  skipped?: string[];
 }
 
 interface Details {
@@ -130,6 +132,15 @@ const head = (git: Git, cwd: string): string => {
   if (r.status !== 0 || !COMMIT_ID.test(sha)) throw gitError("git rev-parse HEAD", r);
   return sha;
 };
+
+/** R49: the user's identity when both name and email are configured; otherwise a fixed one for this one command. */
+function identityArgs(git: Git, cwd: string): string[] {
+  const configured = (key: string) => {
+    const r = git(cwd, ["config", key]);
+    return r.status === 0 && r.stdout.trim() !== "";
+  };
+  return configured("user.name") && configured("user.email") ? [] : ["-c", "user.name=ai-factory", "-c", "user.email=ai-factory@localhost"];
+}
 
 /** True for a worktree-relative path the gate treats as a secret (R34: never stored in git objects). */
 export type SecretTest = (relative: string) => boolean;
@@ -187,11 +198,7 @@ export function commitCheckpoint(worktree: string, subject: string, message: str
     if (stagedPaths.length === 0) return { sha: head(git, worktree), kind: "commit", changed: false, excluded };
     const body = message !== undefined && message.trim() !== "" ? ["-m", message.trim()] : [];
     // R49: the user's identity when both name and email are configured; otherwise a fixed one for this commit only.
-    const configured = (key: string) => {
-      const r = git(worktree, ["config", key]);
-      return r.status === 0 && r.stdout.trim() !== "";
-    };
-    const identity = configured("user.name") && configured("user.email") ? [] : ["-c", "user.name=ai-factory", "-c", "user.email=ai-factory@localhost"];
+    const identity = identityArgs(git, worktree);
     const commit = git(worktree, [...identity, "commit", "--no-verify", "-q", "-m", subject, ...body]);
     if (commit.status !== 0) {
       const err = gitError("git commit", commit);
@@ -209,11 +216,20 @@ export function commitCheckpoint(worktree: string, subject: string, message: str
  * through its reflog); HEAD when there is nothing to stash. Untracked files are not part of the undo point
  * (`git stash create` has no `-u`).
  */
-export function undoCheckpoint(root: string, taskId: string, subject: string): Checkpoint {
+export function undoCheckpoint(root: string, taskId: string, subject: string, isSecret: SecretTest): Checkpoint {
   return withSafeGit((git) => {
     const current = head(git, root);
+    // R55: `git stash create` would write the changed secret files into git objects: no undo point in that case.
+    const status = git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=no", "--no-renames"]);
+    if (status.status !== 0) throw gitError("git status", status);
+    const secrets = status.stdout
+      .split("\0")
+      .filter((e) => e.length >= 4)
+      .map((e) => e.slice(3))
+      .filter((p) => isSecret(p));
+    if (secrets.length > 0) return { sha: current, kind: "undo-ref", changed: false, excluded: [], skipped: secrets };
     // The subject starts with "factory", so git never reads it as an option.
-    const stash = git(root, ["stash", "create", subject]);
+    const stash = git(root, [...identityArgs(git, root), "stash", "create", subject]);
     if (stash.status !== 0) throw gitError("git stash create", stash);
     const created = stash.stdout.trim();
     if (created !== "" && !COMMIT_ID.test(created)) throw new Refusal(`git stash create returned an unexpected value: ${created.slice(0, 80)}`);
@@ -443,7 +459,7 @@ export function registerTaskState(pi: TaskPi, deps: TaskStateDeps): TaskStateHan
       const secretCtx = { home: s.home, piAgentDir: s.piAgentDir, platform: hostPlatform() };
       checkpoint = tiered
         ? commitCheckpoint(worktree, subject, message, (p) => isSecretPath(join(worktree, p), secretCtx))
-        : undoCheckpoint(root, taskId, message !== undefined ? `${subject} - ${message}` : subject);
+        : undoCheckpoint(root, taskId, message !== undefined ? `${subject} - ${message}` : subject, (p) => isSecretPath(join(root, p), secretCtx));
       try {
         s.ledger.append({
           v: 1,
@@ -481,9 +497,11 @@ export function registerTaskState(pi: TaskPi, deps: TaskStateDeps): TaskStateHan
     const parts = [`Progress recorded for task ${taskId}${phase !== undefined ? ` (phase ${phase})` : ""}.`];
     if (checkpoint !== undefined) {
       parts.push(
-        checkpoint.kind === "commit"
-          ? `Checkpoint ${checkpoint.sha}: ${checkpoint.changed ? "committed in" : "no changes to commit in"} ${route.worktree}.`
-          : `Checkpoint ${checkpoint.sha}: undo point refs/factory/undo/${taskId}${checkpoint.changed ? "" : " (no uncommitted changes; points at HEAD)"}; the working tree is unchanged.`,
+        checkpoint.skipped !== undefined
+          ? `Checkpoint recorded at ${checkpoint.sha} without an undo point: undo point skipped: changed secret files ${checkpoint.skipped.join(", ")} (R55; a secret must not enter git objects). No refs/factory/undo/${taskId} was written; the working tree is unchanged.`
+          : checkpoint.kind === "commit"
+            ? `Checkpoint ${checkpoint.sha}: ${checkpoint.changed ? "committed in" : "no changes to commit in"} ${route.worktree}.`
+            : `Checkpoint ${checkpoint.sha}: undo point refs/factory/undo/${taskId}${checkpoint.changed ? "" : " (no uncommitted changes; points at HEAD)"}; the working tree is unchanged.`,
       );
       if (checkpoint.excluded.length > 0) {
         parts.push(`Left out of the checkpoint because they are secret paths (R34; they stay in the working tree, uncommitted): ${checkpoint.excluded.join(", ")}.`);
