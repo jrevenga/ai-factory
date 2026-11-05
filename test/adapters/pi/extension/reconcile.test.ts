@@ -899,3 +899,88 @@ describe("mergeReplayOrder (R61)", () => {
     expect(names(mergeReplayOrder([run]))).toEqual(["r1-2", "r1-1"]);
   });
 });
+
+describe("R60: new files are judged under the snapshot's ignore rules", () => {
+  it("a runner that ignores `.factory/` and creates `.factory/config.json` has the file moved aside and `.gitignore` restored", async () => {
+    const r = await repo();
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    writeFileSync(join(r.root, ".gitignore"), "dist/\n.factory/\n");
+    mkdirSync(join(r.root, ".factory"));
+    writeFileSync(join(r.root, ".factory", "config.json"), '{"commands":{}}\n');
+    const res = reconcileAfter(r.root, snap);
+    expect(read(join(r.root, ".gitignore"))).toBe("dist/\n");
+    expect(existsSync(join(r.root, ".factory", "config.json"))).toBe(false);
+    expect(read(join(bd, "after", ".factory", "config.json"))).toBe('{"commands":{}}\n');
+    expect(res.reverted).toContain(".gitignore");
+    expect(res.moved).toContain(".factory/config.json");
+  });
+
+  it("a runner that removes an ignore pattern does not get pre-existing ignored outputs moved aside", async () => {
+    const r = await repo();
+    mkdirSync(join(r.root, "dist"));
+    writeFileSync(join(r.root, "dist", "out.js"), "built before\n");
+    const snap = takeSnapshot(r.root, r.backupDir());
+    writeFileSync(join(r.root, ".gitignore"), "");
+    const res = reconcileAfter(r.root, snap);
+    expect(read(join(r.root, ".gitignore"))).toBe("dist/\n");
+    expect(read(join(r.root, "dist", "out.js"))).toBe("built before\n");
+    expect(res.moved).toEqual([]);
+    expect(res.reverted).toEqual([".gitignore"]);
+  });
+
+  it("a new nested .gitignore (even one that ignores itself) is moved aside, and the files it hid are moved aside too", async () => {
+    const r = await repo();
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    writeFileSync(join(r.root, "src", ".gitignore"), "*\n");
+    writeFileSync(join(r.root, "src", "hidden.txt"), "created by the runner\n");
+    const res = reconcileAfter(r.root, snap);
+    expect(existsSync(join(r.root, "src", ".gitignore"))).toBe(false);
+    expect(existsSync(join(r.root, "src", "hidden.txt"))).toBe(false);
+    expect(res.moved.sort()).toEqual(["src/.gitignore", "src/hidden.txt"]);
+    expect(read(join(bd, "after", "src", "hidden.txt"))).toBe("created by the runner\n");
+  });
+
+  it("a new .gitignore inside an ignored output directory is an ignored output and stays", async () => {
+    const r = await repo();
+    const snap = takeSnapshot(r.root, r.backupDir());
+    mkdirSync(join(r.root, "dist"));
+    writeFileSync(join(r.root, "dist", ".gitignore"), "*\n");
+    writeFileSync(join(r.root, "dist", "out.js"), "built\n");
+    const res = reconcileAfter(r.root, snap);
+    expect(read(join(r.root, "dist", ".gitignore"))).toBe("*\n");
+    expect(read(join(r.root, "dist", "out.js"))).toBe("built\n");
+    expect(res.moved).toEqual([]);
+  });
+
+  it("a pre-existing ignored .gitignore that the runner rewrites is restored, not moved aside", async () => {
+    const r = await repo();
+    mkdirSync(join(r.root, "gen"));
+    writeFileSync(join(r.root, "gen", ".gitignore"), "*\n");
+    writeFileSync(join(r.root, "gen", "keep.out"), "generated before\n");
+    const snap = takeSnapshot(r.root, r.backupDir());
+    writeFileSync(join(r.root, "gen", ".gitignore"), "");
+    const res = reconcileAfter(r.root, snap);
+    expect(read(join(r.root, "gen", ".gitignore"))).toBe("*\n");
+    expect(read(join(r.root, "gen", "keep.out"))).toBe("generated before\n");
+    expect(res.moved).toEqual([]);
+    expect(res.reverted).toEqual(["gen/.gitignore"]);
+  });
+
+  it(".git/info/exclude is snapshotted and restored: a runner-added exclude does not hide its new file", async () => {
+    const r = await repo();
+    const exclude = join(r.root, ".git", "info", "exclude");
+    const original = existsSync(exclude) ? read(exclude) : undefined;
+    const bd = r.backupDir();
+    const snap = takeSnapshot(r.root, bd);
+    mkdirSync(join(r.root, ".git", "info"), { recursive: true });
+    writeFileSync(exclude, `${original ?? ""}secret-drop.txt\n`);
+    writeFileSync(join(r.root, "secret-drop.txt"), "created by the runner\n");
+    const res = reconcileAfter(r.root, snap);
+    expect(existsSync(exclude) ? read(exclude) : undefined).toBe(original);
+    expect(existsSync(join(r.root, "secret-drop.txt"))).toBe(false);
+    expect(res.moved).toContain("secret-drop.txt");
+    expect(res.reverted).toContain("(.git/info/exclude)");
+  });
+});

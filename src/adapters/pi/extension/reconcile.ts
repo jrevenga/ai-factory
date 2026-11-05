@@ -131,6 +131,16 @@ export interface Snapshot {
   /** The running call the snapshotted call was nested in (`ctx.executeTool`), when it was nested. */
   parentToolCallId?: string;
   /**
+   * R60: pre-existing untracked `.gitignore` files that are themselves ignored but still read by git (they lie in a
+   * directory git traverses); copied to `before/<path>` like untracked entries. Absent in manifests written before R60.
+   */
+  ignoreFiles?: UntrackedEntry[];
+  /**
+   * R60: the repository's `info/exclude` (`git rev-parse --git-path info/exclude`), copied to `<backupDir>/info-exclude`
+   * when it is a file. Absent in manifests written before R60.
+   */
+  infoExclude?: { file: string; state: EntryState };
+  /**
    * Snapshot order within the run (1, 2, ...): a nested call is always snapshotted after its parent, so a replay in
    * descending order reconciles innermost first. Manifests written before this field fall back to `createdAt`.
    */
@@ -380,6 +390,19 @@ function untrackedPaths(gitBytes: GitBytes, top: string, env: Record<string, str
   return nulSplit(gitBytesOk(gitBytes, top, ["ls-files", "--others", "--exclude-standard", "-z"], "git ls-files --others", env));
 }
 
+/**
+ * R60: untracked paths git ignores, listed as git walks (`--directory`): an ignored directory git does not enter is
+ * one `dir/` entry; a file listed on its own lies in a directory git traverses (so a `.gitignore` there is read).
+ */
+function ignoredPaths(gitBytes: GitBytes, top: string, env: Record<string, string>): string[] {
+  return nulSplit(gitBytesOk(gitBytes, top, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], "git ls-files --others --ignored", env));
+}
+
+const IGNORE_FILE = ".gitignore";
+const isIgnoreFile = (rel: string) => !rel.endsWith("/") && rel.split("/").at(-1) === IGNORE_FILE;
+/** The name `info/exclude` has in results, notes and the journal. */
+const INFO_EXCLUDE = "(.git/info/exclude)";
+
 // --- Snapshot ---------------------------------------------------------------------------------------------------
 
 /** Read-only git against the backed-up index, never writing an optional lock or a refreshed index. */
@@ -425,6 +448,17 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
   const indexExisted = indexKind === "file";
   if (indexExisted) readRegular(indexFile, objectFormat, path.join(backupDir, "index"));
   const env = readEnv(backupDir);
+
+  // R60: the ignore rules outside the tracked files: info/exclude, and ignored `.gitignore` files git still reads.
+  const excludeFile = gitPathOf(git, top, "info/exclude");
+  const excludeKind = kindOf(excludeFile);
+  if (excludeKind !== "missing" && excludeKind !== "file") throw new ReconcileRefusal(`${excludeFile} is not a regular file`);
+  let excludeState: EntryState = { kind: "missing" };
+  if (excludeKind === "file") {
+    const h = readRegular(excludeFile, objectFormat, path.join(backupDir, "info-exclude"));
+    excludeState = { kind: "file", sha256: h.sha256, mode: h.mode, size: h.size };
+  }
+  const ignoredRuleFiles = ignoredPaths(gitBytes, top, env).filter(isIgnoreFile);
 
   // Untracked non-ignored files: counted and sized before anything is read (R38 cap).
   const skipped: string[] = [];
@@ -492,6 +526,13 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
     if (state.kind === "file" || state.kind === "symlink") backupEntry(top, backupDir, p, state, objectFormat);
     if (state.kind !== "missing") untracked.push({ path: p, state });
   }
+  const ignoreFiles: UntrackedEntry[] = [];
+  for (const p of ignoredRuleFiles) {
+    const state = stateOf(top, p, objectFormat, cache);
+    if (state.kind === "blocked" || state.kind === "missing") continue;
+    if (state.kind === "file" || state.kind === "symlink") backupEntry(top, backupDir, p, state, objectFormat);
+    ignoreFiles.push({ path: p, state });
+  }
 
   const snapshot: Snapshot = {
     v: 1,
@@ -504,6 +545,8 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
     tracked,
     untracked,
     skipped,
+    ignoreFiles,
+    infoExclude: { file: excludeFile, state: excludeState },
     ...(meta.toolCallId !== undefined ? { toolCallId: meta.toolCallId } : {}),
     ...(meta.parentToolCallId !== undefined ? { parentToolCallId: meta.parentToolCallId } : {}),
     ...(meta.seq !== undefined ? { seq: meta.seq } : {}),
@@ -867,14 +910,64 @@ class Restorer {
     }
   }
 
-  /** `after/index`, or `after/index-<n>` when a replay already put an index there. */
-  private indexAside(): string {
+  /** `after/<name>`, or `after/<name>-<n>` when a replay already put one there. */
+  private fileAside(name: string): string {
     const dir = path.join(this.s.backupDir, "after");
     mkdirsPrivate(this.s.backupDir, dir);
     for (let n = 1; ; n++) {
-      const dst = path.join(dir, n === 1 ? "index" : `index-${n}`);
+      const dst = path.join(dir, n === 1 ? name : `${name}-${n}`);
       if (kindOf(dst) === "missing") return dst;
     }
+  }
+
+  /** `after/index`, or `after/index-<n>` when a replay already put an index there. */
+  private indexAside(): string {
+    return this.fileAside("index");
+  }
+
+  /**
+   * R60: brings the repository's `info/exclude` back to its snapshot state (the current one is copied to
+   * `after/info-exclude` first). Throws when it cannot: new files could not be judged under the snapshot's rules.
+   */
+  restoreInfoExclude(want: { file: string; state: EntryState }): void {
+    const curKind = kindOf(want.file);
+    if (curKind !== "missing" && curKind !== "file") throw new Error(`${want.file} is not a regular file: the ignore rules cannot be restored`);
+    const cur: EntryState = curKind === "missing" ? { kind: "missing" } : (() => {
+      const h = readRegular(want.file, "sha1");
+      return { kind: "file", sha256: h.sha256, mode: h.mode, size: h.size } as const;
+    })();
+    if (sameState(cur, want.state)) return;
+    let data: Buffer | undefined;
+    if (want.state.kind === "file") {
+      data = readFileSync(path.join(this.s.backupDir, "info-exclude"));
+      if (sha256Of(data) !== want.state.sha256) throw new Error(`the backup of ${want.file} does not match the snapshot`);
+    } else if (want.state.kind !== "missing") {
+      throw new Error(`${want.file} cannot be restored to a ${want.state.kind}`);
+    }
+    if (cur.kind === "file") {
+      const dst = this.fileAside("info-exclude");
+      readRegular(want.file, "sha1", dst);
+      this.record({ op: "aside", path: INFO_EXCLUDE, copy: dst });
+    }
+    if (data === undefined) {
+      unlinkSync(want.file);
+    } else {
+      mkdirSync(path.dirname(want.file), { recursive: true });
+      const tmp = `${want.file}.factory-reconcile-${process.pid}-${randomBytes(4).toString("hex")}`;
+      try {
+        writeFileSync(tmp, data, { flag: "wx", mode: want.state.kind === "file" ? want.state.mode : FILE_MODE });
+        renameSync(tmp, want.file);
+      } catch (e) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          // Not created, or already renamed.
+        }
+        throw e;
+      }
+    }
+    this.result.reverted.push(INFO_EXCLUDE);
+    this.record({ op: "reverted", path: INFO_EXCLUDE });
   }
 
   /**
@@ -1039,6 +1132,10 @@ function reconcilePhases(r: Restorer, s: Snapshot, gitBytes: GitBytes): void {
   const known = new Set(s.untracked.map((u) => u.path));
   const skippedNested = new Set(s.skipped.filter((x) => x.endsWith(" (nested repository)")).map((x) => x.slice(0, -" (nested repository)".length)));
 
+  // 0b. R60: the snapshot's ignore rules come back before any new file is judged, so a runner cannot hide a new file
+  //     behind a rule it added, nor expose an ignored output by removing one.
+  restoreIgnoreRules(r, s, gitBytes, env, new Set([...trackedPaths, ...known, ...(s.ignoreFiles ?? []).map((u) => u.path)]));
+
   // 1. New untracked non-ignored entries (relative to the snapshot's index) are moved aside first: this also frees
   //    paths where the command put a file, a directory or a symlink in place of a tracked file's parent.
   for (const p of untrackedPaths(gitBytes, s.root, env)) {
@@ -1087,6 +1184,38 @@ function reconcilePhases(r: Restorer, s: Snapshot, gitBytes: GitBytes): void {
     } catch (e) {
       rethrowInterrupt(e);
       r.result.notRestored.push(`${u.path} (${(e as Error).message})`);
+    }
+  }
+}
+
+/**
+ * R60: puts the snapshot's ignore rules back: `info/exclude`, tracked `.gitignore` files, and pre-existing untracked
+ * `.gitignore` files (ignored or not); then moves aside, shallowest first, every new `.gitignore` in a directory git
+ * traverses, until none is left (a new one in an ignored directory is never read and is an ignored output). Throws
+ * when a rule file cannot be restored: new files could not be judged, so the reconcile fails and is retried.
+ */
+function restoreIgnoreRules(r: Restorer, s: Snapshot, gitBytes: GitBytes, env: Record<string, string>, known: ReadonlySet<string>): void {
+  if (s.infoExclude !== undefined) r.restoreInfoExclude(s.infoExclude);
+  const rules = [
+    ...s.tracked.filter((t) => isIgnoreFile(t.path)).map((t) => ({ path: t.path, state: t.state, backup: t.backup, oid: t.oid })),
+    ...[...s.untracked, ...(s.ignoreFiles ?? [])].filter((u) => isIgnoreFile(u.path)).map((u) => ({ path: u.path, state: u.state, backup: true, oid: "" })),
+  ];
+  for (const f of rules) {
+    if (sameState(stateOf(s.root, f.path, "sha1"), f.state)) continue;
+    r.restore(f.path, f.state, stateOf(s.root, f.path, "sha1"), f.backup, f.oid);
+    if (!sameState(stateOf(s.root, f.path, "sha1"), f.state)) throw new Error(`the ignore rules could not be restored (${f.path}), so new files cannot be judged`);
+  }
+  for (let round = 0; ; round++) {
+    const listed = [...untrackedPaths(gitBytes, s.root, env), ...ignoredPaths(gitBytes, s.root, env)];
+    const fresh = [...new Set(listed.filter((p) => isIgnoreFile(p) && !known.has(p)))];
+    if (fresh.length === 0) return;
+    if (round >= 1000) throw new Error("new .gitignore files keep appearing: new files cannot be judged");
+    const depth = (p: string) => p.split("/").length;
+    const shallowest = Math.min(...fresh.map(depth));
+    for (const rel of fresh.filter((p) => depth(p) === shallowest)) {
+      const copy = r.moveAside(rel, false);
+      r.result.moved.push(rel);
+      r.record({ op: "moved", path: rel, ...(copy !== undefined ? { copy } : {}) });
     }
   }
 }
