@@ -213,17 +213,24 @@ function analyzeWrite(fact: PathFacts, ctx: GateContext, targetExists: boolean |
   const rootTarget = (cls.within === "write-root" && cls.relative === "") || projectRel === "";
   const a: WriteAnalysis = { cls, gitDir, rootTarget };
 
-  if (under(fact, [ctx.ledgerDir], ctx) !== undefined) {
+  // R57: protected areas apply to the lexical spelling as well as to the resolved destination.
+  const spellings: PathFacts[] = [fact, ...(fact.lexical !== undefined && fact.lexical !== "" ? [{ ...fact, resolved: fact.lexical }] : [])];
+  if (spellings.some((f) => under(f, [ctx.ledgerDir], ctx) !== undefined)) {
     a.deny = "writes under the run ledger directory are denied (only extension code writes machine state)";
     return a;
   }
   // `.factory/` is protected under every write root and under the project root (ruling 7, ruling 18).
+  for (const f of spellings) {
+    const c = f === fact ? cls : classifyPath(f, pathContext(ctx, ctx.route.writeRoots, ctx.tmpRoots));
+    const relOf = c.within === "write-root" ? c.relative : under(f, [ctx.projectRoot], ctx)?.relative;
+    const parts = relOf !== undefined ? segments(relOf, platform) : [];
+    if (parts[0]?.toLowerCase() === ".factory" && !factoryWriteAllowed(parts, ctx, targetExists, platform)) {
+      a.deny = `writes inside .factory/ are limited to this task's knowledge files and new decision files (${parts.join("/")})`;
+      return a;
+    }
+  }
   const relString = cls.within === "write-root" ? cls.relative : projectRel;
   const rel = relString !== undefined ? segments(relString, platform) : [];
-  if (rel[0]?.toLowerCase() === ".factory" && !factoryWriteAllowed(rel, ctx, targetExists, platform)) {
-    a.deny = `writes inside .factory/ are limited to this task's knowledge files and new decision files (${rel.join("/")})`;
-    return a;
-  }
   if (by === "command") {
     if (cls.within === "write-root" && isTaskFile(rel, ctx, platform)) {
       a.deny = "the task file holds the machine-owned section: change it with write/edit, not a command";

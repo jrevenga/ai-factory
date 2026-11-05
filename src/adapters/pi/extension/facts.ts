@@ -178,8 +178,28 @@ function isDirectoryNow(p: string): boolean {
   }
 }
 
-function resolvedFact(input: string, resolved: string, platform: PathPlatform): PathFacts {
-  return { input, resolved, platform, exists: lexists(resolved), directory: isDirectoryNow(resolved) };
+function resolvedFact(input: string, resolved: string, platform: PathPlatform, lexical?: string): PathFacts {
+  return { input, resolved, platform, exists: lexists(resolved), directory: isDirectoryNow(resolved), ...(lexical !== undefined ? { lexical } : {}) };
+}
+
+/**
+ * R57: the normalised absolute spelling of `abs` with symbolic links kept as they are. A part that is `cwd`
+ * itself is anchored on cwd's real path, so it compares with the (realpathed) roots.
+ */
+function lexicalPath(abs: string, cwd: string, platform: PathPlatform): string | undefined {
+  try {
+    const a = platform === "win32" ? path.win32 : path.posix;
+    const norm = a.normalize(abs);
+    if (!a.isAbsolute(norm)) return undefined;
+    const fold = (x: string) => (platform === "win32" ? x.toLowerCase() : x);
+    const rel = a.relative(fold(cwd), fold(norm));
+    if (rel === "" || (!rel.startsWith("..") && !a.isAbsolute(rel))) {
+      return a.join(realTarget(a.normalize(cwd)), norm.slice(norm.length - rel.length));
+    }
+    return norm;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Pi's `resolveReadPath` fallbacks for a missing path (macOS screenshot names, NFD, curly quotes). */
@@ -210,7 +230,7 @@ export function pathFacts(p: string, cwd: string, home: string, opts: PathFactsO
   try {
     let lexical = resolveToolPath(p, cwd, home, platform);
     if (opts.read) lexical = readVariant(lexical);
-    return resolvedFact(p, realTarget(lexical), platform);
+    return resolvedFact(p, realTarget(lexical), platform, lexicalPath(lexical, cwd, platform));
   } catch {
     return unresolvable(p, platform);
   }
@@ -256,7 +276,7 @@ export function commandPathFacts(arg: string, cwd: string, home: string): PathFa
   return commandCandidates(arg, cwd, realHome, platform).map((abs) => {
     if (abs === "") return unresolvable(arg, platform);
     try {
-      return resolvedFact(arg, realTarget(abs), platform);
+      return resolvedFact(arg, realTarget(abs), platform, lexicalPath(abs, cwd, platform));
     } catch {
       return unresolvable(arg, platform);
     }

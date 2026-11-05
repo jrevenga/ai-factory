@@ -403,6 +403,35 @@ describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
     expect(calls[2]?.title).toBe("Factory gate: secrets");
   });
 
+  it.skipIf(process.platform === "win32")("R57: .factory protection applies to the lexical path as well as the resolved destination", async () => {
+    const w = await world();
+    const attempt = (path: string) => enforce(call("write", { path, content: "{}" }), { cwd: w.root }, w.deps(w.feature));
+    // .factory/config.json is a symlink to an ordinary project file.
+    mkdirSync(join(w.real, ".factory"), { recursive: true });
+    writeFileSync(join(w.real, "shared.json"), "{}");
+    symlinkSync(join("..", "shared.json"), join(w.real, ".factory", "config.json"));
+    const r1 = await attempt(".factory/config.json");
+    expect(r1?.block).toBe(true);
+    expect(r1?.reason).toContain(".factory/");
+    // .factory itself is a symlink to a directory outside the project.
+    const w2 = await world();
+    const elsewhere = join(w2.dir, "elsewhere");
+    mkdirSync(elsewhere, { recursive: true });
+    symlinkSync(elsewhere, join(w2.real, ".factory"));
+    const r2 = await enforce(call("write", { path: ".factory/config.json", content: "{}" }), { cwd: w2.root }, w2.deps(w2.feature));
+    expect(r2?.block).toBe(true);
+    // A project file that is a symlink INTO .factory/config.json (resolved-path behaviour, kept).
+    const w3 = await world();
+    mkdirSync(join(w3.real, ".factory"), { recursive: true });
+    writeFileSync(join(w3.real, ".factory", "config.json"), "{}");
+    symlinkSync(join(".factory", "config.json"), join(w3.real, "cfg.json"));
+    const r3 = await enforce(call("write", { path: "cfg.json", content: "{}" }), { cwd: w3.root }, w3.deps(w3.feature));
+    expect(r3?.block).toBe(true);
+    // The same through a command write target.
+    const r4 = await enforce(call("bash", { command: "echo x > .factory/config.json" }), { cwd: w.root }, w.deps(w.feature));
+    expect(r4?.block).toBe(true);
+  });
+
   it("R28: facts report whether each target exists", async () => {
     const w = await world();
     writeFileSync(join(w.root, "a.txt"), "a");

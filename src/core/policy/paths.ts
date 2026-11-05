@@ -21,6 +21,12 @@ export interface PathFacts {
    * `git add` path counts as an explicit file only when this is `false`.
    */
   directory?: boolean;
+  /**
+   * R57: the absolute path as spelled, normalised, with symbolic links NOT resolved (a leading part that is
+   * Pi's working directory is anchored on its real path). Protected-area rules apply to this spelling and to
+   * `resolved`: either one inside a protected area protects the target. Undefined when not supplied.
+   */
+  lexical?: string;
 }
 
 export interface PathContext {
