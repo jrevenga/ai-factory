@@ -11,7 +11,7 @@
 // The `CheckRecord` holds the fingerprints before and after (`mutated` when they differ).
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, writeSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeSync } from "node:fs";
 import { constants as osConstants, homedir, tmpdir } from "node:os";
 import path, { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -104,6 +104,20 @@ export function secretTestFor(top: string, ctx: { home: string; piAgentDir: stri
  * their hash without writing the blob; the tree is then written with `--missing-ok`. A change to a non-ignored
  * secret file still changes the fingerprint, but its content never reaches the object database.
  */
+/**
+ * Copies the index for a scratch `git add`, keeping its modification time no later than the original's. Git trusts an
+ * entry's cached stat data only when the entry is older than the index file; an entry written in the same timestamp
+ * tick as the index ("racily clean") is compared by content instead. A copy with a fresh mtime would turn those
+ * entries into trusted ones, so a same-size edit made in that tick would be missed. The time is rounded down by one
+ * microsecond (`utimes` takes a double): an earlier index only makes more entries compared by content.
+ */
+function copyIndexKeepingMtime(index: string, copy: string): void {
+  copyFileSync(index, copy);
+  const st = statSync(index, { bigint: true });
+  const seconds = (ns: bigint) => Number(ns / 1000n - 1n) / 1e6;
+  utimesSync(copy, seconds(st.atimeNs), seconds(st.mtimeNs));
+}
+
 export function fingerprint(dir: string, isSecret?: SecretTest, opts: FingerprintOptions = {}): string {
   return withSafeGit((git) => {
     const topRun = git(dir, ["rev-parse", "--show-toplevel"]);
@@ -116,7 +130,7 @@ export function fingerprint(dir: string, isSecret?: SecretTest, opts: Fingerprin
     const tmp = mkdtempSync(join(tmpdir(), "factory-fingerprint-"));
     try {
       const tmpIndex = join(tmp, "index");
-      if (existsSync(index)) copyFileSync(index, tmpIndex);
+      if (existsSync(index)) copyIndexKeepingMtime(index, tmpIndex);
       const env: Record<string, string> = { GIT_INDEX_FILE: tmpIndex };
       if (opts.isolateObjects === true) {
         const objects = join(tmp, "objects");

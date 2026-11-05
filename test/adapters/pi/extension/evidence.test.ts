@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { currentRoute as currentRouteForTest, enforce, GatedChecks, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "../../../../src/adapters/pi/extension/enforce.ts";
 import {
@@ -254,6 +254,25 @@ describe("fingerprint (ruling 11)", () => {
     mkdirSync(join(x.wt, "out"), { recursive: true });
     writeFileSync(join(x.wt, "out", "build.log"), "x\n");
     expect(fingerprint(x.wt)).toBe(added);
+  });
+
+  it("sees a same-size edit made in the index's timestamp tick (racily clean entry): the copied index keeps its mtime", async () => {
+    const x = await world();
+    // Git trusts an entry's cached stat only when the entry is older than the index file. Pin the README's mtime and
+    // the index's mtime to the same instant, and ignore ctime, so the edit below is invisible to stat alone.
+    git(x.wt, "config", "core.trustctime", "false");
+    const tick = new Date("2026-01-01T00:00:00.000Z");
+    const readme = join(x.wt, "README.md");
+    utimesSync(readme, tick, tick);
+    git(x.wt, "add", "README.md");
+    git(x.wt, "commit", "-q", "--allow-empty", "-m", "pin readme stat");
+    const fp = fingerprint(x.wt);
+    writeFileSync(readme, "edited\n");
+    expect(readFileSync(readme, "utf8").length).toBe("readme\n".length);
+    utimesSync(readme, tick, tick);
+    const gitPath = git(x.wt, "rev-parse", "--git-path", "index").trim();
+    utimesSync(isAbsolute(gitPath) ? gitPath : join(x.wt, gitPath), tick, tick);
+    expect(fingerprint(x.wt)).not.toBe(fp);
   });
 
   it("never writes the user's index and leaves no temporary index behind", async () => {
