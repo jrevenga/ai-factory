@@ -8,12 +8,12 @@
 //
 // Fix round 1: replay completion is tracked by the manifests themselves (a manifest stays retryable until it is `done`),
 // not by the interruption marker. Every startup looks at every interrupted run with unfinished reconciles and replays
-// it under a replay claim (`ledger.claimReplay`) that a live session holds exclusively and that a later startup takes
-// over once its holder is gone.
+// it under the run's replay lock (fix round 2: `ledger.acquireReplayLock`, a `replay.lock` directory) that a live
+// session holds exclusively and that a later startup takes over once its holder is gone.
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RunEvent } from "../../../core/ledger/events.ts";
-import { claimReplay, ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
+import { acquireReplayLock, holdsReplayLock, ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
 import { hasUnfinishedReconciles, replayInterrupted, type Diagnose } from "./reconcile.ts";
 import { lastRouteEntryRunId } from "./route-state.ts";
 
@@ -91,7 +91,7 @@ export interface ReplayInput {
  * After `run_start`: finishes the answer-route reconciliations that interrupted runs of the project left unfinished,
  * audited in this run's ledger. A run qualifies when its `reconcile/` holds unfinished work (reconcile.ts
  * `hasUnfinishedReconciles`) and it is interrupted (`ledger.runInterrupted`), whoever detected it; it is replayed only
- * under its replay claim, so a run a live session is replaying is skipped. Newest run first (reverse snapshot order
+ * under its replay lock, so a run a live session is replaying is left to it (a note says so). Newest run first (reverse snapshot order
  * across runs, as within one). A failure is reported (note, `diagnose`, ledger `error`) and left for a retry. Returns
  * one note per replayed, kept or failed item, prefixed with the interrupted run's id.
  */
@@ -113,8 +113,12 @@ export function replayInterruptedRuns(input: ReplayInput, ledger: Sink, diagnose
     const runDir = join(dir, runId);
     try {
       if (!hasUnfinishedReconciles(runDir) || runInterrupted(dir, runId, input.isAlive) !== true) continue;
-      if (!claimReplay(runDir, input.runId, input.isAlive)) continue;
-      for (const outcome of replayInterrupted(runDir, ledger, input.runId, diagnose)) {
+      if (!acquireReplayLock(runDir, input.runId, input.isAlive)) {
+        notes.push(`Interrupted factory run ${runId}: replay in progress elsewhere; another live session holds the replay lock of its answer-route reconciles, so they are left to it`);
+        continue;
+      }
+      const owns = () => holdsReplayLock(runDir, input.runId);
+      for (const outcome of replayInterrupted(runDir, ledger, input.runId, diagnose, { owns })) {
         for (const n of outcome.notes) notes.push(`Interrupted factory run ${runId}: ${n}`);
       }
     } catch (e) {

@@ -8,13 +8,14 @@ import {
   fstatSync,
   fsyncSync,
   ftruncateSync,
-  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
   writeSync,
@@ -355,79 +356,139 @@ export function runInterrupted(dir: string, runId: string, isAlive: (pid: number
   return pid === undefined || !isAlive(pid);
 }
 
-/** `<runDir>/replay-<n>.claim`: generation `n` of the claim to replay an interrupted run's reconciles. */
-const REPLAY_CLAIM = /^replay-(\d+)\.claim$/;
-/** A claim file without a readable holder is treated as held for this long (its writer may still be writing it). */
-const UNREADABLE_CLAIM_GRACE_MS = 10_000;
+/** Fix round 2 (R50.3): `<runDir>/replay.lock`, the directory lock to replay an interrupted run's reconciles. */
+export const REPLAY_LOCK = "replay.lock";
+const LOCK_OWNER = "owner";
+/** A lock directory without a readable owner is treated as held for this long (its creator may still be writing it). */
+const OWNERLESS_LOCK_GRACE_MS = 10_000;
+const LOCK_ATTEMPTS = 3;
 
-/** The holder of a replay claim is alive (its runId's pid); an unreadable holder counts as alive while it is recent. */
-function claimHolderAlive(file: string, isAlive: (pid: number) => boolean): boolean {
-  let text: string;
+/**
+ * The start time of process `pid` (Linux: field 22 of `/proc/<pid>/stat`, in clock ticks since boot), so a recorded
+ * holder is not mistaken for an unrelated process that reused its pid. Undefined where it cannot be read.
+ */
+export function processStart(pid: number): string | undefined {
+  if (process.platform !== "linux") return undefined;
   try {
-    text = readFileSync(file, "utf8").trim();
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return fields[19];
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a contender saw at the lock path: the directory's identity and its owner record (empty: none yet). */
+interface LockView {
+  ino: number;
+  owner: string;
+  mtimeMs: number;
+}
+
+function viewLock(dir: string): LockView | undefined {
+  let st;
+  try {
+    st = lstatSync(dir);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw e;
   }
-  const m = RUN_ID.test(text) ? /-(\d+)$/.exec(text) : null;
-  if (m) return isAlive(Number(m[1]));
+  let owner = "";
   try {
-    return Date.now() - lstatSync(file).mtimeMs < UNREADABLE_CLAIM_GRACE_MS;
+    owner = readFileSync(join(dir, LOCK_OWNER), "utf8");
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") throw e;
+  }
+  return { ino: st.ino, owner, mtimeMs: st.mtimeMs };
+}
+
+/** The holder recorded in `owner` is alive: its pid is alive and, where recorded and readable, has the same start. */
+function lockHolderAlive(view: LockView, isAlive: (pid: number) => boolean): boolean {
+  let rec: { pid?: unknown; start?: unknown } | undefined;
+  try {
+    rec = JSON.parse(view.owner) as { pid?: unknown; start?: unknown };
+  } catch {
+    rec = undefined;
+  }
+  if (typeof rec?.pid !== "number") return Date.now() - view.mtimeMs < OWNERLESS_LOCK_GRACE_MS;
+  if (!isAlive(rec.pid)) return false;
+  if (typeof rec.start === "string") {
+    const now = processStart(rec.pid);
+    if (now !== undefined && now !== rec.start) return false;
+  }
+  return true;
+}
+
+const sameLock = (a: LockView, b: LockView | undefined): boolean => b !== undefined && a.owner === b.owner && (a.ino === 0 || b.ino === 0 || a.ino === b.ino);
+
+/** Test seam: called after a contender judged the holder dead (`inspected`) and after its takeover rename (`renamed`). */
+export type ReplayLockStep = (step: "inspected" | "renamed") => void;
+
+/**
+ * Fix round 2 (R50.3): the exclusive right to replay the reconciles of the interrupted run in `runDir`, so two Pi
+ * sessions never replay the same manifests at once and a holder that died does not leave them abandoned. The lock is
+ * the directory `replay.lock` (`mkdir` is atomic: one contender creates it), holding an `owner` record (runId, pid of
+ * the runId and, for this process, its start identity) written exclusively. A contender that finds a dead holder takes
+ * over by renaming the directory to a fresh `replay.lock.stale-<random>` (one rename wins; a name is never reused) and
+ * then retries `mkdir`. If the renamed directory is not the one it judged dead (a stale view: someone took over in
+ * between), it is renamed back and the contender backs off. The lock is kept for the holder's lifetime. False: a live
+ * session holds it (replay in progress elsewhere), or the contest was lost.
+ */
+export function acquireReplayLock(runDir: string, selfRunId: string, isAlive: (pid: number) => boolean, step?: ReplayLockStep): boolean {
+  const lock = join(runDir, REPLAY_LOCK);
+  const m = RUN_ID.test(selfRunId) ? /-(\d+)$/.exec(selfRunId) : null;
+  const pid = m ? Number(m[1]) : process.pid;
+  const start = pid === process.pid ? processStart(pid) : undefined;
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+    try {
+      mkdirSync(lock, { mode: 0o700 });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      const seen = viewLock(lock);
+      if (seen === undefined) continue;
+      if (lockHolderAlive(seen, isAlive)) return false;
+      step?.("inspected");
+      const stale = `${lock}.stale-${randomBytes(8).toString("hex")}`;
+      try {
+        renameSync(lock, stale);
+      } catch (err) {
+        // Another contender renamed it first.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      if (!sameLock(seen, viewLock(stale))) {
+        // A stale view: the directory renamed is a newer holder's. Give it back; this contender loses.
+        try {
+          renameSync(stale, lock);
+        } catch {
+          // A third contender created the lock meanwhile; the newer holder loses it (replayInterrupted re-checks).
+        }
+        return false;
+      }
+      rmSync(stale, { recursive: true, force: true });
+      step?.("renamed");
+      continue;
+    }
+    try {
+      writeFileSync(join(lock, LOCK_OWNER), `${JSON.stringify({ runId: selfRunId, pid, ...(start !== undefined ? { start } : {}) })}\n`, { flag: "wx", mode: 0o600 });
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      // The directory was replaced or taken over before the owner record landed: another contender holds it.
+      if (code === "EEXIST" || code === "ENOENT") return false;
+      throw e;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** The lock in `runDir` is held by `selfRunId` (a holder re-checks it before each replayed manifest). */
+export function holdsReplayLock(runDir: string, selfRunId: string): boolean {
+  try {
+    const rec = JSON.parse(readFileSync(join(runDir, REPLAY_LOCK, LOCK_OWNER), "utf8")) as { runId?: unknown };
+    return rec.runId === selfRunId;
   } catch {
     return false;
   }
-}
-
-/**
- * Creates `file` holding `selfRunId` atomically (a complete temp file hard-linked into place; the link fails when the
- * name exists). A filesystem without hard links falls back to the O_EXCL claim, whose holder is written right after.
- * False when the name already exists.
- */
-function claimWhole(file: string, selfRunId: string): boolean {
-  const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  writeFileSync(tmp, `${selfRunId}\n`, { flag: "wx", mode: 0o600 });
-  try {
-    linkSync(tmp, file);
-    return true;
-  } catch (e) {
-    const code = (e as NodeJS.ErrnoException).code;
-    if (code === "EEXIST") return false;
-    if (code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS") return claim(file, selfRunId);
-    throw e;
-  } finally {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // Already gone.
-    }
-  }
-}
-
-/**
- * Fix round 1 (Task 13): the claim to replay the reconciles of the interrupted run in `runDir`, so two Pi sessions never
- * replay the same manifests at once, and a claimant that died (before or during its replay) does not leave them
- * abandoned. Claims are generations `replay-<n>.claim`, each holding the claimant's runId: while any listed holder is
- * alive the claim is refused; otherwise generation max+1 is created exclusively, so of two contenders that both saw
- * only dead holders exactly one wins. A generation's file is created only after the previous one exists and a live
- * holder's file is never removed, so a live holder is always seen. Dead generations below the newest are pruned.
- * The claim is kept for the claimant's lifetime: a later startup retries what is unfinished once it is gone.
- */
-export function claimReplay(runDir: string, selfRunId: string, isAlive: (pid: number) => boolean): boolean {
-  const gens: number[] = [];
-  for (const name of readdirSync(runDir)) {
-    const m = REPLAY_CLAIM.exec(name);
-    if (m) gens.push(Number(m[1]));
-  }
-  gens.sort((a, b) => a - b);
-  for (const g of gens) if (claimHolderAlive(join(runDir, `replay-${g}.claim`), isAlive)) return false;
-  const max = gens.at(-1) ?? 0;
-  if (!claimWhole(join(runDir, `replay-${max + 1}.claim`), selfRunId)) return false;
-  for (const g of gens.slice(0, -1)) {
-    try {
-      unlinkSync(join(runDir, `replay-${g}.claim`));
-    } catch {
-      // Pruned by another claimant, or left: harmless.
-    }
-  }
-  return true;
 }

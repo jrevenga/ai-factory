@@ -1303,9 +1303,10 @@ export interface ReplayOutcome {
  * Fix round 2 (R50.2): the replay stops at the first manifest that fails (is not `done` afterwards); older manifests
  * are kept and the whole remaining tail is retried, in the same order, at a later startup. Work without a readable
  * manifest (unreadable manifest, an entry that cannot be examined, copies without manifest) has no known place in
- * the order, so nothing of that run is replayed until it is readable or dealt with by hand.
+ * the order, so nothing of that run is replayed until it is readable or dealt with by hand. `opts.owns` (the lock
+ * holder's re-check) is consulted before each manifest; once it fails, the rest is kept.
  */
-export function replayInterrupted(runDir: string, ledger: Sink, runId: string, diagnose?: Diagnose): ReplayOutcome[] {
+export function replayInterrupted(runDir: string, ledger: Sink, runId: string, diagnose?: Diagnose, opts: { owns?(): boolean } = {}): ReplayOutcome[] {
   const base = path.join(runDir, "reconcile");
   const out: ReplayOutcome[] = [];
   const failed = (dir: string, message: string): void => {
@@ -1370,6 +1371,10 @@ export function replayInterrupted(runDir: string, ledger: Sink, runId: string, d
     return out;
   }
   for (const [i, p] of pending.entries()) {
+    if (opts.owns !== undefined && !opts.owns()) {
+      defer(i, "this session no longer holds the run's replay lock (another session took it over)");
+      break;
+    }
     const dir = path.join(base, p.name);
     out.push({ dir: p.snapshot.backupDir, kind: "replayed", notes: reconcileAudited(p.snapshot.toolCallId ?? p.name, p.snapshot, ledger, runId, diagnose) });
     let done = false;
