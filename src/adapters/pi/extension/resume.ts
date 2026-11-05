@@ -13,7 +13,7 @@
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RunEvent } from "../../../core/ledger/events.ts";
-import { ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
+import { ledgerDirFor, reconcile, runOwnerGone, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
 import { hasUnfinishedReconciles, replayInterrupted, type Diagnose } from "./reconcile.ts";
 import { claimReplay } from "./replay-owners.ts";
 import { lastRouteEntryRunId } from "./route-state.ts";
@@ -91,7 +91,8 @@ export interface ReplayInput {
 /**
  * After `run_start`: finishes the answer-route reconciliations that interrupted runs of the project left unfinished,
  * audited in this run's ledger. A run qualifies when its `reconcile/` holds unfinished work (reconcile.ts
- * `hasUnfinishedReconciles`) and it is interrupted (`ledger.runInterrupted`), whoever detected it; it is replayed only
+ * `hasUnfinishedReconciles`) and its owning process is gone (`ledger.runOwnerGone`, R62: whether or not it wrote
+ * `run_end`, so a reconcile that failed in-process is retried); it is replayed only
  * while this session owns its replay (R52, `claimReplay`), so a run another live session is replaying, or contending
  * for, is left to it (a note says so; retried at a later startup). The ownership entry is removed when the replay ends.
  * Newest run first (reverse snapshot order across runs, as within one). A failure is reported (note, `diagnose`,
@@ -115,7 +116,7 @@ export function replayInterruptedRuns(input: ReplayInput, ledger: Sink, diagnose
   for (const runId of runIds) {
     const runDir = join(dir, runId);
     try {
-      if (!hasUnfinishedReconciles(runDir) || runInterrupted(dir, runId, input.isAlive) !== true) continue;
+      if (!hasUnfinishedReconciles(runDir) || !runOwnerGone(dir, runId, input.isAlive)) continue;
       const claim = claimReplay(runDir, input.runId, input.isAlive);
       if (claim === undefined) {
         notes.push(`Interrupted factory run ${runId}: replay in progress elsewhere; another live session is replaying (or contending for) its answer-route reconciles, so they are left to it and retried at a later startup`);

@@ -333,18 +333,18 @@ export function sessionInterruptedRuns(
 }
 
 /**
- * Fix round 1 (Task 13): whether `runId` (a run of the project other than this one) is interrupted for a replay: no
- * `run_end`, and marked `run_interrupted` (by whoever detected it) or its pid is not alive. `error` when its ledger is
- * missing or unreadable (the run is then left alone; `reconcile` reports an unreadable ledger).
+ * R62: whether the process that owned `runId` (a run of the project other than this one) is gone, so its unfinished
+ * answer-route reconciles may be replayed: marked `run_interrupted` (by whoever detected it), or its pid (from
+ * `run_start`, else the runId suffix) is not alive. A clean `run_end` does not matter: a reconcile that failed in-process
+ * stays unfinished and is retried once its owner is gone. An unreadable ledger falls back to the runId's pid.
  */
-export function runInterrupted(dir: string, runId: string, isAlive: (pid: number) => boolean): boolean | "error" {
+export function runOwnerGone(dir: string, runId: string, isAlive: (pid: number) => boolean): boolean {
   let events: RunEvent[];
   try {
     events = RunLedger.read(new RunLedger(dir, runId).file);
   } catch {
-    return "error";
+    events = [];
   }
-  if (events.some((e) => e.type === "run_end")) return false;
   if (events.some((e) => e.type === "run_interrupted")) return true;
   const pid = pidOf(runId, events);
   return pid === undefined || !isAlive(pid);

@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ledgerDirFor, RunLedger, type InterruptedRun } from "../../../../src/adapters/pi/extension/ledger.ts";
 import { claimReplay, REPLAY_OWNERS } from "../../../../src/adapters/pi/extension/replay-owners.ts";
-import { loadSnapshot, replayInterrupted, takeSnapshot } from "../../../../src/adapters/pi/extension/reconcile.ts";
+import { loadSnapshot, Reconciler, replayInterrupted, takeSnapshot } from "../../../../src/adapters/pi/extension/reconcile.ts";
 import { lastRouteEntryRunId, recoverRuns, replayInterruptedRuns, resumeLine, resumeSection } from "../../../../src/adapters/pi/extension/resume.ts";
 import { ROUTE_ENTRY } from "../../../../src/adapters/pi/extension/route-state.ts";
 import { RunEvent } from "../../../../src/core/ledger/events.ts";
@@ -211,5 +211,38 @@ describe("replayInterrupted ownership re-check (R52)", () => {
     expect(out.map((o) => o.kind)).toEqual(["kept"]);
     expect(out[0]?.notes.join("\n")).toContain("no longer owns the run's replay");
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("runner\n");
+  });
+});
+
+describe("R62: unfinished reconciles of a run that ended cleanly", () => {
+  it("a reconciliation that failed in-process is replayed at the next startup once its owner is gone, run_end or not", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    interruptedRun(h, R1, "session-a", []);
+    const runDir = join(ledgerDirFor(h, PROJECT), R1);
+    const rec = new Reconciler(runDir);
+    rec.begin("call-1", undefined, root);
+    writeFileSync(join(root, "a.txt"), "runner\n");
+    // A transient failure: the work tree is briefly unavailable when the call's result arrives.
+    renameSync(root, `${root}.gone`);
+    const live = sinkOf();
+    const diag: string[] = [];
+    rec.finishId("call-1", live.ledger, R1, (m) => diag.push(m));
+    expect(diag.join("\n")).toContain("failed");
+    renameSync(`${root}.gone`, root);
+    expect(rec.size).toBe(0);
+    // The session then shuts down cleanly.
+    new RunLedger(ledgerDirFor(h, PROJECT), R1).append({ v: 1, ts: TS, runId: R1, type: "run_end", reason: "quit" });
+    expect(loadSnapshot(join(runDir, "reconcile", "call-1")).status).not.toBe("done");
+    // While its process lives the manifest is left alone.
+    const alive = sinkOf();
+    expect(replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: (pid) => pid === 4242 }, alive.ledger)).toEqual([]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("runner\n");
+    // Once it is gone, the next startup replays it.
+    const s = sinkOf();
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+    expect(s.events).toEqual([expect.objectContaining({ type: "reconciled", runId: SELF, toolCallId: "call-1", reverted: ["a.txt"] })]);
+    expect(loadSnapshot(join(runDir, "reconcile", "call-1")).status).toBe("done");
   });
 });
