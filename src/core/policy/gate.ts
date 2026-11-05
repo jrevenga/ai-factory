@@ -50,6 +50,13 @@ export type ToolAction =
        * means none; the adapter fails closed (everything configured) when the config query fails.
        */
       gitHelpers?: GitHelpers;
+      /**
+       * R59: where each segment runs, aligned with `classifyCommandLine().segments`: the adapter's facts for every
+       * candidate of `CommandClassification.execDirs` (resolved from the tool's cwd). An empty entry, or a missing or
+       * misaligned list, means the directory is unknown: on a route with write roots, a segment that is not read-only
+       * then asks `outside-root-write` (fail closed).
+       */
+      execDirs?: PathFacts[][];
     }
   | { kind: "factory"; tool: string }
   | { kind: "unknown"; tool: string };
@@ -349,6 +356,27 @@ function demoteDirectoryOperands(c: CommandClassification, facts: PathFacts[]): 
   return out;
 }
 
+/**
+ * R59: the first segment that is not read-only and may run outside every write root and tmp root (implicit writes:
+ * git mutations, runners, unknown programs write where they run), as an ask reason; undefined when every such segment
+ * runs inside. Only routes with write roots call it. A resolved leading `cd` runs nothing itself.
+ */
+function outsideExecution(c: CommandClassification, action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): string | undefined {
+  const dirs = action.execDirs !== undefined && action.execDirs.length === c.segments.length ? action.execDirs : undefined;
+  for (const [i, seg] of c.segments.entries()) {
+    if (seg.class === "read-only" || (i === 0 && c.leadingCd !== undefined)) continue;
+    const label = `segment ${i + 1} (${seg.argv.join(" ")})`;
+    const candidates = dirs?.[i] ?? [];
+    if (candidates.length === 0) return `${label} is not read-only and the directory it runs in cannot be determined (R59)`;
+    const away = candidates.find((d) => {
+      const within = classifyPath(d, pathContext(ctx, ctx.route.writeRoots, ctx.tmpRoots)).within;
+      return within !== "write-root" && within !== "tmp";
+    });
+    if (away !== undefined) return `${label} is not read-only and runs in ${away.input}, outside the route's write roots (R59)`;
+  }
+  return undefined;
+}
+
 function classifyAction(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): CommandClassification {
   return classifyCommandLine(action.command, {
     projectCommands: ctx.projectCommands,
@@ -460,6 +488,8 @@ function evaluateCommandDecision(action: Extract<ToolAction, { kind: "command" }
   if (outside) {
     return result("ask", `the command writes outside the write roots: ${outside.fact.input}`, { ...base, hardGate: "outside-root-write" });
   }
+  const away = noRoots ? undefined : outsideExecution(c, action, ctx);
+  if (away !== undefined) return result("ask", away, { ...base, hardGate: "outside-root-write" });
   if (c.hardClass === "destructive") return result("ask", `destructive command: ${summary(c)}`, { ...base, hardGate: "destructive" });
   const git = writes.find((w) => w.gitDir);
   if (git) {

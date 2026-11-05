@@ -292,3 +292,68 @@ describe("configured git helpers (R58)", () => {
     expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, small).decision).toBe("allow");
   });
 });
+
+describe("where a command runs (R59) through adapter facts", () => {
+  const worlds: World[] = [];
+  beforeEach(() => {
+    vi.stubEnv("GIT_CONFIG_GLOBAL", process.platform === "win32" ? "NUL" : "/dev/null");
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+    vi.stubEnv("GIT_EXTERNAL_DIFF", "");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+  afterAll(async () => {
+    for (const w of worlds) await w.tmp.cleanup();
+  });
+
+  /** The project with a task worktree `<tmp>/home/wt` on branch factory/t1, and a feature-route context for it. */
+  async function featureWorld() {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    const wt = join(w.home, "wt");
+    git(w.project, "worktree", "add", "-q", "-b", "factory/t1", wt);
+    const worktree = canonicalDir(wt);
+    const feature: RouteState = { route: "feature", tier: "feature", taskId: "t1", reason: "test", worktree, writeRoots: [worktree], needsReclassification: false };
+    const { small } = contexts(w);
+    return { w, wt: worktree, ctx: { ...small, route: feature, mode: "interactive" as const } satisfies GateContext };
+  }
+
+  function decideIn(cmd: string, cwd: string, w: World, ctx: GateContext) {
+    const action = toToolAction({ toolName: "bash", toolCallId: "c1", input: { command: cmd } }, { cwd, home: w.home, projectCommands: [], piAgentDir: ctx.piAgentDir });
+    return evaluateGate(action, ctx);
+  }
+
+  it("feature route with Pi's cwd in the main checkout: git commit and npm run build ask outside-root-write", async () => {
+    const { w, ctx } = await featureWorld();
+    for (const cmd of ["git commit -m x", "npm run build", "git checkout -b experiment main"]) {
+      const r = decideIn(cmd, w.project, w, ctx);
+      expect(r, cmd).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+      expect(r.reason, cmd).toContain("R59");
+    }
+    expect(decideIn("git status", w.project, w, ctx).decision).toBe("allow");
+  });
+
+  it("`git -C <worktree>` and `cd <worktree> &&` follow the normal rules; the same commands run in the worktree are allowed", async () => {
+    const { w, wt, ctx } = await featureWorld();
+    for (const cmd of [`git -C ${quote(wt)} commit -m x`, `cd ${quote(wt)} && git commit -m x`, `cd ${quote(wt)} && npm run build`]) {
+      expect(decideIn(cmd, w.project, w, ctx).reason, cmd).not.toContain("R59");
+    }
+    expect(decideIn("git commit -m x", wt, w, ctx).decision).toBe("allow");
+    expect(decideIn("npm run build", wt, w, { ...ctx, mode: "unattended" }).decision).toBe("allow");
+  });
+
+  it("R58 addendum: helpers are looked up where each git segment runs, and an undetermined directory counts as configured", async () => {
+    const { w, wt } = await featureWorld();
+    const other = join(w.home, "other");
+    mkdirSync(other);
+    git(other, "init", "-q");
+    git(other, "config", "diff.pdf.textconv", "touch /nonexistent-marker");
+    const action = (cmd: string, cwd: string) => toToolAction({ toolName: "bash", toolCallId: "h", input: { command: cmd } }, { cwd, home: w.home, projectCommands: [] });
+    expect(action("git diff", w.project)).not.toHaveProperty("gitHelpers");
+    expect(action(`cd ${quote(other)} && git diff`, w.project)).toMatchObject({ gitHelpers: { diff: true } });
+    expect(action(`git -C ${quote(other)} diff`, wt)).toMatchObject({ gitHelpers: { diff: true } });
+    expect(action("git diff", other)).toMatchObject({ gitHelpers: { diff: true } });
+    expect(action("frobnicate && git diff", w.project)).toMatchObject({ gitHelpers: { diff: true, fsmonitor: true } });
+  });
+});

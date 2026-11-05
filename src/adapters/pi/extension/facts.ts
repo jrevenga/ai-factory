@@ -284,6 +284,45 @@ export function commandPathFacts(arg: string, cwd: string, home: string): PathFa
 }
 
 /**
+ * R59: facts for one execution-directory candidate of a command segment (`CommandClassification.execDirs`): `chain`
+ * resolved word by word from `cwd`. `cd` resolves `..` logically (before symlinks) and `git -C` physically; a word
+ * whose two readings differ (a `..` after a symlink) is unresolvable. One fact per reading (win32 has several for a
+ * leading `/`); a reading that cannot be resolved yields an unresolvable fact (outside every root: fail closed).
+ */
+export function execDirFacts(chain: readonly string[], cwd: string, home: string): PathFacts[] {
+  const platform = hostPlatform();
+  const a = api(platform);
+  const label = chain.length === 0 ? cwd : chain.join(" ");
+  let realHome: string;
+  try {
+    realHome = canonicalDir(home);
+  } catch {
+    return [unresolvable(label, platform)];
+  }
+  let bases: (string | undefined)[];
+  try {
+    bases = [realTarget(a.normalize(cwd))];
+  } catch {
+    bases = [undefined];
+  }
+  for (const word of chain) {
+    bases = bases.flatMap((b) => {
+      if (b === undefined) return [undefined];
+      return commandCandidates(word, b, realHome, platform).map((abs) => {
+        if (abs === "") return undefined;
+        try {
+          const physical = realTarget(abs);
+          return realTarget(a.normalize(abs)) === physical ? physical : undefined;
+        } catch {
+          return undefined;
+        }
+      });
+    });
+  }
+  return bases.map((b) => (b === undefined ? unresolvable(label, platform) : resolvedFact(b, b, platform)));
+}
+
+/**
  * Realpath of an absolute directory (home, Pi agent dir, project root, worktree, tmp root) or of its nearest
  * existing ancestor plus the missing tail; core compares realpathed paths only. Throws on empty or relative input.
  */

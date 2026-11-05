@@ -1,5 +1,7 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { evaluateGate, type GateContext, type ToolAction } from "../../../src/core/policy/gate.ts";
+import { classifyCommandLine } from "../../../src/core/policy/command.ts";
+import { evaluateGate as evaluateGateCore, type GateContext, type GateResult, type ToolAction } from "../../../src/core/policy/gate.ts";
 import type { PathFacts, PathPlatform } from "../../../src/core/policy/paths.ts";
 import type { RouteState } from "../../../src/core/route/types.ts";
 
@@ -58,8 +60,26 @@ function write(input: string, opts: { resolved?: string; base?: string; machine?
   return a;
 }
 
+/** R59: the execution-directory facts the extension computes for `command` run with cwd `base` (lexical, posix). */
+function execDirsFor(command: string, base: string): PathFacts[][] {
+  return classifyCommandLine(command, { projectCommands: [] }).execDirs.map((candidates) =>
+    candidates.map((chain) => {
+      const dir = chain.reduce((b, w) => path.posix.resolve(b, w.startsWith("~/") ? `${HOME}/${w.slice(2)}` : w), base);
+      return { input: dir, resolved: dir, platform: "posix" as const };
+    }),
+  );
+}
+
+/** Commands built without execution directories run in the project root (the small route's write root). */
+function evaluateGate(action: ToolAction, c: GateContext): GateResult {
+  if (action.kind === "command" && action.tool === "bash" && action.execDirs === undefined) {
+    return evaluateGateCore({ ...action, execDirs: execDirsFor(action.command, ROOT) }, c);
+  }
+  return evaluateGateCore(action, c);
+}
+
 function bash(command: string, facts: [string, string?][] = [], base = ROOT): ToolAction {
-  return { kind: "command", tool: "bash", command, pathFacts: facts.map(([i, r]) => fact(i, r, base)) };
+  return { kind: "command", tool: "bash", command, pathFacts: facts.map(([i, r]) => fact(i, r, base)), execDirs: execDirsFor(command, base) };
 }
 
 const UNATTENDED = { mode: "unattended" } as const;
@@ -784,5 +804,66 @@ describe("evaluateGate: directory operands (R43)", () => {
   it("the reason names the directory operand", () => {
     const r = evaluateGate(cmd("diff a b", [f("a", true), f("b", false)]), ctx(UNATTENDED));
     expect(r.reason).toContain("R43");
+  });
+});
+
+describe("evaluateGate: where a command runs (R59)", () => {
+  const FEATURE_CTX = () => ctx({ route: FEATURE });
+
+  it("feature route with the cwd in the main checkout: git mutations and runners ask outside-root-write", () => {
+    for (const command of ["git commit -m x", "npm run build", "git checkout -b experiment main", "ls && npm test"]) {
+      const r = evaluateGate(bash(command, [], ROOT), FEATURE_CTX());
+      expect(r, command).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+      expect(r.reason, command).toContain("R59");
+      expect(r.reason, command).toContain(ROOT);
+    }
+  });
+
+  it("read-only commands in the main checkout are unaffected", () => {
+    expect(evaluateGate(bash("git status", [], ROOT), FEATURE_CTX())).toMatchObject({ decision: "allow" });
+    expect(evaluateGate(bash("ls", [], ROOT), FEATURE_CTX())).toMatchObject({ decision: "allow" });
+  });
+
+  it("the same commands with the cwd in the worktree follow the normal rules", () => {
+    expect(evaluateGate(bash("git commit -m x", [], WT), FEATURE_CTX())).toMatchObject({ decision: "allow" });
+    expect(evaluateGate(bash("npm run build", [], WT), ctx({ route: FEATURE, mode: "unattended" }))).toMatchObject({ decision: "allow" });
+  });
+
+  it("`git -C <worktree>` and `cd <worktree> &&` follow the normal rules (no R59 ask)", () => {
+    for (const command of [`git -C ${WT} commit -m x`, `cd ${WT} && git commit -m x`, `cd ${WT} && npm run build`]) {
+      const facts: [string, string?][] = command.startsWith("git -C") ? [[WT]] : [];
+      const r = evaluateGate(bash(command, facts, ROOT), FEATURE_CTX());
+      expect(r.reason, command).not.toContain("R59");
+    }
+    // `cd` itself is not in the rule tables: the line asks as unrecognised, not as an outside write.
+    expect(evaluateGate(bash(`cd ${WT} && git commit -m x`, [], ROOT), FEATURE_CTX())).toMatchObject({ decision: "ask", class: "unknown" });
+  });
+
+  it("`git -C <main checkout>` or `cd <main checkout> &&` from the worktree ask outside-root-write", () => {
+    expect(evaluateGate(bash(`cd ${ROOT} && npm run build`, [], WT), FEATURE_CTX())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+    expect(evaluateGate(bash(`git -C ${ROOT} commit -m x`, [[ROOT]], WT), FEATURE_CTX())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+  });
+
+  it("a segment that may run in the main checkout after `;` asks", () => {
+    const r = evaluateGate(bash(`cd ${WT} && npm test; git commit -m x`, [], ROOT), FEATURE_CTX());
+    expect(r).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+  });
+
+  it("a tmp root is an acceptable execution directory", () => {
+    expect(evaluateGate(bash("npm run build", [], "/tmp/scratch"), ctx({ route: FEATURE, mode: "unattended" }))).toMatchObject({ decision: "allow" });
+  });
+
+  it("an undetermined or missing execution directory fails closed on change routes", () => {
+    const action: ToolAction = { kind: "command", tool: "bash", command: "npm run build", pathFacts: [] };
+    expect(evaluateGateCore(action, ctx())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+    expect(evaluateGateCore({ ...action, execDirs: [[]] }, ctx())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+    expect(evaluateGateCore({ ...action, execDirs: [] }, ctx())).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+    // Read-only commands need no execution directory.
+    expect(evaluateGateCore({ ...action, command: "ls" }, ctx())).toMatchObject({ decision: "allow" });
+  });
+
+  it("the answer route is unchanged (it has no write roots)", () => {
+    const r = evaluateGate(bash("npm run build", [], "/elsewhere"), ctx({ route: ANSWER }));
+    expect(r).toMatchObject({ decision: "allow", reconcile: true });
   });
 });

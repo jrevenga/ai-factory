@@ -98,6 +98,14 @@ export interface CommandClassification {
   /** R41: some segment prints tracked file contents; the gate needs the extension's `trackedSecret` fact. */
   trackedContent: boolean;
   allowlisted: boolean;
+  /**
+   * R59: where each segment runs, aligned with `segments`. Each entry lists the candidate directories of that segment,
+   * each a chain of words the adapter resolves in turn from the session cwd (`[]` is the session cwd itself; a leading
+   * `cd <dir>` and `git -C <dir>` add words). An empty list means the directory cannot be determined.
+   */
+  execDirs: string[][][];
+  /** R59: the operand of a leading `cd <dir>` joined by `&&` that later segments run in (the `cd` itself runs nothing). */
+  leadingCd?: string;
 }
 
 interface Verdict {
@@ -1054,6 +1062,77 @@ function copiesLinkTargets(argv: readonly string[]): string | undefined {
   return recursive && derefs ? "a recursive cp that follows links copies the targets of links inside the tree (R32)" : undefined;
 }
 
+/**
+ * R59: a `cd` operand whose target depends neither on CDPATH nor on the previous directory: absolute (posix or a
+ * drive path), `~/`-rooted, or starting with `.`/`..`. Anything else (options, `-`, no operand, assignments) is
+ * unresolvable.
+ */
+function cdTarget(seg: Segment): string | undefined {
+  if (Object.keys(seg.assignments).length > 0 || seg.argv.length !== 2 || seg.argv[0] !== "cd") return undefined;
+  const d = seg.argv[1]!;
+  if (d === "" || d.startsWith("-")) return undefined;
+  const anchored = d.startsWith("/") || /^[A-Za-z]:\//.test(d) || d.startsWith("~/") || d === "." || d === ".." || d.startsWith("./") || d.startsWith("../");
+  return anchored ? d : undefined;
+}
+
+/** R59: builtins that change the shell's directory (or may: they run other shell code) for the segments after them. */
+const DIR_CHANGERS: ReadonlySet<string> = new Set(["cd", "pushd", "popd", "source", ".", "eval", "exec", "builtin", "command"]);
+
+/**
+ * R59: the `git -C` words of a git segment, in order (git applies each relative to the previous); `[]` for any other
+ * program. Undefined when git's directory cannot be determined (`-C` without a value, `--git-dir`/`--work-tree`, a
+ * `GIT_*` assignment).
+ */
+function gitDirWords(seg: Segment): string[] | undefined {
+  const argv0 = seg.argv[0];
+  if (argv0 === undefined || commandName(argv0) !== "git") return [];
+  if (Object.keys(seg.assignments).some((n) => n.toUpperCase().startsWith("GIT_"))) return undefined;
+  const args = seg.argv.slice(1);
+  if (hasLong(args, ["--git-dir", "--work-tree"])) return undefined;
+  const out: string[] = [];
+  let i = 0;
+  while (i < args.length && args[i]!.startsWith("-")) {
+    if (args[i] === "-C") {
+      const d = args[i + 1];
+      if (d === undefined) return undefined;
+      out.push(d);
+      i += 2;
+    } else if (R.GIT_GLOBAL_FLAGS.has(args[i]!)) i++;
+    else break;
+  }
+  return out;
+}
+
+/**
+ * R59: the execution directories of every segment (see `CommandClassification.execDirs`). A leading `cd <dir>` joined
+ * by `&&` moves the later segments; after a `;`, newline or `||` a later segment may also run in the session cwd (the
+ * `cd` may have failed). After any other segment that changes (or may change) the shell's directory, or that is
+ * unknown, the directory of every later segment is undetermined, unless it is a pipeline member (a subshell). Pipeline
+ * members run in the same directory.
+ */
+function executionDirs(segs: readonly Segment[], classes: readonly CommandClass[]): { execDirs: string[][][]; leadingCd?: string } {
+  const cd = segs.length > 1 && segs[1]!.joinedBy === "&&" ? cdTarget(segs[0]!) : undefined;
+  let shell: string[][] | undefined = [[]];
+  const execDirs: string[][][] = [];
+  segs.forEach((seg, i) => {
+    if (i === 1 && cd !== undefined) shell = [[cd]];
+    else if (i > 0 && shell !== undefined) {
+      const prev = segs[i - 1]!;
+      const prevName = prev.argv[0] === undefined ? undefined : commandName(prev.argv[0]);
+      const changer = prevName === undefined || DIR_CHANGERS.has(prevName) || classes[i - 1] === "unknown";
+      // A pipeline member runs in a subshell: its directory change does not reach later segments.
+      const piped = prev.joinedBy === "|" || seg.joinedBy === "|";
+      if (changer && !piped) shell = undefined;
+      else if (cd !== undefined && (seg.joinedBy === ";" || seg.joinedBy === "\n" || seg.joinedBy === "||") && !shell.some((c) => c.length === 0)) {
+        shell = [...shell, []];
+      }
+    }
+    const words = gitDirWords(seg);
+    execDirs.push(shell === undefined || words === undefined ? [] : shell.map((c) => [...c, ...words]));
+  });
+  return cd !== undefined ? { execDirs, leadingCd: cd } : { execDirs };
+}
+
 export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandClassification {
   const tok = tokenizeCommandLine(cmd);
   if (!tok.ok) {
@@ -1067,6 +1146,7 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
       logicalPaths: [],
       trackedContent: false,
       allowlisted: false,
+      execDirs: [],
     };
   }
   let cls: CommandClass = "read-only";
@@ -1120,7 +1200,11 @@ export function classifyCommandLine(cmd: string, ctx: CommandContext): CommandCl
     for (const p of v.inputPaths) if (!inputPaths.includes(p)) inputPaths.push(p);
     for (const w of segReadArgs) if (!readArgs.includes(w)) readArgs.push(w);
   });
-  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, readArgs, logicalPaths, trackedContent, allowlisted };
+  const dirs = executionDirs(
+    tok.segments,
+    segments.map((x) => x.class),
+  );
+  const result: CommandClassification = { class: cls, segments, reasons, pathArgs, inputPaths, readArgs, logicalPaths, trackedContent, allowlisted, ...dirs };
   if (hard !== undefined) result.hardClass = hard;
   return result;
 }

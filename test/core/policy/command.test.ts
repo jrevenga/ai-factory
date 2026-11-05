@@ -735,3 +735,44 @@ describe("classifyCommandLine: fix round 5 (R45-R47)", () => {
     expect(classify("echo -e --x").readArgs).toEqual([]);
   });
 });
+
+describe("classifyCommandLine: execution directories (R59)", () => {
+  it("runs every segment in the session cwd without cd or git -C", () => {
+    expect(classify("npm run build && git commit -m x").execDirs).toEqual([[[]], [[]]]);
+    expect(classify("npm run build").leadingCd).toBeUndefined();
+  });
+
+  it("moves the segments after a leading `cd <dir> &&` and keeps the cd segment itself in the cwd", () => {
+    const r = classify("cd /w/wt && git commit -m x");
+    expect(r.leadingCd).toBe("/w/wt");
+    expect(r.execDirs).toEqual([[[]], [["/w/wt"]]]);
+    expect(classify("cd ../wt && npm test | cat").execDirs).toEqual([[[]], [["../wt"]], [["../wt"]]]);
+  });
+
+  it("adds the session cwd after `;`, newline or `||` (the cd may have failed)", () => {
+    expect(classify("cd /w/wt && git add a.ts; git commit -m x").execDirs).toEqual([[[]], [["/w/wt"]], [["/w/wt"], []]]);
+    expect(classify("cd /w/wt && npm test || git commit -m x").execDirs[2]).toEqual([["/w/wt"], []]);
+  });
+
+  it("appends git -C words to the segment's directory", () => {
+    expect(classify("git -C /w/wt commit -m x").execDirs).toEqual([[["/w/wt"]]]);
+    expect(classify("cd /w && git -C wt -C sub status").execDirs[1]).toEqual([["/w", "wt", "sub"]]);
+  });
+
+  it("cannot determine the directory after a cd that is not leading, anchored or joined by &&", () => {
+    expect(classify("cd wt && git commit -m x").execDirs[1]).toEqual([]); // CDPATH may apply
+    expect(classify("cd /w/wt; git commit -m x").execDirs[1]).toEqual([]);
+    expect(classify("cd -P /w/wt && git commit -m x").execDirs[1]).toEqual([]);
+    expect(classify("cd /w/wt && cd /w/main && git commit -m x").execDirs[2]).toEqual([]);
+    expect(classify("ls && pushd /w && npm test").execDirs[2]).toEqual([]);
+  });
+
+  it("cannot determine the directory after an unknown segment or of git that redirects its repository", () => {
+    expect(classify("frobnicate && npm test").execDirs[1]).toEqual([]);
+    // A pipeline member runs in a subshell: its directory change stays there.
+    expect(classify("echo x | frobnicate | npm test").execDirs[2]).toEqual([[]]);
+    expect(classify("cd /w | npm test").execDirs[1]).toEqual([[]]);
+    expect(classify("git --work-tree=/w/main commit -m x").execDirs[0]).toEqual([]);
+    expect(classify("git -C").execDirs[0]).toEqual([]);
+  });
+});
