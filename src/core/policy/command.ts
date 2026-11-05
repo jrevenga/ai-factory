@@ -31,9 +31,23 @@ function isHard(c: CommandClass): c is HardClass {
   return c === "destructive" || c === "remote-mutating";
 }
 
+/** R58: which configured external programs git could run during a read-only command (fact gathered by the adapter). */
+export interface GitHelpers {
+  /** `diff.external`, `diff.<driver>.textconv/command` or `GIT_EXTERNAL_DIFF` is set. */
+  diff: boolean;
+  /** `core.fsmonitor` names a program (a non-boolean value). */
+  fsmonitor: boolean;
+}
+
 export interface CommandContext {
   /** Project-declared runners, already tokenized to argv; matched by argv equality. */
   projectCommands: string[][];
+  /**
+   * R58: undefined means no helper is configured. When set, a git invocation that would be read-only is `unknown`
+   * unless it carries both `--no-ext-diff` and `--no-textconv`; with an fsmonitor program it is always `unknown`
+   * (`-c core.fsmonitor=false` is itself unclassified).
+   */
+  gitHelpers?: GitHelpers;
 }
 
 export interface SegmentClassification {
@@ -963,6 +977,20 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
   } else {
     const name = commandName(argv0);
     v = name === undefined ? unknown("empty command word") : classifyByName(name, seg.argv.slice(1));
+    if (name === "git" && v.class === "read-only" && ctx.gitHelpers !== undefined) {
+      const args = seg.argv.slice(1);
+      const h = ctx.gitHelpers;
+      if (h.fsmonitor) {
+        v = { ...v, class: "unknown", allowlisted: false, reasons: ["git is configured with a core.fsmonitor program that read commands would run (R58)"] };
+      } else if (h.diff && !(args.includes("--no-ext-diff") && args.includes("--no-textconv"))) {
+        v = {
+          ...v,
+          class: "unknown",
+          allowlisted: false,
+          reasons: ["git has a diff helper configured (diff.external, a textconv or GIT_EXTERNAL_DIFF); admitted only with --no-ext-diff and --no-textconv (R58)"],
+        };
+      }
+    }
     const declared = ctx.projectCommands.some((pc) => argvEqual(pc, seg.argv));
     if (declared && !isHard(v.class)) {
       // The grammar's facts stay (content and directory checks); read facts fall back to the over-approximation.

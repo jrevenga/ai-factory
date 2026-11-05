@@ -14,7 +14,7 @@ import { summarizeCommand } from "../../../core/policy/redact.ts";
 import { INITIAL_ROUTE } from "../../../core/route/route.ts";
 import type { RouteState } from "../../../core/route/types.ts";
 import { editTouchesMachine, MACHINE_CLOSE, MACHINE_OPEN, parseMachine, touchesMachine, type TextEdit } from "../../../core/task/machine.ts";
-import { commandPathFacts, pathFacts, trackedSecretFact } from "./facts.ts";
+import { commandPathFacts, gitHelpersFact, pathFacts, trackedSecretFact } from "./facts.ts";
 import type { Reconciler } from "./reconcile.ts";
 
 /** Ruling 4: an unanswered confirm dialog denies after 120 s. */
@@ -203,6 +203,11 @@ function commandAction(ev: ToolCallLike, tool: "bash" | "powershell", f: ActionF
   for (const a of c.readArgs) if (isPathLikeArg(a) || exists(path.resolve(f.cwd, a))) add(a);
   const facts: PathFacts[] = args.flatMap((a) => commandPathFacts(a, f.cwd, f.home));
   const action: ToolAction = { kind: "command", tool, command, pathFacts: facts };
+  // R58: configured diff/fsmonitor programs matter only when some segment runs git (one `git config` per call).
+  if (c.segments.some((seg) => /^(?:.*[\\/])?git(?:\.exe)?$/i.test(seg.argv[0] ?? ""))) {
+    const h = gitHelpersFact(f.cwd);
+    if (h.diff || h.fsmonitor) action.gitHelpers = h;
+  }
   // R41: only content-printing git commands need the tracked-secret fact (one `git ls-files` per call).
   if (c.trackedContent) {
     const tracked = trackedSecretFact(f.cwd, f.home, f.piAgentDir ?? path.join(f.home, ".pi", "agent"));

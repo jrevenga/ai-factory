@@ -629,6 +629,35 @@ export function headCommit(dir: string): string | undefined {
   return out !== undefined && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(out) ? out : undefined;
 }
 
+const FALSE_OR_TRUE = /^(?:true|false|yes|no|on|off|[-+]?\d*)$/i;
+
+/**
+ * R58: configured programs that a read-only git command run in `cwd` could execute: `diff.external`,
+ * `diff.<driver>.textconv|command` and `GIT_EXTERNAL_DIFF` (diff), and a non-boolean `core.fsmonitor`. Filter
+ * drivers (`filter.*`) are a documented residual. Fails closed: when the config query fails, everything counts as
+ * configured.
+ */
+export function gitHelpersFact(cwd: string, env: NodeJS.ProcessEnv = process.env): { diff: boolean; fsmonitor: boolean } {
+  const envDiff = (env.GIT_EXTERNAL_DIFF ?? "") !== "";
+  const r = gitRunBytes(cwd, ["config", "--get-regexp", "^(diff\\.external|diff\\..*\\.(textconv|command)|core\\.fsmonitor)$"], GIT_TIMEOUT_MS, 1024 * 1024);
+  if (r.status === 1 && r.stdout.length === 0) return { diff: envDiff, fsmonitor: false };
+  if (r.status !== 0) return { diff: true, fsmonitor: true };
+  let diff = envDiff;
+  let fsmonitor = false;
+  for (const line of r.stdout.toString("utf8").split("\n")) {
+    if (line === "") continue;
+    const space = line.search(/\s/);
+    const key = (space < 0 ? line : line.slice(0, space)).toLowerCase();
+    const value = space < 0 ? "" : line.slice(space + 1).trim();
+    if (key === "core.fsmonitor") {
+      if (space >= 0 && !FALSE_OR_TRUE.test(value)) fsmonitor = true;
+    } else {
+      diff = true;
+    }
+  }
+  return { diff, fsmonitor };
+}
+
 /** Bound for the `git ls-files -z` listing of a large repository. */
 const LS_FILES_MAX_BUFFER = 256 * 1024 * 1024;
 

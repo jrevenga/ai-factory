@@ -9,7 +9,7 @@ import path from "node:path";
 import type { HardGateId } from "../config/schema.ts";
 import type { RouteState } from "../route/types.ts";
 import type { AutonomyLevel } from "./autonomy.ts";
-import { classifyCommandLine, isPathLikeArg, severity, type CommandClass, type CommandClassification } from "./command.ts";
+import { classifyCommandLine, isPathLikeArg, severity, type CommandClass, type CommandClassification, type GitHelpers } from "./command.ts";
 import { invisibleCharacter } from "./shell.ts";
 import { classifyPath, isSecretPath, type PathClassification, type PathContext, type PathFacts, type PathPlatform } from "./paths.ts";
 
@@ -45,6 +45,11 @@ export type ToolAction =
        * `isSecretPath`). Required when the classification has `trackedContent`; undefined then asks `secrets`.
        */
       trackedSecret?: boolean;
+      /**
+       * R58: configured programs git could run during a read-only command (diff helpers, fsmonitor). Undefined
+       * means none; the adapter fails closed (everything configured) when the config query fails.
+       */
+      gitHelpers?: GitHelpers;
     }
   | { kind: "factory"; tool: string }
   | { kind: "unknown"; tool: string };
@@ -344,6 +349,13 @@ function demoteDirectoryOperands(c: CommandClassification, facts: PathFacts[]): 
   return out;
 }
 
+function classifyAction(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): CommandClassification {
+  return classifyCommandLine(action.command, {
+    projectCommands: ctx.projectCommands,
+    ...(action.gitHelpers !== undefined ? { gitHelpers: action.gitHelpers } : {}),
+  });
+}
+
 /**
  * R56: reconciliation belongs to the classified action, not to the decision. An allowlisted runner on the answer
  * route that a hard gate turns into an ask (`npm run test < .env`) is reconciled exactly like an allowed one once
@@ -353,7 +365,7 @@ function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: 
   const r = evaluateCommandDecision(action, ctx);
   if (r.decision !== "ask" || action.tool === "powershell") return r;
   if (ctx.route.route !== "answer" || ctx.route.needsReclassification) return r;
-  const c = demoteDirectoryOperands(classifyCommandLine(action.command, { projectCommands: ctx.projectCommands }), action.pathFacts);
+  const c = demoteDirectoryOperands(classifyAction(action, ctx), action.pathFacts);
   if (c.class === "read-only" || answerRouteDeny(c, ctx) !== undefined) return r;
   return { ...r, reconcile: true };
 }
@@ -367,7 +379,7 @@ function evaluateCommandDecision(action: Extract<ToolAction, { kind: "command" }
   if (action.tool === "powershell") {
     return result("ask", "PowerShell commands are not classified in Phase 2 (ruling 3)", { class: "unknown" });
   }
-  const c = demoteDirectoryOperands(classifyCommandLine(action.command, { projectCommands: ctx.projectCommands }), action.pathFacts);
+  const c = demoteDirectoryOperands(classifyAction(action, ctx), action.pathFacts);
   const base = { class: c.class };
   const noRoots = ctx.route.route === "answer" || ctx.route.needsReclassification;
   const noRootsReason = ctx.route.needsReclassification ? RECLASSIFY : DECLARE;

@@ -4,7 +4,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { toToolAction } from "../../../../src/adapters/pi/extension/enforce.ts";
 import { canonicalDir, trackedSecretFact } from "../../../../src/adapters/pi/extension/facts.ts";
 import { evaluateGate, type GateContext } from "../../../../src/core/policy/gate.ts";
@@ -222,5 +222,73 @@ describe("tracked-secret fact (R41)", () => {
     const t = await makeTmp("classifier-gate-norepo");
     worlds.push({ tmp: t, home: t.dir, project: t.dir, outside: t.dir, ledger: t.dir });
     expect(trackedSecretFact(t.dir, t.dir, join(t.dir, ".pi", "agent"))).toBeUndefined();
+  });
+});
+
+describe("configured git helpers (R58)", () => {
+  const worlds: World[] = [];
+  beforeEach(() => {
+    vi.stubEnv("GIT_CONFIG_GLOBAL", process.platform === "win32" ? "NUL" : "/dev/null");
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+    vi.stubEnv("GIT_EXTERNAL_DIFF", "");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+  afterAll(async () => {
+    for (const w of worlds) await w.tmp.cleanup();
+  });
+  const world = async () => {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    return w;
+  };
+
+  it("without helpers nothing changes", async () => {
+    const w = await world();
+    const { small, answer } = contexts(w);
+    for (const ctx of [small, answer]) for (const cmd of ["git diff HEAD", "git status", "git log -1"]) expect(decide(cmd, w, ctx).decision, cmd).toBe("allow");
+    expect(toToolAction({ toolName: "bash", toolCallId: "h1", input: { command: "git diff" } }, { cwd: w.project, home: w.home, projectCommands: [] })).not.toHaveProperty("gitHelpers");
+  });
+
+  it("a configured textconv makes git diff ask unless both helpers are disabled; --textconv is never read-only", async () => {
+    const w = await world();
+    git(w.project, "config", "diff.pdf.textconv", "touch /nonexistent-marker");
+    const { small, answer } = contexts(w);
+    for (const ctx of [small, answer]) {
+      expect(decide("git diff HEAD", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff --no-ext-diff HEAD", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff --no-textconv HEAD", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, ctx).decision).toBe("allow");
+      expect(decide("git status", w, ctx).decision).not.toBe("allow");
+    }
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    expect(decide("git diff HEAD", w, answer).decision).toBe("deny");
+  });
+
+  it("--textconv is unknown even when no helper is configured", async () => {
+    const w = await world();
+    const { small } = contexts(w);
+    expect(decide("git diff --textconv HEAD", w, small).decision).toBe("ask");
+    expect(decide("git diff --ext-diff HEAD", w, small).decision).toBe("ask");
+  });
+
+  it("diff.external, GIT_EXTERNAL_DIFF and a core.fsmonitor program each count; a boolean fsmonitor does not", async () => {
+    const w = await world();
+    const { small } = contexts(w);
+    git(w.project, "config", "core.fsmonitor", "true");
+    expect(decide("git diff HEAD", w, small).decision).toBe("allow");
+    git(w.project, "config", "core.fsmonitor", "/nonexistent-hook");
+    expect(decide("git status", w, small).decision).toBe("ask");
+    expect(decide("git diff --no-ext-diff --no-textconv", w, small).decision).toBe("ask");
+    git(w.project, "config", "--unset", "core.fsmonitor");
+    expect(decide("git diff HEAD", w, small).decision).toBe("allow");
+    git(w.project, "config", "diff.external", "/nonexistent-diff");
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    git(w.project, "config", "--unset", "diff.external");
+    expect(decide("git diff HEAD", w, small).decision).toBe("allow");
+    vi.stubEnv("GIT_EXTERNAL_DIFF", "/nonexistent-diff");
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, small).decision).toBe("allow");
   });
 });

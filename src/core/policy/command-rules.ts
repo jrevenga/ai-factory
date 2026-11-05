@@ -502,7 +502,7 @@ const GIT_DIFF_LONG: Record<string, Opt> = {
       "--patch", "--no-patch", "--raw", "--patch-with-raw", "--patch-with-stat", "--numstat", "--shortstat", "--summary",
       "--name-only", "--name-status", "--full-index", "--binary", "--no-renames", "--text", "--ignore-cr-at-eol",
       "--ignore-space-at-eol", "--ignore-space-change", "--ignore-all-space", "--ignore-blank-lines", "--minimal", "--patience",
-      "--histogram", "--no-color", "--no-ext-diff", "--no-textconv", "--textconv", "--pickaxe-all", "--pickaxe-regex",
+      "--histogram", "--no-color", "--no-ext-diff", "--no-textconv", "--pickaxe-all", "--pickaxe-regex",
       "--function-context", "--no-prefix", "--default-prefix", "--irreversible-delete", "--check", "--exit-code", "--quiet",
       "--compact-summary", "--indent-heuristic", "--no-indent-heuristic", "--no-relative",
     ],
@@ -520,6 +520,7 @@ const GIT_DIFF_LONG: Record<string, Opt> = {
   ),
   "--output": WRITES_FILE,
   "--ext-diff": reject("runs an external diff program"),
+  "--textconv": reject("runs a configured text conversion program (R58)"),
   "--orderfile": RP,
 };
 /** Revision-walk and log formatting options (`git log`, `git show`). */
