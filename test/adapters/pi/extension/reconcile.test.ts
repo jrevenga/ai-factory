@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { vi } from "vitest";
@@ -985,26 +985,49 @@ describe("R60: new files are judged under the snapshot's ignore rules", () => {
   });
 
   for (const snapshotHasExclude of [true, false]) {
-    it.skipIf(isWin)(`R64: .git/info replaced by a symlink is never followed (${snapshotHasExclude ? "overwrite" : "delete"}); the result says the ignore rules were not reconciled`, async () => {
+    it.skipIf(isWin)(`R64: .git/info replaced by a symlink is never followed (${snapshotHasExclude ? "overwrite" : "delete"}); the reconcile throws and stays unfinished`, async () => {
       const r = await repo();
       const info = join(r.root, ".git", "info");
       mkdirSync(info, { recursive: true });
       const exclude = join(info, "exclude");
       if (snapshotHasExclude) writeFileSync(exclude, "# snapshot rules\n");
       else rmSync(exclude, { force: true });
-      const snap = takeSnapshot(r.root, r.backupDir());
+      const bd = r.backupDir();
+      const snap = takeSnapshot(r.root, bd);
       const outside = join(r.dir, "outside-info");
       mkdirSync(outside);
-      writeFileSync(join(outside, "exclude"), "outside rules\n");
+      writeFileSync(join(outside, "exclude"), ".factory/\n");
       rmSync(info, { recursive: true });
       symlinkSync(outside, info);
-      const res = reconcileAfter(r.root, snap);
-      expect(read(join(outside, "exclude"))).toBe("outside rules\n");
+      mkdirSync(join(r.root, ".factory"));
+      writeFileSync(join(r.root, ".factory", "config.json"), "{}\n");
+      expect(() => reconcileAfter(r.root, snap)).toThrow(/not a real directory/);
+      expect(read(join(outside, "exclude"))).toBe(".factory/\n");
       expect(readdirSync(outside)).toEqual(["exclude"]);
-      expect(res.notRestored.some((x) => x.startsWith("(.git/info/exclude)") && x.includes("not reconciled"))).toBe(true);
-      expect(res.reverted).not.toContain("(.git/info/exclude)");
+      expect(existsSync(join(r.root, ".factory", "config.json"))).toBe(true);
+      expect(loadSnapshot(bd).status).not.toBe("done");
     });
   }
+
+  it.skipIf(isWin)("N1: in a linked worktree, the common dir's parent replaced by a symlink after the snapshot is never followed; the reconcile throws and stays unfinished", async () => {
+    const r = await repo();
+    const wt = join(r.dir, "linked");
+    git(r.root, "worktree", "add", "-q", "-b", "side", wt);
+    const exclude = join(r.root, ".git", "info", "exclude");
+    mkdirSync(join(r.root, ".git", "info"), { recursive: true });
+    writeFileSync(exclude, "# snapshot rules\n");
+    const bd = r.backupDir();
+    const snap = takeSnapshot(wt, bd);
+    const moved = join(r.dir, "project-moved");
+    const outside = join(r.dir, "outside-copy");
+    renameSync(r.root, moved);
+    mkdirSync(join(outside, ".git", "info"), { recursive: true });
+    writeFileSync(join(outside, ".git", "info", "exclude"), "outside rules\n");
+    symlinkSync(outside, r.root);
+    expect(() => reconcileAfter(wt, snap)).toThrow();
+    expect(read(join(outside, ".git", "info", "exclude"))).toBe("outside rules\n");
+    expect(loadSnapshot(bd).status).not.toBe("done");
+  });
 
   it.skipIf(isWin)("R64: a snapshot refuses when .git/info is a symlink", async () => {
     const r = await repo();

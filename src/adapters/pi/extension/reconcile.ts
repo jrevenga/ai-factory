@@ -137,9 +137,10 @@ export interface Snapshot {
   ignoreFiles?: UntrackedEntry[];
   /**
    * R60: the repository's `info/exclude` (`git rev-parse --git-path info/exclude`), copied to `<backupDir>/info-exclude`
-   * when it is a file. Absent in manifests written before R60.
+   * when it is a file. Absent in manifests written before R60. `gitDirReal` is the real path of the directory holding
+   * `info/` at snapshot time (R64); restore refuses when it is not the same any more (absent: refuses too).
    */
-  infoExclude?: { file: string; state: EntryState };
+  infoExclude?: { file: string; state: EntryState; gitDirReal?: string };
   /**
    * Snapshot order within the run (1, 2, ...): a nested call is always snapshotted after its parent, so a replay in
    * descending order reconciles innermost first. Manifests written before this field fall back to `createdAt`.
@@ -411,19 +412,36 @@ const isIgnoreFile = (rel: string) => !rel.endsWith("/") && rel.split("/").at(-1
 /** The name `info/exclude` has in results, notes and the journal. */
 const INFO_EXCLUDE = "(.git/info/exclude)";
 
+/** Comparable form of a real path: normalised, and case-folded on Windows. */
+const comparablePath = (p: string) => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p));
+
+/** The real path of the directory that contains `info/` (the common git dir), or why it cannot be had. */
+function realGitDirOf(file: string): { real: string } | { problem: string } | { missing: true } {
+  const gitDir = path.dirname(path.dirname(file));
+  try {
+    return { real: realpathSync.native(gitDir) };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { missing: true };
+    return { problem: `${gitDir} cannot be resolved: ${(e as Error).message}` };
+  }
+}
+
 /**
- * R64: why `info/exclude` (`file`) cannot be trusted to lie in the repository, or undefined. Every directory from the
- * work tree (for a linked worktree, from the parent of the common git dir) down to `info/` must be a real directory:
- * a symlink or a Windows junction (both lstat as links) would send a read, write or delete elsewhere. A missing
- * component is fine (the file is then missing too).
+ * R64: why `info/exclude` (`file`) cannot be trusted to lie in the repository, or undefined. The base (the work tree
+ * or, for a linked worktree, the parent of the common git dir) and every directory below it down to `info/` must be a
+ * real directory: a symlink or a Windows junction (both lstat as links) would send a read, write or delete elsewhere.
+ * A missing component is fine (the file is then missing too). With `recordedReal` (restore time), the real path of the
+ * git dir must also equal the one recorded at the snapshot, which catches any ancestor replaced by a link since; a
+ * missing record or a git dir that cannot be resolved fails closed.
  */
-function infoExcludeProblem(root: string, file: string): string | undefined {
+function infoExcludeProblem(root: string, file: string, recordedReal?: { value: string | undefined }): string | undefined {
   const dir = path.dirname(file);
   const rel = path.relative(root, dir);
   const inside = rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
   const base = inside ? root : path.dirname(path.dirname(dir));
   let cur = base;
-  for (const part of path.relative(base, dir).split(path.sep).filter((x) => x !== "")) {
+  const parts = ["", ...path.relative(base, dir).split(path.sep).filter((x) => x !== "")];
+  for (const part of parts) {
     cur = path.join(cur, part);
     let st;
     try {
@@ -433,6 +451,14 @@ function infoExcludeProblem(root: string, file: string): string | undefined {
       return `${cur} cannot be inspected: ${(e as Error).message}`;
     }
     if (st.isSymbolicLink() || !st.isDirectory()) return `${cur} is not a real directory (a symlink, junction or file)`;
+  }
+  if (recordedReal !== undefined) {
+    if (recordedReal.value === undefined) return "the snapshot did not record where the git directory really is";
+    const now = realGitDirOf(file);
+    if ("problem" in now) return now.problem;
+    if ("real" in now && comparablePath(now.real) !== comparablePath(recordedReal.value)) {
+      return `the git directory moved since the snapshot (was ${recordedReal.value}, now ${now.real})`;
+    }
   }
   return undefined;
 }
@@ -488,6 +514,9 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
   const excludeFile = path.join(commonDirOf(git, top), "info", "exclude");
   const excludeProblem = infoExcludeProblem(top, excludeFile);
   if (excludeProblem !== undefined) throw new ReconcileRefusal(`the ignore rules cannot be snapshotted: ${excludeProblem}`);
+  const gitDirNow = realGitDirOf(excludeFile);
+  if (!("real" in gitDirNow)) throw new ReconcileRefusal(`the ignore rules cannot be snapshotted: ${"problem" in gitDirNow ? gitDirNow.problem : `${path.dirname(path.dirname(excludeFile))} is missing`}`);
+  const gitDirReal = gitDirNow.real;
   const excludeKind = kindOf(excludeFile);
   if (excludeKind !== "missing" && excludeKind !== "file") throw new ReconcileRefusal(`${excludeFile} is not a regular file`);
   let excludeState: EntryState = { kind: "missing" };
@@ -583,7 +612,7 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
     untracked,
     skipped,
     ignoreFiles,
-    infoExclude: { file: excludeFile, state: excludeState },
+    infoExclude: { file: excludeFile, state: excludeState, gitDirReal },
     ...(meta.toolCallId !== undefined ? { toolCallId: meta.toolCallId } : {}),
     ...(meta.parentToolCallId !== undefined ? { parentToolCallId: meta.parentToolCallId } : {}),
     ...(meta.seq !== undefined ? { seq: meta.seq } : {}),
@@ -966,13 +995,11 @@ class Restorer {
    * R60: brings the repository's `info/exclude` back to its snapshot state (the current one is copied to
    * `after/info-exclude` first). Throws when it cannot: new files could not be judged under the snapshot's rules.
    */
-  restoreInfoExclude(want: { file: string; state: EntryState }): void {
-    const problem = infoExcludeProblem(this.s.root, want.file);
-    if (problem !== undefined) {
-      // R64: neither read, written nor deleted; reported, so the result says the ignore rules were not reconciled.
-      this.result.notRestored.push(`${INFO_EXCLUDE} (ignore rules not reconciled, file left untouched: ${problem})`);
-      return;
-    }
+  restoreInfoExclude(want: { file: string; state: EntryState; gitDirReal?: string }): void {
+    const problem = infoExcludeProblem(this.s.root, want.file, { value: want.gitDirReal });
+    // R64: neither read, written nor deleted; throws, so new files are not judged under unrestored rules and the
+    // manifest stays unfinished for a retry.
+    if (problem !== undefined) throw new Error(`${want.file} cannot be restored: ${problem}`);
     const curKind = kindOf(want.file);
     if (curKind !== "missing" && curKind !== "file") throw new Error(`${want.file} is not a regular file: the ignore rules cannot be restored`);
     const cur: EntryState = curKind === "missing" ? { kind: "missing" } : (() => {
