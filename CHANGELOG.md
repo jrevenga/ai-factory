@@ -10,7 +10,7 @@
 - Evidence: `run_check` records check results, `record_decision` and `record_review` store decisions, and delivery validation rejects stale checks.
 - Resume of interrupted runs: unfinished answer-route reconciliations are replayed at startup and the route is reclassified.
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-11-05
 
 - Toolchain, layer lint and CI for a TypeScript Pi package plus `factory` CLI.
 - Platform adapter: bounded process runner, cmd quoting, npm resolution, paths, atomic JSON.
