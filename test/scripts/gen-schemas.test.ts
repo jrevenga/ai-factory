@@ -10,6 +10,7 @@ describe("gen-schemas", () => {
     expect(Object.keys(generateSchemas()).sort()).toEqual([
       "check-record.schema.json",
       "eval-contenders.schema.json",
+      "eval-report.schema.json",
       "eval-run-manifest.schema.json",
       "eval-run-record.schema.json",
       "eval-task.schema.json",
@@ -29,6 +30,6 @@ describe("gen-schemas", () => {
     expect(checkSchemas(resolve(root, "schemas"))).toEqual([]);
   });
   it("reports a stale directory", () => {
-    expect(checkSchemas(resolve(root, "test"))).toHaveLength(15);
+    expect(checkSchemas(resolve(root, "test"))).toHaveLength(16);
   });
 });

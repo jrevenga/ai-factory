@@ -8,6 +8,7 @@ import { CheckRecord, ReviewDisposition } from "../src/core/evidence/records.ts"
 import { ContenderPins, ToolsLock } from "../src/core/eval/contenders.ts";
 import { EvalRunManifest, EvalRunRecord } from "../src/core/eval/records.ts";
 import { EvalTask } from "../src/core/eval/task.ts";
+import { EvalReport } from "../src/core/eval/report.ts";
 import { EvalThresholds } from "../src/core/eval/thresholds.ts";
 import { RunEvent } from "../src/core/ledger/events.ts";
 import { Profile } from "../src/core/profiles/schema.ts";
@@ -28,6 +29,7 @@ const SOURCES: Record<string, z.ZodType> = {
   "eval-task.schema.json": EvalTask,
   "eval-run-record.schema.json": EvalRunRecord,
   "eval-run-manifest.schema.json": EvalRunManifest,
+  "eval-report.schema.json": EvalReport,
   "eval-thresholds.schema.json": EvalThresholds,
   "eval-contenders.schema.json": ContenderPins,
   "eval-tools-lock.schema.json": ToolsLock,

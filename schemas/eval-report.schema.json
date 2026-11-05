@@ -1,0 +1,734 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "v": {
+      "type": "number",
+      "const": 1
+    },
+    "manifest": {
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "number",
+          "const": 1
+        },
+        "evalRunId": {
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "suite": {
+          "type": "string"
+        },
+        "profile": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "claude-codex",
+                "codex-only"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "contenders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "enum": [
+                  "claude-code",
+                  "claude-code-superpowers",
+                  "pi-bridge",
+                  "codex",
+                  "codex-superpowers",
+                  "pi-codex",
+                  "oracle",
+                  "noop"
+                ]
+              },
+              "model": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "provider": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "claude",
+                      "codex"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "argvTemplate": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "envKeys": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "id",
+              "model",
+              "provider",
+              "argvTemplate",
+              "envKeys"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "reps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "seed": {
+          "type": "number"
+        },
+        "tasks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "tier": {
+                "type": "string",
+                "enum": [
+                  "answer",
+                  "small",
+                  "feature",
+                  "project"
+                ]
+              },
+              "split": {
+                "type": "string",
+                "enum": [
+                  "dev",
+                  "heldout"
+                ]
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "public",
+                  "private"
+                ]
+              },
+              "exposure": {
+                "type": "string",
+                "enum": [
+                  "public",
+                  "private"
+                ]
+              },
+              "snapshotSha": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              "taskSha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "checksSha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "solutionSha256": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "gate": {
+                "type": "object",
+                "properties": {
+                  "reply": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "maxContinuations": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 10
+                  }
+                },
+                "required": [
+                  "reply",
+                  "maxContinuations"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "id",
+              "tier",
+              "split",
+              "source",
+              "exposure",
+              "snapshotSha",
+              "taskSha256",
+              "checksSha256",
+              "solutionSha256",
+              "gate"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "pins": {
+          "type": "object",
+          "properties": {
+            "claude": {
+              "type": "string"
+            },
+            "codex": {
+              "type": "string"
+            },
+            "pi": {
+              "type": "string"
+            },
+            "bridge": {
+              "type": "string"
+            },
+            "superpowersCommit": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pi",
+            "bridge"
+          ],
+          "additionalProperties": false
+        },
+        "drift": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "factory": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string"
+            },
+            "commit": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "commit"
+          ],
+          "additionalProperties": false
+        },
+        "host": {
+          "type": "object",
+          "properties": {
+            "platform": {
+              "type": "string"
+            },
+            "bwrap": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "platform",
+            "bwrap"
+          ],
+          "additionalProperties": false
+        },
+        "thresholds": {
+          "type": "object",
+          "properties": {
+            "schema": {
+              "type": "number",
+              "const": 1
+            },
+            "passRatePp": {
+              "type": "number",
+              "minimum": 0
+            },
+            "usageReductionPct": {
+              "type": "number",
+              "minimum": 0
+            },
+            "secondary": {
+              "type": "object",
+              "properties": {
+                "escapedDefectsIncrease": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "wallTimeIncreasePct": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "usageIncreasePct": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "escapedDefectsIncrease",
+                "wallTimeIncreasePct",
+                "usageIncreasePct"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "schema",
+            "passRatePp",
+            "usageReductionPct",
+            "secondary"
+          ],
+          "additionalProperties": false
+        },
+        "confirms": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "v",
+        "evalRunId",
+        "createdAt",
+        "suite",
+        "profile",
+        "contenders",
+        "reps",
+        "seed",
+        "tasks",
+        "pins",
+        "drift",
+        "factory",
+        "host",
+        "thresholds",
+        "confirms"
+      ],
+      "additionalProperties": false
+    },
+    "incomplete": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "summaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "contender": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "claude-code-superpowers",
+              "pi-bridge",
+              "codex",
+              "codex-superpowers",
+              "pi-codex",
+              "oracle",
+              "noop"
+            ]
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "answer",
+              "small",
+              "feature",
+              "project"
+            ]
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "passRate": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "passRateSd": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "escapedDefectsMean": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "usage": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex"
+              ]
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "median": {
+                  "type": "number"
+                },
+                "iqr": {
+                  "type": "array",
+                  "prefixItems": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ],
+                  "items": false,
+                  "minItems": 2,
+                  "maxItems": 2
+                },
+                "n": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "median",
+                "iqr",
+                "n"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "usageMissing": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "wallMsMedian": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "errors": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "timeouts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "gatesHitMean": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "leakSuspect": {
+            "type": "boolean"
+          },
+          "skippedBudget": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "contender",
+          "tier",
+          "runs",
+          "passRate",
+          "passRateSd",
+          "escapedDefectsMean",
+          "usage",
+          "usageMissing",
+          "wallMsMedian",
+          "errors",
+          "timeouts",
+          "gatesHitMean",
+          "leakSuspect",
+          "skippedBudget"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "comparisons": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "candidate": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "claude-code-superpowers",
+              "pi-bridge",
+              "codex",
+              "codex-superpowers",
+              "pi-codex",
+              "oracle",
+              "noop"
+            ]
+          },
+          "reference": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "claude-code-superpowers",
+              "pi-bridge",
+              "codex",
+              "codex-superpowers",
+              "pi-codex",
+              "oracle",
+              "noop"
+            ]
+          },
+          "tasks": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "minRunsPerTask": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "usageComplete": {
+            "type": "boolean"
+          },
+          "passRateDiffPp": {
+            "type": "number"
+          },
+          "ci95": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "escapedDefectsDiff": {
+            "type": "number"
+          },
+          "usageRatio": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex"
+              ]
+            },
+            "additionalProperties": {
+              "type": "number"
+            }
+          },
+          "extraUsage": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex"
+              ]
+            },
+            "additionalProperties": {
+              "type": "number"
+            }
+          },
+          "wallRatio": {
+            "type": "number"
+          },
+          "verdict": {
+            "type": "object",
+            "properties": {
+              "branch": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "enum": [
+                      "pass-rate",
+                      "usage"
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "improved": {
+                "type": "boolean"
+              },
+              "regressions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "eligible": {
+                "type": "boolean"
+              },
+              "note": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "branch",
+              "improved",
+              "regressions",
+              "eligible",
+              "note"
+            ],
+            "additionalProperties": false
+          },
+          "confirmedBy": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "candidate",
+          "reference",
+          "tasks",
+          "minRunsPerTask",
+          "usageComplete",
+          "passRateDiffPp",
+          "ci95",
+          "escapedDefectsDiff",
+          "usageRatio",
+          "extraUsage",
+          "wallRatio",
+          "verdict",
+          "confirmedBy"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "perTask": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "contender": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "claude-code-superpowers",
+              "pi-bridge",
+              "codex",
+              "codex-superpowers",
+              "pi-codex",
+              "oracle",
+              "noop"
+            ]
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "passes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "gatesHit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "taskId",
+          "contender",
+          "runs",
+          "passes",
+          "gatesHit"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "generatedAt": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "v",
+    "manifest",
+    "incomplete",
+    "summaries",
+    "comparisons",
+    "perTask",
+    "generatedAt"
+  ],
+  "additionalProperties": false
+}
