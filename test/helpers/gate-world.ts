@@ -8,6 +8,7 @@ import { delimiter, dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isolatedEnv } from "./isolated-env.ts";
 import { makeTmp, type Tmp } from "./tmp.ts";
+import { RELEASE } from "./release-version.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const FAUX = join(ROOT, "test", "fixtures", "faux-provider.ts");
@@ -120,12 +121,12 @@ export async function makeGateWorld(prefix: string): Promise<GateWorld> {
     join(home, "state.json"),
     JSON.stringify({
       schema: 1,
-      version: "0.1.0",
+      version: RELEASE,
       installedAt: "2026-10-31T00:00:00.000Z",
       source: "https://github.com/jrevenga/ai-factory.git",
       piVersion: "1.4.0",
       piCli: "/nonexistent/cli.js",
-      history: [{ version: "0.1.0", at: "2026-10-31T00:00:00.000Z", reason: "install" }],
+      history: [{ version: RELEASE, at: "2026-10-31T00:00:00.000Z", reason: "install" }],
     }),
   );
   const remote = join(dir, "remote.git");

@@ -7,9 +7,10 @@
 // Fixture releases are built from the committed `HEAD` of this repository (uncommitted changes are not
 // included): its tree is exported through a private index into a fresh work tree, so the real
 // repository is only read, and a shallow CI checkout or a detached pull-request HEAD makes no difference.
-//   v0.1.0 = HEAD's tree
-//   v0.2.0 = v0.1.0 + `factory`/`version` 0.2.0 in release.json/package.json and a `## [0.2.0]` changelog
-//            section (additive release: same stateSchemas, same lockfile, so lockfileSha256 stays valid)
+//   v<BASE> = HEAD's tree (BASE is the `factory` version in release.json)
+//   v<NEXT> = v<BASE> + `factory`/`version` NEXT (BASE with its minor bumped) in release.json/package.json and a
+//             `## [NEXT]` changelog section (additive release: same stateSchemas, same lockfile, so
+//             lockfileSha256 stays valid)
 //
 // After the install, the update and the rollback, the pinned Pi runs with the faux provider and only the
 // test extensions on its command line: the factory package must load from Pi's settings (the checkout Pi
@@ -28,6 +29,7 @@ import { locateGlobalCli } from "../../src/cli/commands/install.ts";
 import { startGitServer, type GitServer } from "../helpers/git-server.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { tree } from "../helpers/release-world.ts";
+import { NEWER as NEXT, RELEASE as BASE } from "../helpers/release-version.ts";
 import { runPiPrint } from "../helpers/pi-harness.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
 
@@ -86,7 +88,7 @@ async function editJson(file: string, edit: (doc: Record<string, unknown>) => vo
   await writeFile(file, `${JSON.stringify(doc, null, 2)}\n`);
 }
 
-/** Builds the two fixture releases and serves them as `fixture/ai-factory.git` (tags v0.1.0, v0.2.0). */
+/** Builds the two fixture releases and serves them as `fixture/ai-factory.git` (tags v<BASE>, v<NEXT>). */
 async function buildFixture(dir: string): Promise<GitServer> {
   const work = join(dir, "fixture work tree");
   await mkdir(work, { recursive: true });
@@ -98,16 +100,16 @@ async function buildFixture(dir: string): Promise<GitServer> {
   const bare = join(dir, "served root", "fixture", "ai-factory.git");
   await gitOk(["init", "--quiet", "--initial-branch=main"], { cwd: work });
   await gitOk(["add", "--all"], { cwd: work });
-  await gitOk(["commit", "--quiet", "-m", "release 0.1.0"], { cwd: work });
-  await gitOk(["tag", "v0.1.0"], { cwd: work });
+  await gitOk(["commit", "--quiet", "-m", `release ${BASE}`], { cwd: work });
+  await gitOk(["tag", `v${BASE}`], { cwd: work });
 
-  await editJson(join(work, "package.json"), (pkg) => void (pkg.version = "0.2.0"));
-  await editJson(join(work, "release.json"), (rel) => void (rel.factory = "0.2.0"));
+  await editJson(join(work, "package.json"), (pkg) => void (pkg.version = NEXT));
+  await editJson(join(work, "release.json"), (rel) => void (rel.factory = NEXT));
   const changelog = readFileSync(join(work, "CHANGELOG.md"), "utf8");
   if (!changelog.startsWith("# Changelog\n")) throw new Error("CHANGELOG.md must start with \"# Changelog\"");
-  await writeFile(join(work, "CHANGELOG.md"), changelog.replace("# Changelog\n", "# Changelog\n\n## [0.2.0] - unreleased\n\n- Round-trip fixture release.\n"));
-  await gitOk(["commit", "--quiet", "--all", "-m", "release 0.2.0"], { cwd: work });
-  await gitOk(["tag", "v0.2.0"], { cwd: work });
+  await writeFile(join(work, "CHANGELOG.md"), changelog.replace("# Changelog\n", `# Changelog\n\n## [${NEXT}] - unreleased\n\n- Round-trip fixture release.\n`));
+  await gitOk(["commit", "--quiet", "--all", "-m", `release ${NEXT}`], { cwd: work });
+  await gitOk(["tag", `v${NEXT}`], { cwd: work });
 
   await mkdir(dirname(bare), { recursive: true });
   await gitOk(["clone", "--quiet", "--bare", "--", work, bare]);
@@ -272,11 +274,11 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
   let updateSnapshotTree: Record<string, string> = {};
 
   it(
-    "npx bootstraps v0.1.0: global factory, state, Pi package, managed settings, guard, healthy doctor",
+    `npx bootstraps v${BASE}: global factory, state, Pi package, managed settings, guard, healthy doctor`,
     async () => {
       // `npx -y <spec> <args>` is `npm exec --yes -- <spec> <args>`; npm runs through its JS entry
       // (resolveNpm), so no npx/.cmd shim is needed on Windows.
-      const spec = `git+${source}#v0.1.0`;
+      const spec = `git+${source}#v${BASE}`;
       const started = performance.now();
       const r = await npm(["exec", "--yes", "--", spec, "install", "--yes", "--profile", "codex-only"], { env, cwd: userCwd, timeoutMs: STEP_TIMEOUT_MS });
       const seconds = (performance.now() - started) / 1000;
@@ -289,8 +291,8 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       expect(globalCli.startsWith(prefix)).toBe(true);
       expect(existsSync(factoryShim())).toBe(true);
 
-      expect(stateVersion()).toBe("0.1.0");
-      expect(piPackages()).toContain(`git:${source}@v0.1.0`);
+      expect(stateVersion()).toBe(BASE);
+      expect(piPackages()).toContain(`git:${source}@v${BASE}`);
       const settings = readJsonFile(paths.piSettings);
       expect(settings.transport).toBe("sse");
       expect(settings.enableInstallTelemetry).toBe(false);
@@ -298,7 +300,7 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       expect(readJsonFile(paths.config).profile).toBe("codex-only");
       await expectDoctorHealthy();
 
-      await expectInstalledPackageEnforces("after install", "0.1.0");
+      await expectInstalledPackageEnforces("after install", BASE);
       // Negative control: the same run against an uninstalled factory home is blocked by the installed
       // package's own handshake report, which proves the package (not only the guard) was loaded.
       const emptyHome = join(tmp.dir, "empty factory home");
@@ -308,34 +310,34 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
       expect(blocked.setRoute).toMatchObject({ isError: true });
       expect(blocked.bash).toMatchObject({ isError: true });
       expect(blocked.run.stderr).toContain("factory handshake failed: not-installed");
-      expect(blocked.handshakes).toEqual([{ ok: false, version: "0.1.0", policy: "v1", reasons: ["not-installed"] }]);
+      expect(blocked.handshakes).toEqual([{ ok: false, version: BASE, policy: "v1", reasons: ["not-installed"] }]);
     },
     STEP_TIMEOUT_MS + 60_000,
   );
 
   it(
-    "factory update --to v0.2.0 installs v0.2.0 and keeps an immutable 0.1.0-to-0.2.0 snapshot",
+    `factory update --to v${NEXT} installs v${NEXT} and keeps an immutable ${BASE}-to-${NEXT} snapshot`,
     async () => {
-      await expectFactoryOk(["update", "--to", "v0.2.0", "--yes"]);
-      expect((await expectFactoryOk(["version"])).stdout.trim()).toBe("0.2.0");
+      await expectFactoryOk(["update", "--to", `v${NEXT}`, "--yes"]);
+      expect((await expectFactoryOk(["version"])).stdout.trim()).toBe(NEXT);
 
-      expect(stateVersion()).toBe("0.2.0");
-      const snapshots = snapshotIds().filter((id) => id.endsWith("-0.1.0-to-0.2.0"));
+      expect(stateVersion()).toBe(NEXT);
+      const snapshots = snapshotIds().filter((id) => id.endsWith(`-${BASE}-to-${NEXT}`));
       expect(snapshots).toHaveLength(1);
       updateSnapshot = snapshots[0] as string;
       updateSnapshotTree = tree(join(paths.backups, updateSnapshot));
       expect(Object.keys(updateSnapshotTree)).toContain("snapshot.json");
-      expect(piPackages()).toContain(`git:${source}@v0.2.0`);
-      expect(piPackages()).not.toContain(`git:${source}@v0.1.0`);
+      expect(piPackages()).toContain(`git:${source}@v${NEXT}`);
+      expect(piPackages()).not.toContain(`git:${source}@v${BASE}`);
       expect(existsSync(paths.txn)).toBe(false);
       await expectDoctorHealthy();
-      await expectInstalledPackageEnforces("after update", "0.2.0");
+      await expectInstalledPackageEnforces("after update", NEXT);
     },
     STEP_TIMEOUT_MS,
   );
 
   it(
-    "factory rollback returns to v0.1.0, keeps a config edit made after the update and leaves the update snapshot untouched",
+    `factory rollback returns to v${BASE}, keeps a config edit made after the update and leaves the update snapshot untouched`,
     async () => {
       expect(updateSnapshot, "the update step must have passed").toBeDefined();
       // Step 4: a user edit after the update.
@@ -343,18 +345,18 @@ describe("bootstrap install and update → rollback round-trip (e2e, real npm an
 
       await expectFactoryOk(["rollback", "--yes"]);
 
-      expect(stateVersion()).toBe("0.1.0");
+      expect(stateVersion()).toBe(BASE);
       // Same stateSchemas in both releases: the rollback keeps current data (ruling 11).
       expect(readJsonFile(paths.config).language).toBe("es");
-      expect(piPackages()).toContain(`git:${source}@v0.1.0`);
-      expect(piPackages()).not.toContain(`git:${source}@v0.2.0`);
+      expect(piPackages()).toContain(`git:${source}@v${BASE}`);
+      expect(piPackages()).not.toContain(`git:${source}@v${NEXT}`);
       expect(existsSync(paths.txn)).toBe(false);
       const version = await expectFactoryOk(["version"]);
-      expect(version.stdout.trim()).toBe("0.1.0");
+      expect(version.stdout.trim()).toBe(BASE);
       expect(tree(join(paths.backups, updateSnapshot as string))).toEqual(updateSnapshotTree);
-      expect(snapshotIds().filter((id) => id.endsWith("-0.2.0-to-0.1.0"))).toHaveLength(1);
+      expect(snapshotIds().filter((id) => id.endsWith(`-${NEXT}-to-${BASE}`))).toHaveLength(1);
       await expectDoctorHealthy();
-      await expectInstalledPackageEnforces("after rollback", "0.1.0");
+      await expectInstalledPackageEnforces("after rollback", BASE);
     },
     STEP_TIMEOUT_MS,
   );

@@ -12,27 +12,28 @@ import {
   sourceOverride,
   tagFor,
 } from "../../../src/core/release/manifest.ts";
+import { RELEASE } from "../../helpers/release-version.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const m = ReleaseManifest.parse(JSON.parse(readFileSync(resolve(root, "release.json"), "utf8")));
 
 describe("release manifest", () => {
   it("builds refs from the production source", () => {
-    expect(packageRef(m, {})).toBe("git:https://github.com/jrevenga/ai-factory.git@v0.1.0");
-    expect(npmInstallSpec(m, {})).toBe("git+https://github.com/jrevenga/ai-factory.git#v0.1.0");
+    expect(packageRef(m, {})).toBe(`git:https://github.com/jrevenga/ai-factory.git@v${RELEASE}`);
+    expect(npmInstallSpec(m, {})).toBe(`git+https://github.com/jrevenga/ai-factory.git#v${RELEASE}`);
     expect(tagFor("1.2.3")).toBe("v1.2.3");
   });
   it("FACTORY_SOURCE overrides everywhere", () => {
     const env = { FACTORY_SOURCE: "http://127.0.0.1:9/fixture/ai-factory.git" };
     expect(effectiveSource(m, env)).toBe(env.FACTORY_SOURCE);
-    expect(packageRef(m, env)).toBe(`git:${env.FACTORY_SOURCE}@v0.1.0`);
-    expect(npmInstallSpec(m, env)).toBe(`git+${env.FACTORY_SOURCE}#v0.1.0`);
+    expect(packageRef(m, env)).toBe(`git:${env.FACTORY_SOURCE}@v${RELEASE}`);
+    expect(npmInstallSpec(m, env)).toBe(`git+${env.FACTORY_SOURCE}#v${RELEASE}`);
   });
   it("an empty FACTORY_SOURCE counts as unset", () => {
     const env = { FACTORY_SOURCE: "" };
     expect(effectiveSource(m, env)).toBe("https://github.com/jrevenga/ai-factory.git");
-    expect(packageRef(m, env)).toBe("git:https://github.com/jrevenga/ai-factory.git@v0.1.0");
-    expect(npmInstallSpec(m, env)).toBe("git+https://github.com/jrevenga/ai-factory.git#v0.1.0");
+    expect(packageRef(m, env)).toBe(`git:https://github.com/jrevenga/ai-factory.git@v${RELEASE}`);
+    expect(npmInstallSpec(m, env)).toBe(`git+https://github.com/jrevenga/ai-factory.git#v${RELEASE}`);
     expect(sourceOverride(env)).toBeUndefined();
     expect(sourceOverride({ FACTORY_SOURCE: "http://127.0.0.1:9/x.git" })).toBe("http://127.0.0.1:9/x.git");
   });
@@ -47,7 +48,7 @@ describe("source URLs with embedded credentials (M3)", () => {
     ["ssh://git:s3cret@example.com/o/x.git", true],
     ["https://github.com/o/ai-factory.git", false],
     ["http://127.0.0.1:9/fixture/ai-factory.git", false],
-    ["https://github.com/o/ai-factory.git@v0.1.0", false],
+    [`https://github.com/o/ai-factory.git@v${RELEASE}`, false],
     ["git@github.com:o/ai-factory.git", false],
     ["ssh://git@github.com/o/ai-factory.git", false],
     ["file:///tmp/ai-factory.git", false],

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkManifest, updateLockfileHash } from "../../scripts/manifest-check.ts";
 import { makeTmp } from "../helpers/tmp.ts";
+import { RELEASE, NEWER } from "../helpers/release-version.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const cleanups: Array<() => Promise<void>> = [];
@@ -43,14 +44,14 @@ describe("checkManifest", () => {
     const d = await copy();
     edit(d, "release.json", (t) =>
       t
-        .replace('"factory": "0.1.0"', '"factory": "0.2.0"')
+        .replace(`"factory": "${RELEASE}"`, `"factory": "${NEWER}"`)
         .replace(">=1.4.0 <1.5.0", ">=1.5.0 <1.6.0")
         .replace('"managed-settings.json": 1', '"managed-settings.json": 1, "other.json": 1')
         .replace('"fsevents",', ""),
     );
     const text = checkManifest(d).join("\n");
     expect(text).toContain("package.json version");
-    expect(text).toContain('no "## [0.2.0]"');
+    expect(text).toContain(`no "## [${NEWER}]"`);
     expect(text).toContain("outside pi.supportedRange");
     expect(text).toContain("stateSchemas keys");
     expect(text).toContain("reviewedInstallScripts");

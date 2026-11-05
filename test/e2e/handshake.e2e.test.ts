@@ -5,6 +5,7 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { ensureTestPi, runPiPrint } from "../helpers/pi-harness.ts";
 import { makeTmp } from "../helpers/tmp.ts";
+import { RELEASE } from "../helpers/release-version.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FAUX = join(ROOT, "test", "fixtures", "faux-provider.ts");
@@ -86,7 +87,7 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
   }, 120_000);
 
   it("valid state at the package version: the handshake passes and the GatePolicy decides, audited in the run ledger", async () => {
-    const s = await setup("0.1.0");
+    const s = await setup(RELEASE);
     const log = join(s.dir, "observed.jsonl");
     s.env.OBSERVE_FILE = log;
     // The project sits beside the factory home: a write root may not contain it (set_route, review M6).
@@ -138,14 +139,14 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
       [FAUX, OBSERVER, EXTENSION],
       [FAUX, EXTENSION, OBSERVER],
     ]) {
-      const s = await setup("0.1.0");
+      const s = await setup(RELEASE);
       const log = join(s.dir, "observed.jsonl");
       s.env.OBSERVE_FILE = log;
       s.env.FAUX_SCRIPT = "[]";
       const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: order });
       expect(r.code, r.stderr).toBe(0);
       expect(observed(log).filter((o) => o.event === "handshake")).toEqual([
-        { event: "handshake", data: { ok: true, version: "0.1.0", policy: "v1", reasons: [] } },
+        { event: "handshake", data: { ok: true, version: RELEASE, policy: "v1", reasons: [] } },
       ]);
     }
   }, 120_000);
@@ -165,7 +166,7 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
     const o = observed(log);
     expect(o.find((x) => x.event === "handshake")).toEqual({
       event: "handshake",
-      data: { ok: false, version: "0.1.0", policy: "v1", reasons: ["version-mismatch"] },
+      data: { ok: false, version: RELEASE, policy: "v1", reasons: ["version-mismatch"] },
     });
     const results = o.filter((x) => x.event === "tool_result");
     expect(results.map((x) => [x.toolName, x.isError])).toEqual([
@@ -178,13 +179,13 @@ describe("Pi startup handshake (e2e, faux provider)", () => {
   }, 120_000);
 
   it("an invalid personal config fails the handshake", async () => {
-    const s = await setup("0.1.0");
+    const s = await setup(RELEASE);
     writeFileSync(join(s.env.FACTORY_HOME as string, "config.json"), "{ not json");
     await expectBlocked(s, [FAUX, EXTENSION], "config-invalid");
   }, 120_000);
 
   it("a missing (unwritable) store fails the handshake", async () => {
-    const s = await setup("0.1.0");
+    const s = await setup(RELEASE);
     s.env.FACTORY_HOME = join(s.dir, "missing home");
     await expectBlocked(s, [FAUX, EXTENSION], "not-installed, store-unwritable");
   }, 120_000);

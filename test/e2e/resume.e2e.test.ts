@@ -12,6 +12,7 @@ import { MACHINE_CLOSE, MACHINE_OPEN, parseMachine } from "../../src/core/task/m
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { ensureTestPi, killPiHard, runPiSession, spawnPiSession, type SpawnedPi } from "../helpers/pi-harness.ts";
 import { makeTmp } from "../helpers/tmp.ts";
+import { RELEASE } from "../helpers/release-version.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FAUX = join(ROOT, "test", "fixtures", "faux-provider.ts");
@@ -74,12 +75,12 @@ async function setup() {
     join(home, "state.json"),
     JSON.stringify({
       schema: 1,
-      version: "0.1.0",
+      version: RELEASE,
       installedAt: "2026-10-31T00:00:00.000Z",
       source: "https://github.com/jrevenga/ai-factory.git",
       piVersion: "1.4.0",
       piCli: "/nonexistent/cli.js",
-      history: [{ version: "0.1.0", at: "2026-10-31T00:00:00.000Z", reason: "install" }],
+      history: [{ version: RELEASE, at: "2026-10-31T00:00:00.000Z", reason: "install" }],
     }),
   );
   const project = join(t.dir, "project");

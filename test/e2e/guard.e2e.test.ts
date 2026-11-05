@@ -6,6 +6,7 @@ import { GUARD_FILE_NAME } from "../../guard/factory-guard.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { ensureTestPi, runPiPrint } from "../helpers/pi-harness.ts";
 import { makeTmp } from "../helpers/tmp.ts";
+import { RELEASE } from "../helpers/release-version.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FAUX = join(ROOT, "test", "fixtures", "faux-provider.ts");
@@ -104,7 +105,7 @@ describe("factory guard (e2e, faux provider)", () => {
   }, 120_000);
 
   it("with the factory extension and a valid state the guard steps aside and the factory gate decides", async () => {
-    const s = await setup({ stateVersion: "0.1.0", script: [] });
+    const s = await setup({ stateVersion: RELEASE, script: [] });
     // The project sits beside the factory home: a write root may not contain it (set_route, review M6).
     const project = join(s.dir, "project");
     mkdirSync(project);

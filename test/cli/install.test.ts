@@ -13,6 +13,7 @@ import type { CliIO } from "../../src/cli/io.ts";
 import { ReleaseManifest } from "../../src/core/release/manifest.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
+import { RELEASE, NEWER } from "../helpers/release-version.ts";
 
 const manifest = ReleaseManifest.parse(JSON.parse(readFileSync("release.json", "utf8")));
 const SOURCE = "http://127.0.0.1:1/fixture/ai-factory.git";
@@ -118,14 +119,14 @@ describe("install", () => {
   it("outside npx → applies the release with reason install, exit 0", async () => {
     const code = await install(ctx(), { yes: true }, deps());
     expect(code).toBe(0);
-    expect(log).toEqual(["ensurePinned", `installPackage git:${SOURCE}@v0.1.0`]);
+    expect(log).toEqual(["ensurePinned", `installPackage git:${SOURCE}@v${RELEASE}`]);
     const state = JSON.parse(readFileSync(paths.state, "utf8")) as { history: Array<{ reason: string }> };
     expect(state.history[0]?.reason).toBe("install");
   });
 
   it.each([GLOBAL_CLI, NPX_CLI])("refuses while txn.json exists (ruling R8), from %s", async (cliPath) => {
     await mkdir(paths.home, { recursive: true });
-    const txn = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
+    const txn = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: RELEASE, snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
     await writeFile(paths.txn, txn);
     expect(await install(ctx(), { yes: true }, deps({ cliPath }))).toBe(1);
     expect(err.join("\n")).toBe('A previous update did not finish. Run "factory rollback".');
@@ -136,10 +137,10 @@ describe("install", () => {
 
   it.each([GLOBAL_CLI, NPX_CLI])("refuses an installed factory newer than this release before any change, from %s (I2)", async (cliPath) => {
     await mkdir(paths.home, { recursive: true });
-    const state = JSON.stringify({ schema: 1, version: "0.2.0", installedAt: "2026-10-01T00:00:00.000Z", source: SOURCE, piVersion: "1.4.0", piCli: "/x/cli.js", history: [] });
+    const state = JSON.stringify({ schema: 1, version: NEWER, installedAt: "2026-10-01T00:00:00.000Z", source: SOURCE, piVersion: "1.4.0", piCli: "/x/cli.js", history: [] });
     await writeFile(paths.state, state);
     expect(await install(ctx(), { yes: true }, deps({ cliPath }))).toBe(1);
-    expect(err.join("\n")).toContain("Installed factory 0.2.0 is newer than this release (0.1.0). Nothing was changed.");
+    expect(err.join("\n")).toContain(`Installed factory ${NEWER} is newer than this release (${RELEASE}). Nothing was changed.`);
     expect(log).toEqual([]);
     expect(readFileSync(paths.state, "utf8")).toBe(state);
   });
@@ -167,9 +168,9 @@ describe("install", () => {
     };
     expect(await install(c, { yes: true }, deps())).toBe(1);
     const text = err.join("\n");
-    expect(text).toContain("factory 0.1.0 is installed, but the factory lock could not be released cleanly: lock compromised while installing");
-    expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe("0.1.0");
-    expect(out.join("\n")).not.toContain("factory 0.1.0 installed.");
+    expect(text).toContain(`factory ${RELEASE} is installed, but the factory lock could not be released cleanly: lock compromised while installing`);
+    expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe(RELEASE);
+    expect(out.join("\n")).not.toContain(`factory ${RELEASE} installed.`);
   });
 
   it("outside npx, a failed apply → exit 1", async () => {
@@ -200,7 +201,7 @@ describe("install", () => {
     const code = await install(ctx(), { yes: true, profile: "codex-only" }, deps({ cliPath: NPX_CLI, runNode }));
     expect(code).toBe(3);
     expect(log).toEqual([
-      `npm install -g --legacy-peer-deps git+${SOURCE}#v0.1.0`,
+      `npm install -g --legacy-peer-deps git+${SOURCE}#v${RELEASE}`,
       "  lock held by us: true",
       "npm root -g",
       `node ${globalCli} install --yes --profile codex-only --parent-lock ${process.pid}`,
@@ -224,7 +225,7 @@ describe("install", () => {
 
   it("under npx, a newer installation that finished before the lock was taken → refused under the lock, global CLI untouched (R18)", async () => {
     await globalCliStandIn();
-    const newer = JSON.stringify({ schema: 1, version: "0.2.0", installedAt: "2026-10-01T00:00:00.000Z", source: SOURCE, piVersion: "1.4.0", piCli: "/x/cli.js", history: [] });
+    const newer = JSON.stringify({ schema: 1, version: NEWER, installedAt: "2026-10-01T00:00:00.000Z", source: SOURCE, piVersion: "1.4.0", piCli: "/x/cli.js", history: [] });
     // A concurrent update completes between the unlocked checks and the bootstrap.
     const requirements: InstallDeps["requirements"] = async () => {
       await mkdir(paths.home, { recursive: true });
@@ -232,7 +233,7 @@ describe("install", () => {
       return REQS_OK;
     };
     expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI, requirements }))).toBe(1);
-    expect(err.join("\n")).toContain("Installed factory 0.2.0 is newer than this release (0.1.0). Nothing was changed.");
+    expect(err.join("\n")).toContain(`Installed factory ${NEWER} is newer than this release (${RELEASE}). Nothing was changed.`);
     expect(log).toEqual([]);
     expect(readFileSync(paths.state, "utf8")).toBe(newer);
     expect(await readLockHolder(paths)).toBeUndefined();
@@ -242,7 +243,7 @@ describe("install", () => {
     await globalCliStandIn();
     const requirements: InstallDeps["requirements"] = async () => {
       await mkdir(paths.home, { recursive: true });
-      await writeFile(paths.txn, JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" }));
+      await writeFile(paths.txn, JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: RELEASE, snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" }));
       return REQS_OK;
     };
     expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI, requirements }))).toBe(1);
@@ -254,7 +255,7 @@ describe("install", () => {
     await globalCliStandIn();
     globalVersion = "0.0.1";
     expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI }))).toBe(1);
-    expect(err.join("\n")).toContain("holds factory 0.0.1, not 0.1.0; not handing over to it");
+    expect(err.join("\n")).toContain(`holds factory 0.0.1, not ${RELEASE}; not handing over to it`);
     expect(log.some((l) => l.startsWith("node "))).toBe(false);
     expect(await readLockHolder(paths)).toBeUndefined();
   });
@@ -263,7 +264,7 @@ describe("install", () => {
     const held = await acquireLock(paths);
     try {
       expect(await install(ctx(), { yes: true, parentLockPid: process.pid }, deps())).toBe(0);
-      expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe("0.1.0");
+      expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe(RELEASE);
       expect((await readLockHolder(paths))?.pid).toBe(process.pid);
     } finally {
       await held.release();
