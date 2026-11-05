@@ -337,7 +337,21 @@ function demoteDirectoryOperands(c: CommandClassification, facts: PathFacts[]): 
   return out;
 }
 
+/**
+ * R56: reconciliation belongs to the classified action, not to the decision. An allowlisted runner on the answer
+ * route that a hard gate turns into an ask (`npm run test < .env`) is reconciled exactly like an allowed one once
+ * the owner approves it.
+ */
 function evaluateCommand(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): GateResult {
+  const r = evaluateCommandDecision(action, ctx);
+  if (r.decision !== "ask" || action.tool === "powershell") return r;
+  if (ctx.route.route !== "answer" || ctx.route.needsReclassification) return r;
+  const c = demoteDirectoryOperands(classifyCommandLine(action.command, { projectCommands: ctx.projectCommands }), action.pathFacts);
+  if (c.class === "read-only" || answerRouteDeny(c, ctx) !== undefined) return r;
+  return { ...r, reconcile: true };
+}
+
+function evaluateCommandDecision(action: Extract<ToolAction, { kind: "command" }>, ctx: GateContext): GateResult {
   // R33: a command whose text a terminal may not show faithfully is never offered for approval.
   const hidden = invisibleCharacter(action.command);
   if (hidden !== undefined) {

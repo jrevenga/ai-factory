@@ -430,6 +430,31 @@ describe("enforce: fix round 1 (R28-R31, M2-M4)", () => {
     expect(w.ledger.events.filter((e) => e.type === "reconciled")).toEqual([expect.objectContaining({ toolCallId: ev.toolCallId, reverted: ["a.txt"] })]);
   });
 
+  it("R56: an approved (asked) answer-route runner is snapshotted before it runs and reconciled afterwards", async () => {
+    const w = await world();
+    gitInit(w.real);
+    writeFileSync(join(w.real, ".env"), "TOKEN=x\n");
+    const reconciler = new Reconciler(join(w.dir, "run"));
+    const { ui, calls } = confirmer(true);
+    const ev = call("bash", { command: "npm run test < .env" });
+    const r = await enforce(ev, { cwd: w.root }, { ...w.deps(w.answer), reconciler, ui });
+    expect(r).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(reconciler.size).toBe(1);
+    writeFileSync(join(w.real, "a.txt"), "changed by the runner\n");
+    reconciler.finish({ toolCallId: ev.toolCallId, content: [{ type: "text", text: "ok" }], isError: false }, w.ledger, RUN_ID);
+    expect(readFileSync(join(w.real, "a.txt"), "utf8")).toBe("a\n");
+  });
+
+  it("R56: an approved answer-route runner whose snapshot fails is denied (fail closed)", async () => {
+    const w = await world();
+    const { ui } = confirmer(true);
+    const reconciler = new Reconciler(join(w.dir, "run"));
+    const r = await enforce(call("bash", { command: "npm run test < .env" }), { cwd: w.root }, { ...w.deps(w.answer), reconciler, ui });
+    expect(r?.block).toBe(true);
+    expect(reconciler.size).toBe(0);
+  });
+
   it("Task 11: without a valid snapshot the runner is denied (fail closed): not a git work tree, or no reconciler in the session", async () => {
     const w = await world();
     const reconciler = new Reconciler(join(w.dir, "run"));

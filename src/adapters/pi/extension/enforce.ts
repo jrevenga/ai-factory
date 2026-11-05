@@ -673,7 +673,7 @@ export async function enforce(ev: ToolCallLike, ctx: { cwd: string }, deps: Enfo
     const busy = r.decision === "deny" ? undefined : deps.inFlight.conflict(group, mutating);
     if (busy !== undefined) {
       r = { ...r, decision: "deny", reason: `${busy}: re-issue this call after the previous call finishes (R31)`, reconcile: false };
-    } else if (r.decision === "allow" && r.reconcile) {
+    } else if (r.decision !== "deny" && r.reconcile) {
       // Ruling 5: answer-route runners run only with reconciliation (Task 11, replacing the R29 deny).
       if (deps.reconciler === undefined) {
         r = { ...r, decision: "deny", reason: "answer-route runner reconciliation is not available in this session (fail closed): declare a change route with set_route", reconcile: false };
