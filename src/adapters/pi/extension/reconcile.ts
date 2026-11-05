@@ -1298,13 +1298,14 @@ export interface ReplayOutcome {
  * `Reconciler.finishTree`; directory names never decide the order. Manifests written before `seq` existed are ordered
  * by `createdAt` (then the manifest's mtime), newest first. Only a missing `reconcile/` directory means "nothing to
  * do": any other failure to list it or an entry is reported (notes, `diagnose`, a ledger `error` event) and the
- * content is left for a retry. Call it only while holding the run's replay lock (`ledger.acquireReplayLock`).
+ * content is left for a retry. Call it only while owning the run's replay (replay-owners.ts `claimReplay`, R52).
  *
  * Fix round 2 (R50.2): the replay stops at the first manifest that fails (is not `done` afterwards); older manifests
  * are kept and the whole remaining tail is retried, in the same order, at a later startup. Work without a readable
  * manifest (unreadable manifest, an entry that cannot be examined, copies without manifest) has no known place in
- * the order, so nothing of that run is replayed until it is readable or dealt with by hand. `opts.owns` (the lock
- * holder's re-check) is consulted before each manifest; once it fails, the rest is kept.
+ * the order, so nothing of that run is replayed until it is readable or dealt with by hand. `opts.owns` (the
+ * owner's re-check: its `replay.owners` entry still exists) is consulted before each manifest; once it fails, the rest
+ * is kept.
  */
 export function replayInterrupted(runDir: string, ledger: Sink, runId: string, diagnose?: Diagnose, opts: { owns?(): boolean } = {}): ReplayOutcome[] {
   const base = path.join(runDir, "reconcile");
@@ -1372,7 +1373,7 @@ export function replayInterrupted(runDir: string, ledger: Sink, runId: string, d
   }
   for (const [i, p] of pending.entries()) {
     if (opts.owns !== undefined && !opts.owns()) {
-      defer(i, "this session no longer holds the run's replay lock (another session took it over)");
+      defer(i, "this session no longer owns the run's replay (its replay.owners entry is gone)");
       break;
     }
     const dir = path.join(base, p.name);

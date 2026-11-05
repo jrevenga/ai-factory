@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { acquireReplayLock, holdsReplayLock, ledgerDirFor, processStart, REPLAY_LOCK, RunLedger, type InterruptedRun } from "../../../../src/adapters/pi/extension/ledger.ts";
+import { ledgerDirFor, RunLedger, type InterruptedRun } from "../../../../src/adapters/pi/extension/ledger.ts";
+import { claimReplay, REPLAY_OWNERS } from "../../../../src/adapters/pi/extension/replay-owners.ts";
 import { loadSnapshot, replayInterrupted, takeSnapshot } from "../../../../src/adapters/pi/extension/reconcile.ts";
 import { lastRouteEntryRunId, recoverRuns, replayInterruptedRuns, resumeLine, resumeSection } from "../../../../src/adapters/pi/extension/resume.ts";
 import { ROUTE_ENTRY } from "../../../../src/adapters/pi/extension/route-state.ts";
@@ -167,8 +168,10 @@ describe("replayInterruptedRuns", () => {
     const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: "20261104T110000Z-50", isAlive: dead }, first.ledger);
     expect(notes.join("\n")).toContain("failed");
     expect(loadSnapshot(join(runDir, "reconcile", "call_1")).status).not.toBe("done");
+    // R52: the claimant removed its owner entry when its replay ended, failed or not.
+    expect(readdirSync(join(runDir, REPLAY_OWNERS))).toEqual([]);
     renameSync(`${root}.gone`, root);
-    // The failed claimant (pid 50) is gone: the next startup retries.
+    // The next startup retries.
     const second = sinkOf();
     replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, second.ledger);
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
@@ -178,158 +181,27 @@ describe("replayInterruptedRuns", () => {
     expect(third.events).toEqual([]);
   });
 
-  it("fix round 1 (I3): while the replay lock holder is alive no other session replays the run; once it is gone, one does", async () => {
+  it("R52: while another live session owns the replay no other session replays the run; once it is gone, one does and releases", async () => {
     const h = await home();
     const root = gitRepo(h);
     const runDir = pendingRun(h, root);
     const holder = "20261104T110000Z-50";
     const alive = (pid: number) => pid === 50;
-    expect(acquireReplayLock(runDir, holder, alive)).toBe(true);
-    // A second contender while the holder lives: refused, and nothing is replayed; the note says why.
-    expect(acquireReplayLock(runDir, SELF, alive)).toBe(false);
+    expect(claimReplay(runDir, holder, alive)).toBeDefined();
+    // A second contender while the holder lives: refused, its own entry removed, and nothing is replayed.
+    expect(claimReplay(runDir, SELF, alive)).toBeUndefined();
+    expect(readdirSync(join(runDir, REPLAY_OWNERS))).toHaveLength(1);
     const s = sinkOf();
     expect(replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: alive }, s.ledger)).toEqual([expect.stringContaining("replay in progress elsewhere")]);
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("runner\n");
-    // The holder died: the next startup takes over and replays; the dead holder's lock directory is removed.
+    // The holder died: the next startup prunes its entry, replays, and removes its own entry when done.
     replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
-    expect(holdsReplayLock(runDir, SELF)).toBe(true);
-    expect(readdirSync(runDir).filter((n) => n.startsWith(REPLAY_LOCK))).toEqual([REPLAY_LOCK]);
+    expect(readdirSync(join(runDir, REPLAY_OWNERS))).toEqual([]);
   });
 });
 
-describe("acquireReplayLock (fix round 2, R50.3)", () => {
-  const X = "20261104T100000Z-40";
-  const A = "20261104T110000Z-50";
-  const B = "20261104T110500Z-60";
-  const C = "20261104T111000Z-70";
-  // X died; A, B and C are live sessions.
-  const alive = (pid: number) => pid !== 40;
-
-  async function lockedByDeadX(): Promise<string> {
-    const runDir = join(await home(), "run");
-    mkdirSync(runDir, { recursive: true });
-    expect(acquireReplayLock(runDir, X, () => true)).toBe(true);
-    return runDir;
-  }
-  const lockNames = (runDir: string) => readdirSync(runDir).filter((n) => n.startsWith(REPLAY_LOCK));
-
-  it("a paused contender with a stale view of a dead holder never takes the lock from the live holder that took over meanwhile", async () => {
-    const runDir = await lockedByDeadX();
-    let b: boolean | undefined;
-    // A judges X dead, then pauses; B takes over completely; A resumes with its stale view.
-    const a = acquireReplayLock(runDir, A, alive, (step) => {
-      if (step === "inspected" && b === undefined) b = acquireReplayLock(runDir, B, alive);
-    });
-    expect(b).toBe(true);
-    expect(a).toBe(false);
-    expect(holdsReplayLock(runDir, B)).toBe(true);
-    expect(lockNames(runDir)).toEqual([REPLAY_LOCK]);
-    // Later contenders still see B alive.
-    expect(acquireReplayLock(runDir, C, alive)).toBe(false);
-    expect(holdsReplayLock(runDir, B)).toBe(true);
-  });
-
-  it("of two contenders that both judged the dead holder dead, exactly one takes over", async () => {
-    const runDir = await lockedByDeadX();
-    let b: boolean | undefined;
-    // A and B both inspect X; B renames first (inside A's pause), then A renames.
-    const a = acquireReplayLock(runDir, A, alive, (step) => {
-      if (step === "inspected" && b === undefined) b = acquireReplayLock(runDir, B, alive, () => undefined);
-    });
-    expect([a, b].filter(Boolean)).toHaveLength(1);
-    expect(holdsReplayLock(runDir, A) !== holdsReplayLock(runDir, B)).toBe(true);
-    expect(lockNames(runDir)).toEqual([REPLAY_LOCK]);
-  });
-
-  it("a contender that arrives between a takeover rename and the winner's mkdir: still exactly one holder", async () => {
-    const runDir = await lockedByDeadX();
-    let b: boolean | undefined;
-    const a = acquireReplayLock(runDir, A, alive, (step) => {
-      if (step === "renamed" && b === undefined) b = acquireReplayLock(runDir, B, alive);
-    });
-    expect(b).toBe(true);
-    expect(a).toBe(false);
-    expect(holdsReplayLock(runDir, B)).toBe(true);
-  });
-
-  it("fix round 3 (R51): a third contender cannot admit a replay in the window where a stale-view contender has displaced a live holder's lock", async () => {
-    const runDir = await lockedByDeadX();
-    let b: boolean | undefined;
-    let c: boolean | undefined;
-    // A judges X dead and pauses; B takes over; A renames B's live lock away; C tries in the window.
-    const a = acquireReplayLock(runDir, A, alive, (step) => {
-      if (step === "inspected" && b === undefined) b = acquireReplayLock(runDir, B, alive);
-      if (step === "displaced") c = acquireReplayLock(runDir, C, alive);
-    });
-    expect(b).toBe(true);
-    expect(c).toBe(false);
-    expect(a).toBe(false);
-    expect(holdsReplayLock(runDir, B)).toBe(true);
-    expect(holdsReplayLock(runDir, C)).toBe(false);
-    expect(lockNames(runDir)).toEqual([REPLAY_LOCK]);
-  });
-
-  it("fix round 3 (R51): a displaced live-owner directory that was never given back blocks admission and is never deleted", async () => {
-    const runDir = await lockedByDeadX();
-    expect(acquireReplayLock(runDir, B, alive)).toBe(true);
-    renameSync(join(runDir, REPLAY_LOCK), join(runDir, `${REPLAY_LOCK}.stale-aaaa`));
-    expect(acquireReplayLock(runDir, C, alive)).toBe(false);
-    expect(lockNames(runDir)).toEqual([`${REPLAY_LOCK}.stale-aaaa`]);
-    expect(JSON.parse(readFileSync(join(runDir, `${REPLAY_LOCK}.stale-aaaa`, "owner"), "utf8")).runId).toBe(B);
-  });
-
-  it("fix round 3 (R51): the lock is rechecked after acquiring; if it was displaced meanwhile the contender releases and backs off", async () => {
-    const runDir = join(await home(), "run");
-    mkdirSync(runDir, { recursive: true });
-    const a = acquireReplayLock(runDir, A, alive, (step) => {
-      if (step === "acquired") renameSync(join(runDir, REPLAY_LOCK), join(runDir, `${REPLAY_LOCK}.stale-bbbb`));
-    });
-    expect(a).toBe(false);
-    expect(holdsReplayLock(runDir, A)).toBe(false);
-    expect(lockNames(runDir)).toEqual([]);
-  });
-
-  it("fix round 3 (R51): stale directories whose owner is dead are pruned, and admission proceeds", async () => {
-    const runDir = join(await home(), "run");
-    mkdirSync(join(runDir, `${REPLAY_LOCK}.stale-dead1`), { recursive: true });
-    writeFileSync(join(runDir, `${REPLAY_LOCK}.stale-dead1`, "owner"), JSON.stringify({ runId: X, pid: 40 }));
-    expect(acquireReplayLock(runDir, A, alive)).toBe(true);
-    expect(lockNames(runDir)).toEqual([REPLAY_LOCK]);
-  });
-
-  it("fix round 3 (R51): an unreadable owner file in a stale directory blocks admission (fail closed)", async () => {
-    const runDir = join(await home(), "run");
-    mkdirSync(join(runDir, `${REPLAY_LOCK}.stale-junk`), { recursive: true });
-    writeFileSync(join(runDir, `${REPLAY_LOCK}.stale-junk`, "owner"), "{not json");
-    expect(acquireReplayLock(runDir, A, alive)).toBe(false);
-    expect(lockNames(runDir)).toEqual([`${REPLAY_LOCK}.stale-junk`]);
-  });
-
-  it("an ownerless lock directory counts as held while recent, and as dead after the grace period", async () => {
-    const runDir = join(await home(), "run");
-    mkdirSync(join(runDir, REPLAY_LOCK), { recursive: true });
-    expect(acquireReplayLock(runDir, A, alive)).toBe(false);
-    const old = new Date(Date.now() - 60_000);
-    utimesSync(join(runDir, REPLAY_LOCK), old, old);
-    expect(acquireReplayLock(runDir, A, alive)).toBe(true);
-    expect(holdsReplayLock(runDir, A)).toBe(true);
-  });
-
-  it.skipIf(process.platform !== "linux")("a holder whose pid now belongs to another process (different start identity) is dead", async () => {
-    const runDir = join(await home(), "run");
-    mkdirSync(join(runDir, REPLAY_LOCK), { recursive: true });
-    writeFileSync(join(runDir, REPLAY_LOCK, "owner"), JSON.stringify({ runId: X, pid: process.pid, start: "1" }));
-    expect(acquireReplayLock(runDir, A, () => true)).toBe(true);
-    // This process's own record (pid and its real start) is alive.
-    const own = `20261104T120000Z-${process.pid}`;
-    const runDir2 = join(runDir, "..", "run2");
-    mkdirSync(runDir2);
-    expect(acquireReplayLock(runDir2, own, () => true)).toBe(true);
-    expect(JSON.parse(readFileSync(join(runDir2, REPLAY_LOCK, "owner"), "utf8"))).toMatchObject({ pid: process.pid, start: processStart(process.pid) });
-    expect(acquireReplayLock(runDir2, A, () => true)).toBe(false);
-  });
-
+describe("replayInterrupted ownership re-check (R52)", () => {
   it("a holder that lost its lock stops replaying before the next manifest", async () => {
     const h = await home();
     const root = gitRepo(h);
@@ -337,7 +209,7 @@ describe("acquireReplayLock (fix round 2, R50.3)", () => {
     const s = sinkOf();
     const out = replayInterrupted(runDir, s.ledger, SELF, undefined, { owns: () => false });
     expect(out.map((o) => o.kind)).toEqual(["kept"]);
-    expect(out[0]?.notes.join("\n")).toContain("no longer holds the run's replay lock");
+    expect(out[0]?.notes.join("\n")).toContain("no longer owns the run's replay");
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("runner\n");
   });
 });

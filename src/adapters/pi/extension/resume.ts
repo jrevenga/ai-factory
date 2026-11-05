@@ -8,13 +8,14 @@
 //
 // Fix round 1: replay completion is tracked by the manifests themselves (a manifest stays retryable until it is `done`),
 // not by the interruption marker. Every startup looks at every interrupted run with unfinished reconciles and replays
-// it under the run's replay lock (fix round 2: `ledger.acquireReplayLock`, a `replay.lock` directory) that a live
-// session holds exclusively and that a later startup takes over once its holder is gone.
+// it only while it owns the run's replay (ruling R52, replay-owners.ts: create-then-list unique entries in
+// `<runDir>/replay.owners/`), so two live sessions never replay the same run at once.
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { RunEvent } from "../../../core/ledger/events.ts";
-import { acquireReplayLock, holdsReplayLock, ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
+import { ledgerDirFor, reconcile, runInterrupted, sessionInterruptedRuns, type InterruptedRun } from "./ledger.ts";
 import { hasUnfinishedReconciles, replayInterrupted, type Diagnose } from "./reconcile.ts";
+import { claimReplay } from "./replay-owners.ts";
 import { lastRouteEntryRunId } from "./route-state.ts";
 
 /** Key of the resume section in `systemPromptOptions.sections`. */
@@ -91,9 +92,11 @@ export interface ReplayInput {
  * After `run_start`: finishes the answer-route reconciliations that interrupted runs of the project left unfinished,
  * audited in this run's ledger. A run qualifies when its `reconcile/` holds unfinished work (reconcile.ts
  * `hasUnfinishedReconciles`) and it is interrupted (`ledger.runInterrupted`), whoever detected it; it is replayed only
- * under its replay lock, so a run a live session is replaying is left to it (a note says so). Newest run first (reverse snapshot order
- * across runs, as within one). A failure is reported (note, `diagnose`, ledger `error`) and left for a retry. Returns
- * one note per replayed, kept or failed item, prefixed with the interrupted run's id.
+ * while this session owns its replay (R52, `claimReplay`), so a run another live session is replaying, or contending
+ * for, is left to it (a note says so; retried at a later startup). The ownership entry is removed when the replay ends.
+ * Newest run first (reverse snapshot order across runs, as within one). A failure is reported (note, `diagnose`,
+ * ledger `error`) and left for a retry. Returns one note per replayed, kept or failed item, prefixed with the
+ * interrupted run's id.
  */
 export function replayInterruptedRuns(input: ReplayInput, ledger: Sink, diagnose?: Diagnose): string[] {
   const dir = ledgerDirFor(input.factoryHome, input.projectId);
@@ -113,13 +116,17 @@ export function replayInterruptedRuns(input: ReplayInput, ledger: Sink, diagnose
     const runDir = join(dir, runId);
     try {
       if (!hasUnfinishedReconciles(runDir) || runInterrupted(dir, runId, input.isAlive) !== true) continue;
-      if (!acquireReplayLock(runDir, input.runId, input.isAlive)) {
-        notes.push(`Interrupted factory run ${runId}: replay in progress elsewhere; another live session holds the replay lock of its answer-route reconciles, so they are left to it`);
+      const claim = claimReplay(runDir, input.runId, input.isAlive);
+      if (claim === undefined) {
+        notes.push(`Interrupted factory run ${runId}: replay in progress elsewhere; another live session is replaying (or contending for) its answer-route reconciles, so they are left to it and retried at a later startup`);
         continue;
       }
-      const owns = () => holdsReplayLock(runDir, input.runId);
-      for (const outcome of replayInterrupted(runDir, ledger, input.runId, diagnose, { owns })) {
-        for (const n of outcome.notes) notes.push(`Interrupted factory run ${runId}: ${n}`);
+      try {
+        for (const outcome of replayInterrupted(runDir, ledger, input.runId, diagnose, { owns: claim.owns })) {
+          for (const n of outcome.notes) notes.push(`Interrupted factory run ${runId}: ${n}`);
+        }
+      } finally {
+        claim.release();
       }
     } catch (e) {
       const message = `the answer-route reconciles of ${runId} could not be replayed (${(e as Error).message}); they are kept for a retry at a later startup: check the working tree before continuing`;
