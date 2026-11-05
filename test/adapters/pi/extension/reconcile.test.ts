@@ -752,6 +752,66 @@ describe("Task 13: replayInterrupted (startup replay of an interrupted run's rec
     expect(read(join(r.runDir, "reconcile", "a_parent", "after", "src", "a.txt"))).toBe("B parent intermediate\n");
   });
 
+  /** Nested parent (snapshot A = original) and child (snapshot B = the parent's intermediate), both killed. */
+  async function nestedKilled() {
+    const r = await repo();
+    const rec = new Reconciler(r.runDir);
+    rec.begin("a|parent", undefined, r.root);
+    writeFileSync(join(r.root, "src", "a.txt"), "B parent intermediate\n");
+    rec.begin("z-child", "a|parent", r.root);
+    writeFileSync(join(r.root, "src", "a.txt"), "C child\n");
+    return { r, parentDir: join(r.runDir, "reconcile", "a_parent"), childDir: join(r.runDir, "reconcile", "z-child") };
+  }
+  const reconciledIds = (events: RunEvent[]) => events.filter((e) => e.type === "reconciled").map((e) => (e.type === "reconciled" ? e.toolCallId : ""));
+
+  it("fix round 2 (I2, R50.2): an unreadable child manifest stops the run's replay; the parent is not restored until the child replays first", async () => {
+    const { r, parentDir, childDir } = await nestedKilled();
+    const childManifest = join(childDir, "manifest.json");
+    const good = read(childManifest);
+    writeFileSync(childManifest, "{ torn");
+    const s = sink();
+    const diag: string[] = [];
+    const out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9", (m) => diag.push(m));
+    // Nothing is replayed: the parent's snapshot A must not land before the child's B is undone.
+    expect(reconciledIds(s.events)).toEqual([]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("C child\n");
+    expect(loadSnapshot(parentDir).status).toBe("pending");
+    expect(out.map((o) => [o.kind, o.dir])).toEqual([
+      ["kept", childDir],
+      ["kept", parentDir],
+    ]);
+    expect(out[1]?.notes.join("\n")).toMatch(/not replayed/);
+    expect(s.events).toEqual([expect.objectContaining({ type: "error", where: "reconcile-replay" })]);
+    // The child becomes readable: the whole tail replays in order, child then parent, and ends at A.
+    writeFileSync(childManifest, good);
+    const s2 = sink();
+    replayInterrupted(r.runDir, s2.ledger, "20261104T130000Z-9");
+    expect(reconciledIds(s2.events)).toEqual(["z-child", "a|parent"]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("a original\n");
+    expect(loadSnapshot(parentDir).status).toBe("done");
+    expect(loadSnapshot(childDir).status).toBe("done");
+  });
+
+  it("fix round 2 (I2, R50.2): a failed child replay stops the run's replay before its parent; the next replay retries child then parent", async () => {
+    const { r, parentDir, childDir } = await nestedKilled();
+    const childManifest = join(childDir, "manifest.json");
+    const good = read(childManifest);
+    const m = JSON.parse(good) as Record<string, unknown>;
+    writeFileSync(childManifest, JSON.stringify({ ...m, root: join(r.root, "gone") }));
+    const s = sink();
+    const out = replayInterrupted(r.runDir, s.ledger, "20261104T120000Z-9");
+    expect(reconciledIds(s.events)).toEqual([]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("C child\n");
+    expect(loadSnapshot(parentDir).status).toBe("pending");
+    expect(out.map((o) => o.kind)).toEqual(["replayed", "kept"]);
+    expect(out[0]?.notes.join("\n")).toContain("failed");
+    writeFileSync(childManifest, good);
+    const s2 = sink();
+    replayInterrupted(r.runDir, s2.ledger, "20261104T130000Z-9");
+    expect(reconciledIds(s2.events)).toEqual(["z-child", "a|parent"]);
+    expect(read(join(r.root, "src", "a.txt"))).toBe("a original\n");
+  });
+
   it("fix round 1 (I2): manifests without a sequence (before this change) are replayed newest first by createdAt", async () => {
     const r = await repo();
     const base = join(r.runDir, "reconcile");

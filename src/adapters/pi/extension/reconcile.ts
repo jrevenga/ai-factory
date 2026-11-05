@@ -1298,7 +1298,12 @@ export interface ReplayOutcome {
  * `Reconciler.finishTree`; directory names never decide the order. Manifests written before `seq` existed are ordered
  * by `createdAt` (then the manifest's mtime), newest first. Only a missing `reconcile/` directory means "nothing to
  * do": any other failure to list it or an entry is reported (notes, `diagnose`, a ledger `error` event) and the
- * content is left for a retry. Call it only while holding the run's replay claim (`ledger.claimReplay`).
+ * content is left for a retry. Call it only while holding the run's replay lock (`ledger.acquireReplayLock`).
+ *
+ * Fix round 2 (R50.2): the replay stops at the first manifest that fails (is not `done` afterwards); older manifests
+ * are kept and the whole remaining tail is retried, in the same order, at a later startup. Work without a readable
+ * manifest (unreadable manifest, an entry that cannot be examined, copies without manifest) has no known place in
+ * the order, so nothing of that run is replayed until it is readable or dealt with by hand.
  */
 export function replayInterrupted(runDir: string, ledger: Sink, runId: string, diagnose?: Diagnose): ReplayOutcome[] {
   const base = path.join(runDir, "reconcile");
@@ -1317,6 +1322,8 @@ export function replayInterrupted(runDir: string, ledger: Sink, runId: string, d
     return out;
   }
   const pending: Array<{ name: string; snapshot: Snapshot; mtime: number }> = [];
+  // Fix round 2 (R50.2): work whose place in the replay order is unknown (no readable manifest) blocks the run's replay.
+  const blocked: string[] = [];
   for (const name of names) {
     const dir = path.join(base, name);
     try {
@@ -1330,6 +1337,7 @@ export function replayInterrupted(runDir: string, ledger: Sink, runId: string, d
           const message = `${dir} holds reconcile copies but no manifest: it was kept; check it before continuing`;
           diagnose?.(`factory: ${message}`);
           out.push({ dir, kind: "kept", notes: [message] });
+          blocked.push(dir);
         }
         continue;
       }
@@ -1338,17 +1346,43 @@ export function replayInterrupted(runDir: string, ledger: Sink, runId: string, d
         snapshot = loadSnapshot(dir);
       } catch (e) {
         failed(dir, `the reconcile manifest in ${dir} cannot be read (${(e as Error).message}): it was kept; check the working tree before continuing`);
+        blocked.push(dir);
         continue;
       }
       if (snapshot.status !== "pending" && snapshot.status !== "reconciling") continue;
       pending.push({ name, snapshot, mtime: lstatSync(manifest).mtimeMs });
     } catch (e) {
       failed(dir, `${dir} cannot be examined (${(e as Error).message}): it was kept for a retry at a later startup; check the working tree before continuing`);
+      blocked.push(dir);
     }
   }
   pending.sort(replayOrder);
-  for (const p of pending) {
+  const defer = (from: number, why: string): void => {
+    const rest = pending.slice(from);
+    if (rest.length === 0) return;
+    diagnose?.(`factory: ${rest.length} answer-route reconcile(s) of ${runDir} were not replayed: ${why}; they are retried at a later startup`);
+    for (const p of rest) {
+      out.push({ dir: p.snapshot.backupDir, kind: "kept", notes: [`the answer-route reconcile in ${p.snapshot.backupDir} was not replayed: ${why}; it is kept and retried in the same order at a later startup`] });
+    }
+  };
+  if (blocked.length > 0) {
+    defer(0, `the reconcile work in ${blocked.join(", ")} has no readable manifest, so its place in the replay order is unknown`);
+    return out;
+  }
+  for (const [i, p] of pending.entries()) {
+    const dir = path.join(base, p.name);
     out.push({ dir: p.snapshot.backupDir, kind: "replayed", notes: reconcileAudited(p.snapshot.toolCallId ?? p.name, p.snapshot, ledger, runId, diagnose) });
+    let done = false;
+    try {
+      // A redundant backup is removed once audited: nothing is left to retry.
+      done = kindOf(dir) === "missing" || loadSnapshot(dir).status === "done";
+    } catch {
+      done = false;
+    }
+    if (!done) {
+      defer(i + 1, `the newer reconcile in ${p.snapshot.backupDir} did not finish`);
+      break;
+    }
   }
   return out;
 }
