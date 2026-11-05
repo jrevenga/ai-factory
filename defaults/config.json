@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "autonomy": "medium",
+  "parallelism": 3,
+  "radar": false,
+  "maintainer": false,
+  "gates": {
+    "hard": ["destructive", "remote-mutation", "secrets", "integration", "outside-root-write"],
+    "soften": []
+  },
+  "budgets": {}
+}

@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "factory": "0.1.0",
+  "source": {
+    "git": "https://github.com/jrevenga/ai-factory.git"
+  },
+  "stateSchemas": {
+    "config.json": 1,
+    "state.json": 1,
+    "managed-settings.json": 1
+  },
+  "node": {
+    "min": "22.19.0"
+  },
+  "pi": {
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "1.4.0",
+    "supportedRange": ">=1.4.0 <1.5.0"
+  },
+  "companions": {
+    "pi-claude-bridge": {
+      "source": "npm:pi-claude-bridge@0.9.3",
+      "when": "claude"
+    }
+  },
+  "lockfileSha256": "53ceb2222b00f21c52dd5e56dd5a8b08330419b8f6e4c98195b25ba90782ad35",
+  "reviewedInstallScripts": [
+    "@google/genai",
+    "fsevents",
+    "protobufjs"
+  ]
+}

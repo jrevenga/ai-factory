@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "name": {
+      "type": "string"
+    },
+    "requires": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex"
+        ]
+      }
+    },
+    "roles": {
+      "type": "object",
+      "properties": {
+        "orchestrator": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "options": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "model"
+          ],
+          "additionalProperties": {}
+        },
+        "implementer": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "options": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "model"
+          ],
+          "additionalProperties": {}
+        },
+        "reviewer": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "options": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "model"
+          ],
+          "additionalProperties": {}
+        },
+        "researcher": {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "options": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "model"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "required": [
+        "orchestrator",
+        "implementer",
+        "reviewer",
+        "researcher"
+      ],
+      "additionalProperties": {}
+    }
+  },
+  "required": [
+    "schema",
+    "name",
+    "requires",
+    "roles"
+  ],
+  "additionalProperties": {}
+}

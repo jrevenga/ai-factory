@@ -1,0 +1,337 @@
+// `factory _apply-release`: the one step every install, update and rollback converges on, always run by
+// the CLI version being installed (plan ruling 10). Its flags are a compatibility contract from v0.1.0 on.
+//
+// Order matters. The guard is copied right after taking the lock, so any later failure leaves Pi's write
+// tools blocked; `state.json` is written last, so any earlier failure leaves the previous state in place;
+// the transaction journal is removed only after that (ruling 12).
+//
+// Under a borrowed lock (`--parent-lock`, R17) the lender may end mid-run: the lock's `lost` signal stops
+// the running Pi/npm subprocesses, and `verify()` before each commit point (the migrated documents,
+// state.json, the journal) refuses to commit once the lender no longer holds the lock it lent. Only the
+// journal of the transaction found at start is removed.
+import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { copyFile, mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { GUARD_FILE_NAME } from "../../../guard/factory-guard.ts";
+import { MalformedJson, readJson, renameWithRetry, writeJsonAtomic } from "../../adapters/platform/json-file.ts";
+import type { FactoryPaths } from "../../adapters/platform/paths.ts";
+import type { PiRuntime } from "../../adapters/pi/runtime.ts";
+import { applyManagedPiSettings } from "../../adapters/pi/settings-file.ts";
+import { detectLogins } from "../../adapters/providers/logins.ts";
+import { acquireLock, LockLost, type Lock } from "../../adapters/store/lock.ts";
+import { docSchemas, loadProfiles, readState, stateDocPath, writePersonalConfig, writeState } from "../../adapters/store/state-store.ts";
+import { clearTxn, readTxn, TxnMismatch } from "../../adapters/store/transaction.ts";
+import type { LoginState } from "../../core/profiles/propose.ts";
+import { proposeProfile } from "../../core/profiles/propose.ts";
+import { effectiveSource, packageRef, type ReleaseManifest } from "../../core/release/manifest.ts";
+import { compareSemver } from "../../core/release/semver.ts";
+import { MIGRATIONS, NoMigrationPath, planMigrations, type Migration } from "../../core/state/migrations.ts";
+import { FactoryState, type StateDoc } from "../../core/state/schema.ts";
+import type { CliIO } from "../io.ts";
+import { formatDoctor, runDoctor } from "./doctor.ts";
+
+export type ApplyReason = "install" | "update" | "rollback";
+export const APPLY_REASONS: readonly ApplyReason[] = ["install", "update", "rollback"];
+
+/** Seams for tests; production uses the real implementations. */
+export interface ApplyDeps {
+  detectLogins: typeof detectLogins;
+  runDoctor: typeof runDoctor;
+  migrations: readonly Migration[];
+  clearTxn: typeof clearTxn;
+  acquireLock: typeof acquireLock;
+  writeState: typeof writeState;
+}
+
+export interface ApplyContext {
+  paths: FactoryPaths;
+  env: NodeJS.ProcessEnv;
+  /** This CLI's own release.json. */
+  manifest: ReleaseManifest;
+  io: CliIO;
+  pi: PiRuntime;
+  now(): Date;
+  /** Package root holding guard/, profiles/ and defaults/; defaults to this package. */
+  root?: string;
+  deps?: Partial<ApplyDeps>;
+}
+
+export interface ApplyOptions {
+  reason: ApplyReason;
+  /** The version being left (update/rollback); recorded in the history entry. */
+  from?: string;
+  /** Pid of a parent factory process holding the factory lock, which is then borrowed. */
+  parentLockPid?: number;
+  /** Profile for a newly created personal config. */
+  profile?: string;
+  /** Accept the proposed profile without asking (R15). */
+  yes?: boolean;
+}
+
+/** Ruling R8: an install never runs over (or clears) the journal of an unfinished update or rollback. */
+export const TXN_PENDING_MESSAGE = 'A previous update did not finish. Run "factory rollback".';
+
+class InstallBlockedByTxn extends Error {
+  constructor() {
+    super(TXN_PENDING_MESSAGE);
+    this.name = "InstallBlockedByTxn";
+  }
+}
+
+/** A preflight refusal: raised before any change, its message is shown as it is. */
+export class ApplyRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApplyRefused";
+  }
+}
+
+/**
+ * Checks that need no change and must pass before the first one (I2): an install never downgrades a
+ * newer installation (that is a rollback, which snapshots first), and every present document has a
+ * migration path to this release's schema. Throws ApplyRefused naming the file and the fix.
+ *
+ * Only an install can say "Nothing was changed": an update/rollback child runs after its parent took the
+ * snapshot, wrote the journal and replaced the CLI, and the parent prints the recovery instruction.
+ */
+export async function applyPreflight(paths: FactoryPaths, manifest: ReleaseManifest, migrations: readonly Migration[], reason: ApplyReason): Promise<void> {
+  const install = reason === "install";
+  const refuse = (problem: string, fix: string): ApplyRefused =>
+    new ApplyRefused(install ? `${problem} Nothing was changed.\n  fix: ${fix}` : `${problem} factory ${manifest.factory} cannot be applied over it.`);
+  const unreadable = (e: MalformedJson): ApplyRefused =>
+    refuse(`${e.path} is unreadable: ${stripPeriod(msg(e.cause))}.`, `Fix or remove ${e.path} (a removed file is recreated by "factory install"), then retry.`);
+  if (install) {
+    let raw: unknown;
+    try {
+      raw = await readJson(paths.state);
+    } catch (e) {
+      if (e instanceof MalformedJson) throw unreadable(e);
+      throw e;
+    }
+    const installed = typeof raw === "object" && raw !== null ? (raw as { version?: unknown }).version : undefined;
+    if (typeof installed === "string" && /^\d+\.\d+\.\d+$/.test(installed) && compareSemver(installed, manifest.factory) > 0) {
+      throw refuse(
+        `Installed factory ${installed} is newer than this release (${manifest.factory}).`,
+        `To go back to ${manifest.factory}, use "factory rollback ${manifest.factory}" (it snapshots your state first).`,
+      );
+    }
+  }
+  let schemas: Partial<Record<StateDoc, number>>;
+  try {
+    schemas = await docSchemas(paths);
+  } catch (e) {
+    if (e instanceof MalformedJson) throw unreadable(e);
+    throw e;
+  }
+  try {
+    planMigrations(schemas, migrations, manifest.stateSchemas);
+  } catch (e) {
+    if (!(e instanceof NoMigrationPath)) throw e;
+    const hint =
+      e.from > e.to
+        ? `It was written by a newer factory; use "factory rollback ${manifest.factory}" to return to this release.`
+        : `Install a factory release that can migrate it ("factory update").`;
+    throw refuse(e.message, hint);
+  }
+}
+
+/** Raised after the failure has been reported to the user; callers only map it to an exit code. */
+export class ApplyFailed extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "ApplyFailed";
+  }
+}
+
+const PACKAGE_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const stripPeriod = (s: string): string => s.trim().replace(/\.+$/, "");
+
+/** Copies the shipped guard into Pi's global extensions dir; readers see the old or the new file, never a partial one. */
+async function installGuard(root: string, paths: FactoryPaths): Promise<void> {
+  await mkdir(paths.piExtensions, { recursive: true });
+  const target = join(paths.piExtensions, GUARD_FILE_NAME);
+  const tmp = `${target}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    await copyFile(join(root, "guard", GUARD_FILE_NAME), tmp);
+    await renameWithRetry(tmp, target);
+  } catch (e) {
+    await rm(tmp, { force: true });
+    throw e;
+  }
+}
+
+function loginInstructions(logins: { claude: LoginState; codex: LoginState }, piCli: string): string {
+  return (
+    `no provider login found (claude: ${logins.claude}, codex: ${logins.codex}), so no profile can be chosen. ` +
+    `Log in to at least one provider, then run "factory install" again: ` +
+    `for Claude, start Claude Code (\`claude\`) and run /login; ` +
+    `for Codex, start Pi (\`"${process.execPath}" "${piCli}"\`), run /login and choose ChatGPT`
+  );
+}
+
+/**
+ * Creates `config.json` when it does not exist; an existing file is never touched. Without `--profile`
+ * the proposed profile is shown and, on a terminal without `--yes`, confirmed first (R15).
+ */
+async function ensurePersonalConfig(
+  paths: FactoryPaths,
+  root: string,
+  io: CliIO,
+  opts: { requested: string | undefined; yes: boolean },
+  logins: { claude: LoginState; codex: LoginState },
+  piCli: string,
+): Promise<void> {
+  if (existsSync(paths.config)) return;
+  const profiles = await loadProfiles(join(root, "profiles"));
+  const available = profiles.map((p) => p.name).join(", ");
+  let name: string;
+  if (opts.requested !== undefined) {
+    if (!profiles.some((p) => p.name === opts.requested)) {
+      throw new Error(`Unknown profile "${opts.requested}". Available profiles: ${available}`);
+    }
+    name = opts.requested;
+  } else {
+    const proposed = proposeProfile(logins, profiles);
+    if (!proposed) throw new Error(loginInstructions(logins, piCli));
+    name = proposed.name;
+    io.out(`Proposed profile: ${name} (logins: claude ${logins.claude}, codex ${logins.codex}).`);
+    if (!opts.yes && io.isTTY && !(await io.confirm(`Use profile "${name}"?`))) {
+      throw new Error(`no profile was chosen. Run "factory install --profile <name>" with one of: ${available}`);
+    }
+  }
+  await writePersonalConfig(paths, { schema: 1, profile: name });
+}
+
+/**
+ * Applies the planned migrations. Every document except `state.json` is rewritten now; `state.json` is
+ * only migrated in memory and returned, because it may be written only as the last step.
+ */
+async function migrate(paths: FactoryPaths, manifest: ReleaseManifest, registry: readonly Migration[]): Promise<unknown | undefined> {
+  const plan = planMigrations(await docSchemas(paths), registry, manifest.stateSchemas);
+  const docs = new Map<StateDoc, unknown>();
+  for (const m of plan) {
+    const current = docs.has(m.doc) ? docs.get(m.doc) : await readJson(stateDocPath(paths, m.doc));
+    docs.set(m.doc, m.up(current));
+  }
+  for (const [doc, value] of docs) {
+    if (doc !== "state.json") await writeJsonAtomic(stateDocPath(paths, doc), value);
+  }
+  return docs.get("state.json");
+}
+
+export async function applyRelease(ctx: ApplyContext, opts: ApplyOptions): Promise<void> {
+  const { paths, env, manifest, io, pi } = ctx;
+  const root = ctx.root ?? PACKAGE_ROOT;
+  const deps: ApplyDeps = { detectLogins, runDoctor, migrations: MIGRATIONS, clearTxn, acquireLock, writeState, ...ctx.deps };
+  const now = ctx.now();
+
+  let lock: Lock | undefined;
+  let failure: unknown;
+  /** True once state.json is written: the release is installed even if a later step fails. */
+  let committed = false;
+  try {
+    const held = await deps.acquireLock(paths, { ownerPid: opts.parentLockPid });
+    lock = held;
+    /** The lock may be lost mid-run (compromised, or the lender ended; R5/R17): never mutate after that. */
+    const live = () => held.verify();
+    await live();
+    const signal = held.lost;
+    if (opts.reason === "install" && existsSync(paths.txn)) throw new InstallBlockedByTxn();
+    // The journal this apply finishes (written by the update/rollback that lent the lock); R17.
+    const txnId = opts.reason === "install" ? undefined : (await readTxn(paths))?.id;
+    await applyPreflight(paths, manifest, deps.migrations, opts.reason);
+    await live();
+    await installGuard(root, paths);
+    await live();
+    const piCli = await pi.ensurePinned(paths, manifest.pi.version, { env, signal });
+    await live();
+    await pi.installPackage(piCli, packageRef(manifest, env), { env, cwd: paths.home, signal });
+    await live();
+    const logins = await deps.detectLogins({ piCli, env });
+    const bridge = manifest.companions["pi-claude-bridge"];
+    if (logins.claude === "present") {
+      await live();
+      await pi.installPackage(piCli, bridge.source, { env, cwd: paths.home, signal });
+    }
+    await live();
+    await applyManagedPiSettings(paths, manifest.factory);
+    await live();
+    await ensurePersonalConfig(paths, root, io, { requested: opts.profile, yes: opts.yes === true }, logins, piCli);
+    await live();
+    const migratedState = await migrate(paths, manifest, deps.migrations);
+    const previous = migratedState === undefined ? await readState(paths) : FactoryState.parse(migratedState);
+    const entry = { version: manifest.factory, at: now.toISOString(), reason: opts.reason, ...(opts.from === undefined ? {} : { from: opts.from }) };
+    await live();
+    await deps.writeState(paths, {
+      ...previous,
+      schema: 1,
+      version: manifest.factory,
+      // Ruling R9: the first-install time; later applies only append history.
+      installedAt: previous?.installedAt ?? now.toISOString(),
+      source: effectiveSource(manifest, env),
+      piVersion: manifest.pi.version,
+      piCli,
+      history: [...(previous?.history ?? []), entry],
+    });
+    committed = true;
+    // The journal belongs to the update/rollback that holds (or lent us) the lock: remove it while the
+    // lock is still ours, never after release (another transaction may own the journal by then).
+    if (txnId !== undefined) {
+      await held.verify();
+      await deps.clearTxn(paths, txnId);
+    }
+  } catch (e) {
+    failure = e;
+  }
+
+  // Release in every case; a release error (e.g. a compromised lock) is reported, never swallowed.
+  let releaseError: unknown;
+  try {
+    await lock?.release();
+  } catch (e) {
+    releaseError = e;
+  }
+  const releaseNote = releaseError === undefined || releaseError === failure ? "" : ` (and the factory lock could not be released: ${msg(releaseError)})`;
+
+  if (failure instanceof InstallBlockedByTxn) {
+    io.err(`${TXN_PENDING_MESSAGE}${releaseNote}`);
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (failure instanceof ApplyRefused) {
+    io.err(`${failure.message}${releaseNote}`);
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (failure !== undefined && !committed) {
+    io.err(`Install did not complete: ${stripPeriod(msg(failure))}${releaseNote}. Previous state kept. Run "factory doctor"; after an update run "factory rollback".`);
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (failure instanceof LockLost || failure instanceof TxnMismatch) {
+    // The journal is not ours to remove any more (R17): leave it for whoever holds the lock now.
+    io.err(
+      `factory ${manifest.factory} was written to ${paths.state}, but its journal ${paths.txn} was left in place: ${stripPeriod(msg(failure))}${releaseNote}. ` +
+        `Once no other factory command is running, run "factory rollback" to recover.`,
+    );
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (failure !== undefined) {
+    io.err(
+      `factory ${manifest.factory} is installed, but the journal ${paths.txn} could not be removed: ${stripPeriod(msg(failure))}${releaseNote}. ` +
+        `Make sure no other factory command is running, remove it, then run "factory doctor".`,
+    );
+    throw new ApplyFailed(msg(failure), { cause: failure });
+  }
+  if (releaseError !== undefined) {
+    // M2: committed, but another process may have held the lock meanwhile; automation must see a failure.
+    io.err(`factory ${manifest.factory} is installed, but the factory lock could not be released cleanly: ${msg(releaseError)}. Run "factory doctor".`);
+    throw new ApplyFailed(msg(releaseError), { cause: releaseError });
+  }
+  io.out(`factory ${manifest.factory} installed.`);
+  try {
+    io.out(formatDoctor(await deps.runDoctor({ paths, env, offline: true, manifest, root })));
+  } catch (e) {
+    io.err(`The installation finished, but "factory doctor" could not run: ${msg(e)}. Run "factory doctor" to check it.`);
+  }
+}

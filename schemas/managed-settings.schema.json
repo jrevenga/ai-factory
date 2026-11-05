@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "keys": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "value": {},
+          "writtenAt": {
+            "type": "string"
+          },
+          "factoryVersion": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "writtenAt",
+          "factoryVersion"
+        ],
+        "additionalProperties": {}
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "keys"
+  ],
+  "additionalProperties": {}
+}

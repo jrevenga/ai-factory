@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "name": "claude-codex",
+  "requires": ["claude", "codex"],
+  "roles": {
+    "orchestrator": { "model": "claude-bridge/claude-opus-5-5" },
+    "implementer": { "model": "claude-bridge/claude-opus-5-5" },
+    "reviewer": { "model": "openai-codex/gpt-6.1-sol" },
+    "researcher": { "model": "openai-codex/gpt-6-luna" }
+  }
+}
