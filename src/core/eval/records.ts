@@ -1,7 +1,7 @@
 // Per-run records (`results.jsonl`) and the immutable run manifest (Phase 3 rulings 4, 13, 16, 21).
 import { z } from "zod";
 import { ContenderId, ProfileName, ProviderId } from "./contenders.ts";
-import { TASK_SPLITS, TASK_TIERS } from "./task.ts";
+import { TASK_SPLITS, TASK_TIERS, TaskGate } from "./task.ts";
 import { EvalThresholds } from "./thresholds.ts";
 
 const Count = z.int().min(0);
@@ -88,6 +88,8 @@ export const EvalRunManifest = z.strictObject({
       taskSha256: Sha256,
       checksSha256: Sha256,
       solutionSha256: Sha256.nullable(),
+      /** The task's resolved scripted gate policy (ruling 19), required: resume and reports never fall back to defaults. */
+      gate: TaskGate,
     }),
   ),
   pins: z.strictObject({

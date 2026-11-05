@@ -158,6 +158,25 @@
                 "type": "null"
               }
             ]
+          },
+          "gate": {
+            "type": "object",
+            "properties": {
+              "reply": {
+                "type": "string",
+                "minLength": 1
+              },
+              "maxContinuations": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 10
+              }
+            },
+            "required": [
+              "reply",
+              "maxContinuations"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [
@@ -169,7 +188,8 @@
           "snapshotSha",
           "taskSha256",
           "checksSha256",
-          "solutionSha256"
+          "solutionSha256",
+          "gate"
         ],
         "additionalProperties": false
       }

@@ -80,6 +80,7 @@ const manifest = () => ({
       taskSha256: sha64,
       checksSha256: sha64,
       solutionSha256: null,
+      gate: { reply: "Proceed.", maxContinuations: 3 },
     },
   ],
   pins: { claude: "2.1.318", pi: "1.0.0", bridge: "0.3.0" },
@@ -130,6 +131,16 @@ describe("EvalRunManifest", () => {
     m.tasks[0]!.taskSha256 = "abc";
     expect(EvalRunManifest.safeParse(m).success).toBe(false);
     expect(EvalRunManifest.safeParse({ ...manifest(), extra: 1 }).success).toBe(false);
+  });
+
+  it("records each task's resolved gate policy (ruling 16) and requires it", () => {
+    expect(EvalRunManifest.parse(manifest()).tasks[0]!.gate).toEqual({ reply: "Proceed.", maxContinuations: 3 });
+    const missing = manifest() as { tasks: Record<string, unknown>[] };
+    delete missing.tasks[0]!.gate;
+    expect(EvalRunManifest.safeParse(missing).success).toBe(false);
+    const invalid = manifest();
+    invalid.tasks[0]!.gate.maxContinuations = 11;
+    expect(EvalRunManifest.safeParse(invalid).success).toBe(false);
   });
 });
 
