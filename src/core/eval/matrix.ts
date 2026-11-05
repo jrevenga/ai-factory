@@ -12,6 +12,9 @@ export function selectTasks(tasks: EvalTask[], sel: TaskSelection): EvalTask[] {
   if (sel.taskIds) {
     const known = new Set(tasks.map((t) => t.id));
     for (const id of sel.taskIds) if (!known.has(id)) throw new Error(`unknown task: ${id}`);
+    // An explicitly requested task outside the selection is an error, never silently dropped.
+    const selected = new Set(out.map((t) => t.id));
+    for (const id of sel.taskIds) if (!selected.has(id)) throw new Error(`task ${id} is not in suite ${sel.suite} (${split})`);
     const wanted = new Set(sel.taskIds);
     out = out.filter((t) => wanted.has(t.id));
   }

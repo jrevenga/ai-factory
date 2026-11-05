@@ -35,6 +35,12 @@ describe("selectTasks", () => {
   it("taskIds filters further", () => {
     expect(ids(selectTasks(TASKS, { suite: "full", heldout: false, taskIds: ["zeta", "alpha"] }))).toEqual(["alpha", "zeta"]);
   });
+  it("a requested task outside the selected suite or split throws instead of being dropped", () => {
+    expect(() => selectTasks(TASKS, { suite: "smoke", heldout: false, taskIds: ["alpha"] })).toThrow(
+      "task alpha is not in suite smoke (dev)",
+    );
+    expect(() => selectTasks(TASKS, { suite: "full", heldout: false, taskIds: ["hf"] })).toThrow("task hf is not in suite full (dev)");
+  });
   it("unknown task id throws", () => {
     expect(() => selectTasks(TASKS, { suite: "full", heldout: false, taskIds: ["nope"] })).toThrow("unknown task: nope");
   });
@@ -71,7 +77,7 @@ describe("shuffle", () => {
 describe("planMatrix", () => {
   const cs: ContenderId[] = ["claude-code", "codex", "noop"];
   it("orders rep, then task, with each block a permutation", () => {
-    const m = planMatrix(["a", "b"], cs, 2, 42);
+    const m = planMatrix(["b", "a"], cs, 2, 42);
     expect(m).toHaveLength(12);
     const keys: string[] = [];
     for (let i = 0; i < m.length; i += 3) {
@@ -80,7 +86,7 @@ describe("planMatrix", () => {
       expect(block.map((s) => s.contender).sort()).toEqual([...cs].sort());
       keys.push(`${block[0]!.rep}:${block[0]!.taskId}`);
     }
-    expect(keys).toEqual(["1:a", "1:b", "2:a", "2:b"]);
+    expect(keys).toEqual(["1:b", "1:a", "2:b", "2:a"]);
   });
   it("is deterministic for a seed", () => {
     expect(planMatrix(["a", "b"], cs, 2, 42)).toEqual(planMatrix(["a", "b"], cs, 2, 42));
