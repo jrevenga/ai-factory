@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "taskId": {
+      "type": "string"
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "disposition": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "approved",
+            "approved_with_rulings",
+            "escalated"
+          ]
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "reviewer": {
+      "type": "string"
+    },
+    "findingsSummary": {
+      "type": "string"
+    },
+    "at": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "taskId",
+    "fingerprint",
+    "disposition",
+    "reviewer",
+    "findingsSummary",
+    "at"
+  ],
+  "additionalProperties": {}
+}

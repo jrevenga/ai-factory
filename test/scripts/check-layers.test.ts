@@ -63,6 +63,32 @@ describe("checkLayers", () => {
     expect(checkLayers(root).map((x) => x.rule)).toEqual(["extension-core-only"]);
   });
 
+  it("R36: the extension may import exactly adapters/platform/process.ts and cmd-quote.ts, nothing else from adapters", async () => {
+    const root = await tree({
+      "src/adapters/pi/extension/ok.ts": 'import { killProcessTree } from "../../platform/process.ts";\nimport { quoteCmdArgs } from "../../platform/cmd-quote.ts";\nexport { killProcessTree, quoteCmdArgs };\n',
+      "src/adapters/pi/extension/bad.ts": 'import { npm } from "../../platform/npm.ts";\nexport { npm };\n',
+      "src/adapters/platform/process.ts": 'import { spawn } from "node:child_process";\nimport { quoteCmdArgs } from "./cmd-quote.ts";\nexport { spawn, quoteCmdArgs };\n',
+      "src/adapters/platform/cmd-quote.ts": "export const quoteCmdArgs = 1;\n",
+    });
+    const v = checkLayers(root);
+    expect(v.map((x) => [x.file, x.rule])).toEqual([["src/adapters/pi/extension/bad.ts", "extension-core-only"]]);
+  });
+
+  it("R36: the extension-shared platform files may import only node builtins and each other", async () => {
+    const root = await tree({
+      "src/adapters/platform/process.ts": 'import { z } from "zod";\nimport { x } from "./paths.ts";\nimport type { Y } from "../store/lock.ts";\nimport { c } from "../../core/a.ts";\nexport { z, x, c };\nexport type { Y };\n',
+      "src/adapters/platform/cmd-quote.ts": 'import fs from "node:fs";\nimport { p } from "./process.ts";\nimport lock from "proper-lockfile";\nexport { fs, p, lock };\n',
+    });
+    const v = checkLayers(root);
+    expect(v.map((x) => [x.file, x.specifier, x.rule])).toEqual([
+      ["src/adapters/platform/cmd-quote.ts", "proper-lockfile", "extension-shared-builtins-only"],
+      ["src/adapters/platform/process.ts", "zod", "extension-shared-builtins-only"],
+      ["src/adapters/platform/process.ts", "./paths.ts", "extension-shared-builtins-only"],
+      ["src/adapters/platform/process.ts", "../store/lock.ts", "extension-shared-builtins-only"],
+      ["src/adapters/platform/process.ts", "../../core/a.ts", "extension-shared-builtins-only"],
+    ]);
+  });
+
   it("cli importing the extension -> no-import-extension", async () => {
     const root = await tree({ "src/cli/e.ts": 'import "../adapters/pi/extension/index.ts";\n' });
     expect(checkLayers(root).map((x) => x.rule)).toEqual(["no-import-extension"]);
@@ -93,6 +119,17 @@ describe("checkLayers", () => {
     });
     const v = checkLayers(root);
     expect(v.map((x) => [x.rule, x.specifier])).toEqual([["extension-core-only", "zod"]]);
+  });
+
+  it("extension may value-import typebox and its subpaths (ruling 14); zod and look-alikes stay forbidden", async () => {
+    const root = await tree({
+      "src/adapters/pi/extension/tb.ts":
+        'import { Type } from "typebox";\nimport { Value } from "typebox/value";\nimport { z } from "zod";\nimport t from "typebox-extra";\nexport { Type, Value, z, t };\n',
+    });
+    expect(checkLayers(root).map((x) => [x.rule, x.specifier])).toEqual([
+      ["extension-core-only", "zod"],
+      ["extension-core-only", "typebox-extra"],
+    ]);
   });
 
   it("extension may import node builtins, prefixed or bare (ruling R6)", async () => {

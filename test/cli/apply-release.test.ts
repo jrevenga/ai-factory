@@ -15,14 +15,15 @@ import { ReleaseManifest } from "../../src/core/release/manifest.ts";
 import type { Migration } from "../../src/core/state/migrations.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
+import { RELEASE, NEWER } from "../helpers/release-version.ts";
 
 const manifest = ReleaseManifest.parse(JSON.parse(readFileSync("release.json", "utf8")));
 const SOURCE = "http://127.0.0.1:1/fixture/ai-factory.git";
-const FACTORY_REF = `git:${SOURCE}@v0.1.0`;
+const FACTORY_REF = `git:${SOURCE}@v${RELEASE}`;
 const BRIDGE_REF = "npm:pi-claude-bridge@0.9.3";
 const FAKE_CLI = "/fake/pi/cli.js";
 
-const TXN = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
+const TXN = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: RELEASE, snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
 const PREVIOUS_STATE = `{"schema":1,"version":"0.0.9","installedAt":"2026-10-01T00:00:00.000Z","source":"x","piVersion":"1.4.0","piCli":"/old/cli.js","history":[{"version":"0.0.9","at":"2026-10-01T00:00:00.000Z","reason":"install"}]}`;
 
 let tmp: Tmp;
@@ -98,8 +99,8 @@ describe("applyRelease happy path", () => {
     ]);
     expect(readFileSync(guardPath()).equals(readFileSync(join("guard", GUARD_FILE_NAME)))).toBe(true);
     const state = readJsonFile(paths.state);
-    expect(state).toMatchObject({ schema: 1, version: "0.1.0", piVersion: "1.4.0", piCli: FAKE_CLI, source: SOURCE, installedAt: "2026-11-01T10:00:00.000Z" });
-    expect(state.history).toEqual([{ version: "0.1.0", at: "2026-11-01T10:00:00.000Z", reason: "install" }]);
+    expect(state).toMatchObject({ schema: 1, version: RELEASE, piVersion: "1.4.0", piCli: FAKE_CLI, source: SOURCE, installedAt: "2026-11-01T10:00:00.000Z" });
+    expect(state.history).toEqual([{ version: RELEASE, at: "2026-11-01T10:00:00.000Z", reason: "install" }]);
     expect(readJsonFile(paths.config)).toEqual({ schema: 1, profile: "codex-only" });
     expect(existsSync(paths.managedSettings)).toBe(true);
     expect(readJsonFile(paths.piSettings).transport).toBe("sse");
@@ -125,7 +126,7 @@ describe("applyRelease happy path", () => {
     await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9" });
     const history = readJsonFile(paths.state).history as Array<Record<string, unknown>>;
     expect(history.map((h) => h.reason)).toEqual(["install", "update"]);
-    expect(history[1]).toEqual({ version: "0.1.0", at: "2026-11-01T10:00:00.000Z", reason: "update", from: "0.0.9" });
+    expect(history[1]).toEqual({ version: RELEASE, at: "2026-11-01T10:00:00.000Z", reason: "update", from: "0.0.9" });
   });
 
   it.each(["update", "rollback"] as const)("--reason %s removes the journal after writing state, while still holding the lock", async (reason) => {
@@ -145,7 +146,7 @@ describe("applyRelease happy path", () => {
   it("keeps a history reason written by a newer release when it rewrites state.json (R13)", async () => {
     await mkdir(paths.home, { recursive: true });
     await writeFile(paths.state, PREVIOUS_STATE.replace('"reason":"install"', '"reason":"reinstall-from-backup"'));
-    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "rollback", from: "0.2.0" });
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "rollback", from: NEWER });
     const history = readJsonFile(paths.state).history as Array<Record<string, unknown>>;
     expect(history.map((h) => h.reason)).toEqual(["reinstall-from-backup", "rollback"]);
   });
@@ -177,7 +178,7 @@ describe("unfinished transaction (ruling R8)", () => {
 });
 
 describe("preflight before any change (I2)", () => {
-  const NEWER_STATE = PREVIOUS_STATE.replaceAll("0.0.9", "0.2.0");
+  const NEWER_STATE = PREVIOUS_STATE.replaceAll("0.0.9", NEWER);
 
   it("--reason install refuses when the installed factory is newer than this release; guard, Pi and state untouched", async () => {
     await mkdir(paths.home, { recursive: true });
@@ -185,8 +186,8 @@ describe("preflight before any change (I2)", () => {
     const e = await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "install" }).catch((x: unknown) => x);
     expect(e).toBeInstanceOf(Error);
     const text = err.join("\n");
-    expect(text).toContain("Installed factory 0.2.0 is newer than this release (0.1.0). Nothing was changed.");
-    expect(text).toContain('use "factory rollback 0.1.0"');
+    expect(text).toContain(`Installed factory ${NEWER} is newer than this release (${RELEASE}). Nothing was changed.`);
+    expect(text).toContain(`use "factory rollback ${RELEASE}"`);
     expect(readFileSync(paths.state, "utf8")).toBe(NEWER_STATE);
     expect(existsSync(guardPath())).toBe(false);
     expect(log).toEqual([]);
@@ -196,8 +197,8 @@ describe("preflight before any change (I2)", () => {
   it("--reason rollback applies an older release over a newer state (the parent decided)", async () => {
     await mkdir(paths.home, { recursive: true });
     await writeFile(paths.state, NEWER_STATE);
-    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "rollback", from: "0.2.0" });
-    expect(readJsonFile(paths.state).version).toBe("0.1.0");
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "rollback", from: NEWER });
+    expect(readJsonFile(paths.state).version).toBe(RELEASE);
   });
 
   it("no migration path → refuses before the guard copy and any Pi change", async () => {
@@ -226,9 +227,9 @@ describe("preflight inside an update/rollback child (I2)", () => {
       expect(e).toBeInstanceOf(Error);
       const text = err.join("\n");
       expect(text).toContain("No migration path for config.json from schema 2 to schema 1.");
-      expect(text).toContain("factory 0.1.0 cannot be applied over it");
+      expect(text).toContain(`factory ${RELEASE} cannot be applied over it`);
       expect(text).not.toContain("Nothing was changed");
-      expect(text).not.toContain("factory rollback 0.1.0");
+      expect(text).not.toContain(`factory rollback ${RELEASE}`);
       expect(existsSync(guardPath())).toBe(false);
       expect(log).toEqual([]);
     },
@@ -254,7 +255,7 @@ describe("after state is written", () => {
       },
     };
     await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }, throwing), { reason: "install" });
-    expect(readJsonFile(paths.state).version).toBe("0.1.0");
+    expect(readJsonFile(paths.state).version).toBe(RELEASE);
     expect(err.join("\n")).not.toContain("Install did not complete");
     expect(err.join("\n")).toContain("doctor exploded");
   });
@@ -352,9 +353,9 @@ describe("failure handling", () => {
   it("apply failure leaves previous state.json", async () => {
     await mkdir(paths.home, { recursive: true });
     await writeFile(paths.state, PREVIOUS_STATE);
-    const txn = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
+    const txn = JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: RELEASE, snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" });
     await writeFile(paths.txn, txn);
-    const pi = new FakePi((ref) => new UnresolvableRef(ref, "not-found", `tag v0.1.0 does not exist at ${SOURCE}`));
+    const pi = new FakePi((ref) => new UnresolvableRef(ref, "not-found", `tag v${RELEASE} does not exist at ${SOURCE}`));
 
     const e = await applyRelease(ctx(pi, { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9" }).catch((x: unknown) => x);
 
@@ -427,7 +428,7 @@ describe("failure handling", () => {
     await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }, { writeState: publishing }), { reason: "update", from: "0.0.9", parentLockPid: process.pid }).catch(() => undefined);
     expect(attempts[0]).toBeInstanceOf(Locked);
     // Nobody else could write meanwhile: state.json is the borrower's, and its journal stays for recovery.
-    expect(readJsonFile(paths.state).version).toBe("0.1.0");
+    expect(readJsonFile(paths.state).version).toBe(RELEASE);
     expect(readFileSync(paths.txn, "utf8")).toBe(TXN);
     await (await acquireLock(paths)).release();
   });
@@ -480,7 +481,7 @@ describe("failure handling", () => {
     const held = await acquireLock(paths);
     try {
       await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9", parentLockPid: process.pid });
-      expect(readJsonFile(paths.state).version).toBe("0.1.0");
+      expect(readJsonFile(paths.state).version).toBe(RELEASE);
       expect((await readLockHolder(paths))?.pid).toBe(process.pid);
     } finally {
       await held.release();
@@ -496,7 +497,7 @@ describe("migrations", () => {
     const m = ReleaseManifest.parse({ ...manifest, stateSchemas: { ...manifest.stateSchemas, "config.json": 2 } });
     await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }, { migrations: [bump] }, m), { reason: "install" });
     expect(readJsonFile(paths.config)).toEqual({ schema: 2, profile: "codex-only", migrated: true });
-    expect(readJsonFile(paths.state).version).toBe("0.1.0");
+    expect(readJsonFile(paths.state).version).toBe(RELEASE);
   });
 
   it("no migration path → fails and state is untouched", async () => {

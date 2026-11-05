@@ -9,6 +9,7 @@ import { main } from "../../src/cli/main.ts";
 import { packageRef, ReleaseManifest } from "../../src/core/release/manifest.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeTmp, type Tmp } from "../helpers/tmp.ts";
+import { RELEASE, NEWER } from "../helpers/release-version.ts";
 
 const manifest = ReleaseManifest.parse(JSON.parse(readFileSync("release.json", "utf8")));
 // The first node:sqlite import prints an ExperimentalWarning; the CLI entry hides it, so do the same here.
@@ -61,7 +62,7 @@ describe("doctor on an empty environment", () => {
   it("an empty FACTORY_SOURCE is no override, and the package ref uses the release's source", async () => {
     const checks = await runDoctor({ paths, env: { ...env, FACTORY_SOURCE: "" }, offline: true, manifest });
     expect(byId(checks, "source-override")?.status).toBe("ok");
-    expect(byId(checks, "factory-package")?.message).toContain("git:https://github.com/jrevenga/ai-factory.git@v0.1.0");
+    expect(byId(checks, "factory-package")?.message).toContain(`git:https://github.com/jrevenga/ai-factory.git@v${RELEASE}`);
   });
 });
 
@@ -107,7 +108,7 @@ describe("installed pieces", () => {
 
   it("a pending txn.json fails txn with factory rollback", async () => {
     mkdirSync(paths.home, { recursive: true });
-    writeFileSync(paths.txn, JSON.stringify({ id: "a", kind: "update", from: "0.1.0", to: "0.2.0", snapshot: "a", startedAt: "2026-11-01T00:00:00Z" }));
+    writeFileSync(paths.txn, JSON.stringify({ id: "a", kind: "update", from: RELEASE, to: NEWER, snapshot: "a", startedAt: "2026-11-01T00:00:00Z" }));
     const txn = byId(await runDoctor({ paths, env, offline: true, manifest }), "txn");
     expect(txn?.status).toBe("fail");
     expect(txn?.fix).toBe("factory rollback");
@@ -137,7 +138,7 @@ describe("main doctor", () => {
 describe("bin", () => {
   it("prints the version with empty stderr", () => {
     const r = spawnSync(process.execPath, ["bin/factory.mjs", "version"], { encoding: "utf8", env });
-    expect(r.stdout.trim()).toBe("0.1.0");
+    expect(r.stdout.trim()).toBe(RELEASE);
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
   });

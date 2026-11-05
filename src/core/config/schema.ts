@@ -69,12 +69,27 @@ export const PersonalConfig = z.looseObject({
 });
 export type PersonalConfig = z.infer<typeof PersonalConfig>;
 
+/**
+ * `commands` of `.factory/config.json` (Phase 2 Task 10): project-declared check runners. Each is tokenized with the
+ * gate's lexer and allowlisted only by argv equality (never by prefix); hard gates still apply. Loose: a newer
+ * release may declare more names.
+ */
+export const DECLARED_COMMAND_NAMES = ["test", "build", "lint", "typecheck"] as const;
+export const ProjectCommands = z.looseObject({
+  test: z.string().optional(),
+  build: z.string().optional(),
+  lint: z.string().optional(),
+  typecheck: z.string().optional(),
+});
+export type ProjectCommands = z.infer<typeof ProjectCommands>;
+
 /** `.factory/config.json`. `overrides` is strict: unknown override keys are a parse error. */
 export const ProjectConfig = z.looseObject({
   schema: z.literal(1),
   minFactoryVersion: z.string().optional(),
   context: z.string().optional(),
   conventions: z.string().optional(),
+  commands: ProjectCommands.optional(),
   overrides: z
     .strictObject({
       language: z.string().optional(),

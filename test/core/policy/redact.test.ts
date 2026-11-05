@@ -1,0 +1,149 @@
+import { describe, expect, it } from "vitest";
+import { LineRedactor, redact, summarizeCommand } from "../../../src/core/policy/redact.ts";
+
+describe("redact", () => {
+  it("replaces each secret pattern", () => {
+    expect(redact("x ghp_abcdefghijklmnopqrstuvwxyz0123456789 y")).toBe("x *** y");
+    for (const p of ["gho_", "ghu_", "ghs_"]) {
+      expect(redact(`${p}abcdefghijklmnopqrstuvwxyz0123`)).toBe("***");
+    }
+    expect(redact("github_pat_11ABCDEFG0abcdefghijklmnop_qrstuvwxyz")).toBe("***");
+    expect(redact("key sk-ant-api03-abcDEF_123-xyz end")).toBe("key *** end");
+    expect(redact("sk-abcdefghijklmnopqrstuvwxyz123456")).toBe("***");
+    expect(redact("AKIAIOSFODNN7EXAMPLE")).toBe("***");
+    expect(redact("xoxb-123456-abcdef-ghij")).toBe("***");
+    expect(redact("xoxp-1-2-3")).toBe("***");
+    expect(redact("Authorization: Bearer abc.DEF-123_x==")).toBe("Authorization: Bearer ***");
+    expect(redact("a\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc\ndef\n-----END RSA PRIVATE KEY-----\nb")).toBe("a\n***\nb");
+    expect(redact("-----BEGIN PRIVATE KEY-----\nzz\n-----END PRIVATE KEY-----")).toBe("***");
+    expect(redact("https://u:p@host/x")).toBe("https://***@host/x");
+    expect(redact("git clone https://user:s3cr3t@example.com/r.git")).toBe("git clone https://***@example.com/r.git");
+  });
+
+  it("redacts key=value style assignments but keeps the key", () => {
+    expect(redact("password=hunter2")).toBe("password=***");
+    expect(redact("PASSWD: hunter2 rest")).toBe("PASSWD: *** rest");
+    expect(redact("secret = abc")).toBe("secret = ***");
+    expect(redact("API_KEY=zzz")).toBe("API_KEY=***");
+    expect(redact("api-key: zzz")).toBe("api-key: ***");
+    expect(redact("token=abc && ls")).toBe("token=*** && ls");
+  });
+
+  it("leaves normal text untouched", () => {
+    const s = "npm run test -- --grep 'sky-high' src/a.ts at http://host/path?q=1 sk-short";
+    expect(redact(s)).toBe(s);
+    expect(redact("the password policy is strict")).toBe("the password policy is strict");
+  });
+});
+
+describe("redact: prefixed and structured keys", () => {
+  it("catches keywords inside longer names", () => {
+    expect(redact("DB_PASSWORD=hunter2")).toBe("DB_PASSWORD=***");
+    expect(redact("NPM_TOKEN=npm_xyz")).toBe("NPM_TOKEN=***");
+    expect(redact("GITHUB_TOKEN=abc123")).toBe("GITHUB_TOKEN=***");
+    expect(redact("MY_API_KEY=zzz")).toBe("MY_API_KEY=***");
+    expect(redact("AWS_SECRET_ACCESS_KEY=abc/def+g")).toBe("AWS_SECRET_ACCESS_KEY=***");
+    expect(redact("export X_TOKEN2=abc ok")).toBe("export X_TOKEN2=*** ok");
+  });
+  it("handles flags, JSON and extra credential shapes", () => {
+    expect(redact("cli --password hunter2 --x")).toBe("cli --password *** --x");
+    expect(redact("cli --token abc123")).toBe("cli --token ***");
+    expect(redact("cli --api-key=abc")).toBe("cli --api-key=***");
+    expect(redact('{"password": "x y", "n": 1}')).toBe('{"password": "***", "n": 1}');
+    expect(redact('{"apiKey":"abc"}')).toBe('{"apiKey":"***"}');
+    expect(redact("authorization: bearer abc.def")).toBe("authorization: Bearer ***");
+    expect(redact("https://u:p@ss@host/x")).toBe("https://***@host/x");
+    expect(redact("https://:pw@host/x")).toBe("https://***@host/x");
+    expect(redact("-----BEGIN PGP PRIVATE KEY BLOCK-----\nabc\n-----END PGP PRIVATE KEY BLOCK-----")).toBe("***");
+  });
+  it("does not touch plain URLs with ports or ssh users", () => {
+    expect(redact("http://host:8080/x@y")).toBe("http://host:8080/x@y");
+    expect(redact("ssh://git@host:22/r")).toBe("ssh://git@host:22/r");
+  });
+});
+
+describe("redact: quoted values", () => {
+  it("masks the whole quoted value", () => {
+    expect(redact('GH_TOKEN="abc def" next')).toBe("GH_TOKEN=*** next");
+    expect(redact("password = 'a b c' next")).toBe("password = *** next");
+    expect(redact('password="unterminated x')).toBe("password=*** x");
+  });
+});
+
+describe("redact: documented over-redaction", () => {
+  it("lets key=value cross a newline", () => {
+    expect(redact("token:\nvalue next")).toBe("token:\n*** next");
+  });
+  it("masks everything after an unterminated private key header", () => {
+    expect(redact('grep "-----BEGIN RSA PRIVATE KEY-----" f && echo done')).toBe('grep "***');
+  });
+});
+
+describe("summarizeCommand", () => {
+  it("redacts, collapses whitespace and truncates to 500", () => {
+    expect(summarizeCommand("echo   a\n\t b  ")).toBe("echo a b");
+    expect(summarizeCommand("curl -H 'Authorization: Bearer abc123' x")).toBe("curl -H 'Authorization: Bearer ***' x");
+    expect(summarizeCommand("x".repeat(600))).toHaveLength(500);
+    expect(summarizeCommand("TOKEN=abc " + "y".repeat(600))).toMatch(/^TOKEN=\*\*\* y+$/);
+  });
+  it("does not leave a lone surrogate at the cut", () => {
+    const out = summarizeCommand("a".repeat(499) + "\u{1F600}" + "b");
+    expect(out).toBe("a".repeat(499));
+    expect(summarizeCommand("a".repeat(498) + "\u{1F600}b")).toBe("a".repeat(498) + "\u{1F600}");
+  });
+});
+
+describe("LineRedactor", () => {
+  const TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+
+  it("redacts a secret split across chunks (lines are redacted whole)", () => {
+    const r = new LineRedactor();
+    let out = r.push(`token: ${TOKEN.slice(0, 10)}`);
+    expect(out).toBe("");
+    out += r.push(`${TOKEN.slice(10)} end\nnext`);
+    out += r.end();
+    expect(out).toBe("token: *** end\nnext");
+    expect(out).not.toContain(TOKEN.slice(4));
+  });
+
+  it("masks a private key block spanning lines and chunks, keeping what follows its END line", () => {
+    const r = new LineRedactor();
+    const out = [
+      r.push("before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEA"),
+      r.push("AAAA\nAAAABG5vbmU\n-----END OPENSSH PRIVATE KEY----- tail\nafter\n"),
+      r.end(),
+    ].join("");
+    expect(out).toBe("before\n***\n tail\nafter\n");
+    expect(out).not.toContain("b3BlbnNzaC1rZXktdjEA");
+  });
+
+  it("M1: a token straddling the 64 KiB cut of a newline-free line is still redacted", () => {
+    const r = new LineRedactor();
+    const out = r.push(`${"x".repeat(65536 - 10)} ${TOKEN} tail`) + r.end();
+    expect(out).not.toContain(TOKEN.slice(4));
+    expect(out).toContain("*** tail");
+  });
+
+  it("M1: a credential straddling the cut without any whitespace nearby is still redacted", () => {
+    const r = new LineRedactor();
+    const out = r.push(`${"a".repeat(65536 - 6)}://user:hunter2pw@host/x`) + r.end();
+    expect(out).not.toContain("hunter2pw");
+    expect(out).toContain("://***@host/x");
+  });
+
+  it("M1: a secret still arriving at the cut is not split (the cut waits for a full window)", () => {
+    const r = new LineRedactor();
+    let out = r.push(`${"a".repeat(65536 - 3)}://us`);
+    out += r.push("er:pw123456@host end");
+    out += r.end();
+    expect(out).not.toContain("pw123456");
+    expect(out).toContain("://***@host end");
+  });
+
+  it("stays bounded on output without newlines", () => {
+    const r = new LineRedactor();
+    const out = r.push("x".repeat(200 * 1024));
+    expect(out.length).toBeGreaterThan(0);
+    expect(out.length + r.end().length).toBe(200 * 1024);
+  });
+});

@@ -1,5 +1,5 @@
 // Startup handshake between the installed factory (state.json) and the Pi package actually loaded.
-// GatePolicy arrives in Phase 2 (ruling 18); until then the handshake reports `policy: "none"`.
+// `policy` names the GatePolicy version the loaded package enforces in its `tool_call` hook (Phase 2: "v1").
 
 export type HandshakeReason = "not-installed" | "version-mismatch" | "config-invalid" | "store-unwritable";
 
@@ -15,7 +15,7 @@ export interface HandshakeInput {
 export interface HandshakeResult {
   ok: boolean;
   version: string;
-  policy: "none";
+  policy: "v1";
   reasons: HandshakeReason[];
 }
 
@@ -30,7 +30,7 @@ export function evaluateHandshake(input: HandshakeInput): HandshakeResult {
   else if (input.expectedVersion !== input.packageVersion) reasons.push("version-mismatch");
   if (!input.configOk) reasons.push("config-invalid");
   if (!input.storeWritable) reasons.push("store-unwritable");
-  return { ok: reasons.length === 0, version: input.packageVersion, policy: "none", reasons };
+  return { ok: reasons.length === 0, version: input.packageVersion, policy: "v1", reasons };
 }
 
 export function handshakeFailureMessage(result: HandshakeResult): string {

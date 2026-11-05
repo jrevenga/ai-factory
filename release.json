@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "factory": "0.1.0",
+  "factory": "0.2.0",
   "source": {
     "git": "https://github.com/jrevenga/ai-factory.git"
   },
@@ -23,7 +23,7 @@
       "when": "claude"
     }
   },
-  "lockfileSha256": "53ceb2222b00f21c52dd5e56dd5a8b08330419b8f6e4c98195b25ba90782ad35",
+  "lockfileSha256": "2deaccf2315a0f91c9e38f825f5d2ef2b386a1e42f7f6f54587f4e90863e2b8e",
   "reviewedInstallScripts": [
     "@google/genai",
     "fsevents",

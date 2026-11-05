@@ -3,12 +3,22 @@
 // personal config parses and that FACTORY_HOME is writable, then emits `factory:handshake` for the
 // guard (ruling 8). While the handshake has failed, its own tool_call handler blocks every tool except
 // the read-only ones, which covers "loaded but handshake failed" even without the guard file.
+// Once the handshake is ok it opens the factory run (ruling 9: `run_start` in the run ledger), restores the route
+// of the session branch (route-state.ts), registers `task_progress` (task-state.ts) and the evidence tools `run_check`,
+// `record_review` and `record_decision` (evidence.ts), and enforces the GatePolicy on every tool call (enforce.ts);
+// allowlisted runners on the answer route are snapshotted before they run and reconciled at their `tool_result`
+// (reconcile.ts, Task 11); `run_end` is written at session_shutdown. Before `run_start`, interrupted runs of the project
+// are marked and this session's own interrupted run is found (resume.ts, Task 13): the restored route then starts
+// flagged, unfinished reconciliations of interrupted runs are finished, and the next agent run gets a resume section.
+import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import path, { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { PersonalConfig } from "../../../core/config/schema.ts";
+import { resolveConfig } from "../../../core/config/resolve.ts";
+import { CoreConfig, PersonalConfig, ProjectConfig, type SoftGateId } from "../../../core/config/schema.ts";
+import { declaredCommands, type DeclaredCommand } from "../../../core/evidence/check-plan.ts";
 import {
   evaluateHandshake,
   HANDSHAKE_EVENT,
@@ -16,11 +26,27 @@ import {
   READ_ONLY_TOOLS,
   type HandshakeResult,
 } from "../../../core/handshake.ts";
-import { resolveFactoryHome } from "../../../core/paths/homes.ts";
+import { projectIdFor, runIdFor } from "../../../core/ledger/events.ts";
+import { resolveFactoryHome, resolvePiAgentDir } from "../../../core/paths/homes.ts";
+import type { AutonomyLevel } from "../../../core/policy/autonomy.ts";
+import type { GateContext } from "../../../core/policy/gate.ts";
+import { INITIAL_ROUTE } from "../../../core/route/route.ts";
+import type { RouteState } from "../../../core/route/types.ts";
 import { FactoryState } from "../../../core/state/schema.ts";
+import { CONFIRM_TIMEOUT_MS, currentRoute, enforce, GatedChecks, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "./enforce.ts";
+import { registerEvidence, type EvidenceSession } from "./evidence.ts";
+import { canonicalDir, gitDirs, repoRoot, sha256hex } from "./facts.ts";
+import { ledgerDirFor, RunLedger, sessionInterruptedRuns } from "./ledger.ts";
+import { Reconciler } from "./reconcile.ts";
+import { recoverRuns, replayInterruptedRuns, RESUME_SECTION_KEY, resumeSection } from "./resume.ts";
+import { registerRouteState, type RouteSession } from "./route-state.ts";
 import { storeWritable } from "./store-probe.ts";
+import { registerTaskState, type TaskSession } from "./task-state.ts";
 
 const PACKAGE_JSON = fileURLToPath(new URL("../../../../package.json", import.meta.url));
+const CORE_DEFAULTS = fileURLToPath(new URL("../../../../defaults/config.json", import.meta.url));
+/** A git dir chosen through the environment applies to every bash `git` (R21; Task 6 concern 2). */
+const GIT_DIR_VARS = ["GIT_DIR", "GIT_COMMON_DIR"];
 
 type Read = { kind: "missing" } | { kind: "json"; value: unknown } | { kind: "error" };
 
@@ -56,39 +82,303 @@ async function packageVersion(): Promise<string> {
   return "unknown";
 }
 
+type PersonalRead = { ok: true; config: PersonalConfig | undefined } | { ok: false };
+
 /** No personal config yet is fine (defaults apply); one that exists must parse. */
-async function configOk(home: string): Promise<boolean> {
+async function personalConfig(home: string): Promise<PersonalRead> {
   const r = await readJson(join(home, "config.json"));
-  if (r.kind === "missing") return true;
-  return r.kind === "json" && PersonalConfig.safeParse(r.value).success;
+  if (r.kind === "missing") return { ok: true, config: undefined };
+  if (r.kind !== "json") return { ok: false };
+  const parsed = PersonalConfig.safeParse(r.value);
+  return parsed.success ? { ok: true, config: parsed.data } : { ok: false };
 }
 
-async function runHandshake(env: NodeJS.ProcessEnv = process.env): Promise<HandshakeResult> {
+interface HandshakeRun {
+  result: HandshakeResult;
+  personal: PersonalConfig | undefined;
+}
+
+async function runHandshake(env: NodeJS.ProcessEnv = process.env): Promise<HandshakeRun> {
   const home = resolveFactoryHome(env, homedir());
-  const [expectedVersion, version, config, writable] = await Promise.all([
+  const [expectedVersion, version, personal, writable] = await Promise.all([
     installedVersion(home),
     packageVersion(),
-    configOk(home),
+    personalConfig(home),
     storeWritable(home),
   ]);
-  return evaluateHandshake({ expectedVersion, packageVersion: version, configOk: config, storeWritable: writable });
+  const result = evaluateHandshake({ expectedVersion, packageVersion: version, configOk: personal.ok, storeWritable: writable });
+  return { result, personal: personal.ok ? personal.config : undefined };
 }
 
-function report(ctx: ExtensionContext, result: HandshakeResult): void {
-  const message = handshakeFailureMessage(result);
+/** process.kill(pid, 0): EPERM means the pid exists (another user's process). */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function warn(ctx: ExtensionContext, message: string): void {
+  if (ctx.hasUI) ctx.ui.notify(message, "warning");
+  else process.stderr.write(`${message}\n`);
+}
+
+function report(ctx: ExtensionContext, message: string): void {
   // Print and JSON modes have no UI (Pi docs/extensions.md); stderr keeps stdout clean there.
   if (ctx.hasUI) ctx.ui.notify(message, "error");
   else process.stderr.write(`${message}\n`);
 }
 
-export default function factoryExtension(pi: ExtensionAPI): void {
-  let current: Promise<HandshakeResult> | undefined;
+/** Facts fixed for the run: gathered once at session start (git runs only here, never per tool call). */
+interface Session {
+  ledger: RunLedger;
+  runId: string;
+  rawHome: string;
+  home: string;
+  piAgentDir: string;
+  factoryHome: string;
+  projectRoot: string;
+  ledgerDir: string;
+  gitDirs: string[];
+  tmpCandidates: string[];
+  autonomy: AutonomyLevel;
+  /** Effective `gates.soften` (core, personal and project layers; ruling 13). */
+  softened: SoftGateId[];
+  /** `.factory/config.json` `commands`, tokenized (Task 10); the gate and `run_check` use the same list. */
+  declared: DeclaredCommand[];
+  projectCommands: string[][];
+  postChecks: MachinePostChecks;
+  inFlight: InFlightCalls;
+  gatedChecks: GatedChecks;
+  /** Task 11: answer-route runner snapshots (`<runDir>/reconcile/<toolCallId>`). */
+  reconciler: Reconciler;
+  /** Task 13: this Pi session's previous run was interrupted (the restored route starts flagged, ruling 20). */
+  sessionInterrupted: boolean;
+  /** Fix round 1 (Task 13): whether a run of this project (one that wrote a route entry) was interrupted. */
+  runInterrupted(runId: string): boolean;
+  /** Task 13: what startup recovery tells the person and, once, the next agent run (cleared when injected). */
+  resume: { messages: string[]; section?: string };
+}
 
-  const start = (ctx: ExtensionContext): Promise<HandshakeResult> => {
-    current = runHandshake().then((result) => {
+function within(child: string, parent: string): boolean {
+  const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+  const rel = path.relative(fold(parent), fold(child));
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+/**
+ * A tmp root is usable only when no protected location lies inside it and it is not inside the project, a
+ * write root or factory/Pi state: otherwise a command write "to tmp" could land in protected files (tests
+ * keep the project under the OS temp dir, as can a user).
+ */
+function usableTmpRoots(s: Session, route: RouteState): string[] {
+  const containers = [s.projectRoot, ...route.writeRoots, s.piAgentDir, s.factoryHome, ...s.gitDirs];
+  const guarded = [...containers, s.home];
+  return s.tmpCandidates.filter((t) => !guarded.some((g) => within(g, t)) && !containers.some((c) => within(t, c)));
+}
+
+function taskFileExists(route: RouteState): boolean {
+  if ((route.route !== "feature" && route.route !== "project") || route.worktree === undefined || route.taskId === undefined) return false;
+  return existsSync(join(route.worktree, ".factory", "knowledge", "tasks", `${route.taskId}.md`));
+}
+
+function policyContext(s: Session, ctx: ExtensionContext): GateContext {
+  const route = currentRoute();
+  return {
+    route,
+    mode: ctx.hasUI ? "interactive" : "unattended",
+    autonomy: s.autonomy,
+    home: s.home,
+    piAgentDir: s.piAgentDir,
+    projectRoot: s.projectRoot,
+    tmpRoots: usableTmpRoots(s, route),
+    ledgerDir: s.ledgerDir,
+    projectCommands: s.projectCommands,
+    taskFileExists: taskFileExists(route),
+    gitDirs: s.gitDirs,
+  };
+}
+
+type ProjectRead = { ok: true; config: ProjectConfig | undefined } | { ok: false; error: string };
+
+/** `<projectRoot>/.factory/config.json`, read once per run (the gate write-protects it, ruling 7). */
+function projectConfig(projectRoot: string): ProjectRead {
+  let raw: string;
+  try {
+    raw = readFileSync(join(projectRoot, ".factory", "config.json"), "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, config: undefined };
+    return { ok: false, error: (e as Error).message };
+  }
+  try {
+    const parsed = ProjectConfig.safeParse(JSON.parse(raw));
+    return parsed.success ? { ok: true, config: parsed.data } : { ok: false, error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+/** Opens the factory run: realpathed facts, effective autonomy, run ledger with `run_start`. Throws on failure. */
+function openSession(ctx: ExtensionContext, personal: PersonalConfig | undefined, version: string, env: NodeJS.ProcessEnv = process.env): Session {
+  const rawHome = homedir();
+  const factoryHome = resolveFactoryHome(env, rawHome);
+  const projectRoot = repoRoot(ctx.cwd) ?? canonicalDir(path.resolve(ctx.cwd));
+  const dirs = gitDirs(projectRoot);
+  for (const k of GIT_DIR_VARS) {
+    const v = env[k];
+    if (v) {
+      const d = canonicalDir(path.resolve(ctx.cwd, v));
+      if (!dirs.includes(d)) dirs.push(d);
+    }
+  }
+  const core = CoreConfig.parse(JSON.parse(readFileSync(CORE_DEFAULTS, "utf8")));
+  // An unreadable or invalid project config fails closed for what it would grant: no declared runners, no softened gates.
+  const project = projectConfig(projectRoot);
+  if (!project.ok) report(ctx, `factory: .factory/config.json is invalid (${project.error}); declared commands and softened gates are ignored`);
+  const effective = resolveConfig({ core, ...(personal ? { personal } : {}), ...(project.ok && project.config ? { project: project.config } : {}) }).value;
+  const autonomy = effective.autonomy;
+  const softened = project.ok ? [...effective.gates.soften] : [];
+  const commands = project.ok ? declaredCommands(project.config?.commands) : { declared: [], ignored: [] };
+  if (commands.ignored.length > 0) report(ctx, `factory: ignored declared commands in .factory/config.json: ${commands.ignored.join("; ")}`);
+  const projectId = projectIdFor(projectRoot, sha256hex);
+  const runId = runIdFor(new Date(), process.pid);
+  const ledger = new RunLedger(ledgerDirFor(factoryHome, projectId), runId);
+  const piSession = ctx.sessionManager.getSessionId();
+  // Task 13: interrupted runs are marked and this session's own one is found before this run's `run_start` exists.
+  const recovery = recoverRuns({ factoryHome, projectId, runId, piSession, entries: ctx.sessionManager.getBranch(), isAlive: pidAlive });
+  ledger.append({
+    v: 1,
+    ts: new Date().toISOString(),
+    runId,
+    type: "run_start",
+    pid: process.pid,
+    projectId,
+    projectRoot,
+    factoryVersion: version,
+    piSession,
+    ...(recovery.resumedFrom.length > 0 ? { resumedFrom: recovery.resumedFrom } : {}),
+  });
+  const replayNotes = replayInterruptedRuns({ factoryHome, projectId, runId, isAlive: pidAlive }, ledger);
+  const section = resumeSection([...recovery.lines, ...replayNotes]);
+  return {
+    ledger,
+    runId,
+    rawHome,
+    home: canonicalDir(rawHome),
+    piAgentDir: canonicalDir(resolvePiAgentDir(env, rawHome)),
+    factoryHome: canonicalDir(factoryHome),
+    projectRoot,
+    ledgerDir: canonicalDir(join(factoryHome, "runs")),
+    gitDirs: dirs,
+    tmpCandidates: [canonicalDir(tmpdir())],
+    autonomy,
+    softened,
+    declared: commands.declared,
+    projectCommands: commands.declared.map((d) => [...d.argv]),
+    postChecks: new MachinePostChecks(),
+    inFlight: new InFlightCalls(),
+    gatedChecks: new GatedChecks(),
+    reconciler: new Reconciler(dirname(ledger.file)),
+    sessionInterrupted: recovery.sessionInterrupted,
+    // An unreadable ledger counts as interrupted (`sessionInterruptedRuns` returns it with an error): fails safe.
+    runInterrupted: (other) => sessionInterruptedRuns(factoryHome, projectId, runId, { routeRunId: other }, pidAlive).some((r) => r.runId === other),
+    resume: { messages: [...recovery.errors, ...recovery.lines, ...replayNotes], ...(section !== undefined ? { section } : {}) },
+  };
+}
+
+function routeSession(s: Session): RouteSession {
+  return {
+    ledger: s.ledger,
+    runId: s.runId,
+    facts: { projectRoot: s.projectRoot, home: s.home, piAgentDir: s.piAgentDir, factoryHome: s.factoryHome, gitDirs: s.gitDirs },
+    runInterrupted: s.runInterrupted,
+  };
+}
+
+function taskSession(s: Session): TaskSession {
+  return { ledger: s.ledger, runId: s.runId, projectRoot: s.projectRoot, home: s.home, piAgentDir: s.piAgentDir, postChecks: s.postChecks };
+}
+
+function evidenceSession(s: Session): EvidenceSession {
+  return {
+    ledger: s.ledger,
+    runId: s.runId,
+    runDir: dirname(s.ledger.file),
+    projectRoot: s.projectRoot,
+    home: s.home,
+    piAgentDir: s.piAgentDir,
+    autonomy: s.autonomy,
+    softened: s.softened,
+    projectCommands: s.projectCommands,
+    declared: s.declared,
+    gatedChecks: s.gatedChecks,
+  };
+}
+
+interface Started {
+  handshake: HandshakeResult;
+  session?: Session;
+  sessionError?: string;
+}
+
+export default function factoryExtension(pi: ExtensionAPI): void {
+  let current: Promise<Started> | undefined;
+  /**
+   * Review M2: names of the tools this extension registered with `pi.registerTool`. Only these are gated as
+   * factory tools; each registration adds its name here.
+   */
+  const factoryTools = new Set<string>();
+  const sessionNow = async (): Promise<Session | undefined> => (current === undefined ? undefined : (await current).session);
+  const routes = registerRouteState(pi, {
+    session: async () => {
+      const s = await sessionNow();
+      return s === undefined ? undefined : routeSession(s);
+    },
+    factoryTools,
+  });
+  const tasks = registerTaskState(pi, {
+    session: async () => {
+      const s = await sessionNow();
+      return s === undefined ? undefined : taskSession(s);
+    },
+    factoryTools,
+  });
+  const evidence = registerEvidence(pi, {
+    session: async () => {
+      const s = await sessionNow();
+      return s === undefined ? undefined : evidenceSession(s);
+    },
+    factoryTools,
+  });
+  const verifyTools = (): void => {
+    routes.verifyTools();
+    tasks.verifyTools();
+    evidence.verifyTools();
+  };
+
+  const start = (ctx: ExtensionContext): Promise<Started> => {
+    current = runHandshake().then(({ result, personal }) => {
       pi.events.emit(HANDSHAKE_EVENT, result);
-      if (!result.ok) report(ctx, result);
-      return result;
+      if (!result.ok) {
+        report(ctx, handshakeFailureMessage(result));
+        return { handshake: result };
+      }
+      // Read-only until the route of the session branch is restored (or when opening the run fails).
+      setRoute(INITIAL_ROUTE);
+      try {
+        const session = openSession(ctx, personal, result.version);
+        verifyTools();
+        // Ruling 20 / review M5: a route restored after this session's interrupted run starts flagged.
+        routes.restore(routeSession(session), ctx, { interrupted: session.sessionInterrupted });
+        for (const m of session.resume.messages) warn(ctx, m);
+        return { handshake: result, session };
+      } catch (e) {
+        const sessionError = (e as Error).message;
+        report(ctx, `factory policy unavailable (every tool is blocked): ${sessionError}`);
+        return { handshake: result, sessionError };
+      }
     });
     return current;
   };
@@ -97,9 +387,89 @@ export default function factoryExtension(pi: ExtensionAPI): void {
     await start(ctx);
   });
 
+  // Task 13: the resume section goes into the next agent run only (sections are mutated, never replaced; A §7.2).
+  pi.on("before_agent_start", async (event) => {
+    const session = await sessionNow();
+    if (session === undefined) return undefined;
+    const section = session.resume.section;
+    if (section !== undefined) {
+      event.systemPromptOptions.sections[RESUME_SECTION_KEY] = section;
+      delete session.resume.section;
+    } else {
+      delete event.systemPromptOptions.sections[RESUME_SECTION_KEY];
+    }
+    return undefined;
+  });
+
   pi.on("tool_call", async (event, ctx) => {
-    const result = await (current ?? start(ctx));
-    if (result.ok || READ_ONLY_TOOLS.includes(event.toolName)) return undefined;
-    return { block: true, reason: handshakeFailureMessage(result) };
+    const s = await (current ?? start(ctx));
+    if (!s.handshake.ok) {
+      if (READ_ONLY_TOOLS.includes(event.toolName)) return undefined;
+      return { block: true, reason: handshakeFailureMessage(s.handshake) };
+    }
+    const session = s.session;
+    if (session === undefined) return { block: true, reason: `factory policy unavailable (fail closed): ${s.sessionError ?? "unknown error"}` };
+    // Review M2: a tool registered later under a factory name must not ride on the factory classification.
+    if (factoryTools.has(event.toolName)) verifyTools();
+    const ui: GateUi | undefined = ctx.hasUI ? { confirm: (title, message) => ctx.ui.confirm(title, message, { timeout: CONFIRM_TIMEOUT_MS }) } : undefined;
+    return enforce(event, { cwd: ctx.cwd }, {
+      policyContext: () => policyContext(session, ctx),
+      ledger: session.ledger,
+      runId: session.runId,
+      home: session.rawHome,
+      postChecks: session.postChecks,
+      inFlight: session.inFlight,
+      factoryTools,
+      gatedChecks: session.gatedChecks,
+      reconciler: session.reconciler,
+      ...(ui ? { ui } : {}),
+    });
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    const session = await sessionNow();
+    if (session === undefined) return undefined;
+    try {
+      const post = session.postChecks.afterToolResult(event, session.ledger, session.runId);
+      // Task 11: the call's own result reconciles its snapshot (and its nested calls'), after the post-check.
+      const reconciled = session.reconciler.finish(post === undefined ? event : { ...event, content: post.content ?? event.content }, session.ledger, session.runId, (m) =>
+        report(ctx, m),
+      );
+      return reconciled ?? post;
+    } finally {
+      session.inFlight.done(event.toolCallId);
+    }
+  });
+
+  // Fires for every call, also for one a later extension's hook blocked (which gets no tool_result); Pi emits it after
+  // `tool_result`, so a call reconciled there is already gone.
+  pi.on("tool_execution_end", async (event, ctx) => {
+    const session = await sessionNow();
+    if (session === undefined) return;
+    session.reconciler.finishId(event.toolCallId, session.ledger, session.runId, (m) => report(ctx, m));
+    session.inFlight.done(event.toolCallId);
+  });
+
+  // Backstop (review M4): nothing is in flight once the agent has settled.
+  pi.on("agent_settled", async (_event, ctx) => {
+    const session = await sessionNow();
+    session?.reconciler.finishAll(session.ledger, session.runId, (m) => report(ctx, m));
+    session?.inFlight.clear();
+    session?.postChecks.clear();
+    session?.gatedChecks.clear();
+  });
+
+  pi.on("session_shutdown", async (event, ctx) => {
+    const session = await sessionNow();
+    if (session === undefined) return;
+    session.reconciler.finishAll(session.ledger, session.runId, (m) => report(ctx, m));
+    session.inFlight.clear();
+    session.postChecks.clear();
+    session.gatedChecks.clear();
+    try {
+      session.ledger.append({ v: 1, ts: new Date().toISOString(), runId: session.runId, type: "run_end", reason: event.reason });
+    } catch (e) {
+      process.stderr.write(`factory: could not write run_end: ${(e as Error).message}\n`);
+    }
   });
 }

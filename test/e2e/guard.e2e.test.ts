@@ -6,6 +6,7 @@ import { GUARD_FILE_NAME } from "../../guard/factory-guard.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { ensureTestPi, runPiPrint } from "../helpers/pi-harness.ts";
 import { makeTmp } from "../helpers/tmp.ts";
+import { RELEASE } from "../helpers/release-version.ts";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const FAUX = join(ROOT, "test", "fixtures", "faux-provider.ts");
@@ -64,8 +65,8 @@ async function setup(opts: { stateVersion?: string; script: unknown[] }) {
   return { dir: t.dir, env, agentDir, log };
 }
 
-async function run(s: Awaited<ReturnType<typeof setup>>, extensions: string[]) {
-  const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd: s.dir, env: s.env, extensions: [...extensions, OBSERVER] });
+async function run(s: Awaited<ReturnType<typeof setup>>, extensions: string[], cwd = s.dir) {
+  const r = await runPiPrint({ cli, agentDir: s.agentDir, cwd, env: s.env, extensions: [...extensions, OBSERVER] });
   expect(r.timedOut).toBe(false);
   expect(r.code, r.stderr).toBe(0);
   return results(s.log);
@@ -103,13 +104,30 @@ describe("factory guard (e2e, faux provider)", () => {
     expect(res[0]?.text).not.toContain("factory guard");
   }, 120_000);
 
-  it("with the factory extension and a valid state the write succeeds", async () => {
-    const s = await setup({ stateVersion: "0.1.0", script: [] });
-    const target = join(s.dir, "out.txt");
-    s.env.FAUX_SCRIPT = JSON.stringify([{ tool: "write", args: { path: target, content: "x" } }]);
-    const res = await run(s, [FAUX, EXTENSION]);
-    expect(existsSync(target)).toBe(true);
-    expect(res[0]?.isError).toBe(false);
+  it("with the factory extension and a valid state the guard steps aside and the factory gate decides", async () => {
+    const s = await setup({ stateVersion: RELEASE, script: [] });
+    // The project sits beside the factory home: a write root may not contain it (set_route, review M6).
+    const project = join(s.dir, "project");
+    mkdirSync(project);
+    const target = join(project, "out.txt");
+    s.env.FAUX_SCRIPT = JSON.stringify([
+      { tool: "bash", args: { command: "echo guard-ok" } },
+      { tool: "write", args: { path: target, content: "x" } },
+      { tool: "set_route", args: { route: "small", reason: "write out.txt" } },
+      { tool: "write", args: { path: target, content: "x" } },
+    ]);
+    const res = await run(s, [FAUX, EXTENSION], project);
+    // The guard blocks bash without a handshake; here the read-only command runs.
+    expect(res[0]).toMatchObject({ toolName: "bash", isError: false });
+    expect(res[0]?.text).toContain("guard-ok");
+    // The write is decided by the GatePolicy, not by the guard: denied on the answer route ...
+    expect(res[1]).toMatchObject({ toolName: "write", isError: true });
+    expect(res[1]?.text).toContain("the answer route cannot write");
+    expect(res[1]?.text).not.toContain("factory guard:");
+    // ... and allowed once set_route small opened the project.
+    expect(res[2]).toMatchObject({ toolName: "set_route", isError: false, text: "Route: small — write out.txt" });
+    expect(res[3]).toMatchObject({ toolName: "write", isError: false });
+    expect(readFileSync(target, "utf8")).toBe("x");
   }, 120_000);
 
   it("with the factory extension and a mismatched state the write is blocked", async () => {

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "exitCode": {
+      "type": "number"
+    },
+    "cwd": {
+      "type": "string"
+    },
+    "fingerprint": {
+      "type": "string"
+    },
+    "fingerprintAfter": {
+      "type": "string"
+    },
+    "mutated": {
+      "type": "boolean"
+    },
+    "durationMs": {
+      "type": "number"
+    },
+    "logPath": {
+      "type": "string"
+    },
+    "at": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "command",
+    "exitCode",
+    "cwd",
+    "fingerprint",
+    "fingerprintAfter",
+    "mutated",
+    "durationMs",
+    "logPath",
+    "at"
+  ],
+  "additionalProperties": {}
+}

@@ -1,0 +1,390 @@
+// Fix round 4 (task-3-codex-review.md, rulings R40-R44): every review input goes through the real adapter facts
+// (`toToolAction`) and the gate, in a harmless fixture world. Nothing here executes a command under review: the
+// commands are only classified; the fixture files hold dummy text.
+import { execFileSync } from "node:child_process";
+import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { toToolAction } from "../../../../src/adapters/pi/extension/enforce.ts";
+import { canonicalDir, trackedSecretFact } from "../../../../src/adapters/pi/extension/facts.ts";
+import { evaluateGate, type GateContext } from "../../../../src/core/policy/gate.ts";
+import type { RouteState } from "../../../../src/core/route/types.ts";
+import { GATE_CORPUS } from "../../../fixtures/gate-corpus.ts";
+import { makeTmp, type Tmp } from "../../../helpers/tmp.ts";
+
+const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+const DUMMY = "dummy fixture text, not a secret\n";
+
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", ["-c", "init.defaultBranch=main", "-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", ...args], {
+    cwd,
+    env: GIT_ENV,
+    stdio: "ignore",
+  });
+}
+
+interface World {
+  tmp: Tmp;
+  home: string;
+  project: string;
+  outside: string;
+  ledger: string;
+}
+
+/**
+ * <tmp>/home                    fake home: .aws/credentials, .ssh/id_rsa (dummy text)
+ * <tmp>/home/proj               project (git, tracks a dummy .env, README.md, notes.txt)
+ *   auth -> ../.aws/credentials, sub/auth -> ../../.aws/credentials   neutral-name links to a home secret
+ *   a/.env, b/.env, src/.env, src/a.ts                                 directories with secret descendants
+ *   out/safe.txt -> <tmp>/outside/result.txt                           a destination child that leaves the root
+ *   rel/l -> ../.aws/credentials                                       R28: proj/.aws/credentials (absent) in place
+ *   safe.txt, input.txt, notes, format.txt, names, -input, mods/leak.jq
+ * <tmp>/outside/result.txt      outside the project
+ * <tmp>/state/runs              the ledger directory
+ */
+async function makeWorld(trackSecret: boolean): Promise<World> {
+  const tmp = await makeTmp("classifier-gate");
+  // The long real path: a Windows runner's TEMP can be an 8.3 short name (`C:/Users/RUNNER~1/...`), and a `~` inside a
+  // word makes a command unclassifiable (fail closed), which is not what these entries test.
+  const base = realpathSync.native(tmp.dir);
+  const home = join(base, "home");
+  const project = join(home, "proj");
+  const outside = join(base, "outside");
+  const ledger = join(base, "state", "runs");
+  for (const d of [join(home, ".aws"), join(home, ".ssh"), project, outside, ledger]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(home, ".aws", "credentials"), DUMMY);
+  writeFileSync(join(home, ".ssh", "id_rsa"), DUMMY);
+  writeFileSync(join(outside, "result.txt"), DUMMY);
+  for (const d of ["a", "b", "src", "out", "mods", "sub"]) mkdirSync(join(project, d));
+  writeFileSync(join(project, "a", ".env"), "A=1\n");
+  writeFileSync(join(project, "b", ".env"), "B=2\n");
+  writeFileSync(join(project, "src", ".env"), "S=3\n");
+  writeFileSync(join(project, "src", "a.ts"), "export {};\n");
+  for (const f of ["safe.txt", "input.txt", "notes", "format.txt", "names", "-input", "README.md", "notes.txt"]) writeFileSync(join(project, f), DUMMY);
+  writeFileSync(join(project, "mods", "leak.jq"), "def leak: 1;\n");
+  symlinkSync(join("..", ".aws", "credentials"), join(project, "auth"));
+  symlinkSync(join("..", "..", ".aws", "credentials"), join(project, "sub", "auth"));
+  symlinkSync(join(outside, "result.txt"), join(project, "out", "safe.txt"));
+  // R28 relative-symlink fixture (Task 12): harmless in rel/, the home secret once copied to the project root.
+  mkdirSync(join(project, "rel"));
+  symlinkSync(join("..", ".aws", "credentials"), join(project, "rel", "l"));
+  git(project, "init", "-q");
+  if (trackSecret) writeFileSync(join(project, ".env"), "DUMMY=1\n");
+  git(project, "add", "--", "README.md", "notes.txt", ...(trackSecret ? [".env"] : []));
+  git(project, "commit", "-q", "-m", "init");
+  return { tmp, home, project, outside, ledger };
+}
+
+// Forward slashes only: the command lexer rejects a backslash (fail closed), and Windows accepts `/` in paths.
+const quote = (p: string) => `'${p.replaceAll("\\", "/")}'`;
+
+/** Maps the review's absolute paths into the fixture (single-quoted: the temporary directory contains a space). */
+function localize(cmd: string, w: World): string {
+  return cmd
+    .replaceAll("/h/", `${quote(w.home)}/`)
+    .replaceAll("/outside/", `${quote(w.outside)}/`)
+    .replaceAll("/state/runs", quote(w.ledger));
+}
+
+function contexts(w: World) {
+  const project = canonicalDir(w.project);
+  const base = {
+    mode: "unattended" as const,
+    autonomy: "medium" as const,
+    home: canonicalDir(w.home),
+    piAgentDir: canonicalDir(join(w.home, ".pi", "agent")),
+    projectRoot: project,
+    tmpRoots: [],
+    ledgerDir: canonicalDir(w.ledger),
+    projectCommands: [],
+    taskFileExists: true,
+    gitDirs: [join(project, ".git")],
+  };
+  const small: RouteState = { route: "small", tier: "small", taskId: "small-1", reason: "test", writeRoots: [project], needsReclassification: false };
+  const answer: RouteState = { route: "answer", writeRoots: [], needsReclassification: false };
+  return { small: { ...base, route: small } satisfies GateContext, answer: { ...base, route: answer } satisfies GateContext };
+}
+
+function decide(cmd: string, w: World, ctx: GateContext) {
+  const action = toToolAction(
+    { toolName: "bash", toolCallId: "c1", input: { command: localize(cmd, w) } },
+    { cwd: w.project, home: w.home, projectCommands: [], piAgentDir: ctx.piAgentDir },
+  );
+  return evaluateGate(action, ctx);
+}
+
+describe("classifier to gate through adapter facts (fix round 4)", () => {
+  let w: World;
+  beforeAll(async () => {
+    w = await makeWorld(true);
+  });
+  afterAll(async () => {
+    await w.tmp.cleanup();
+  });
+
+  for (const entry of GATE_CORPUS.filter((e) => e.gate !== undefined)) {
+    const g = entry.gate!;
+    it(`${JSON.stringify(entry.cmd)}: small ${g.decision}${g.hardGate ? ` (${g.hardGate})` : ""}, answer ${g.answer}`, () => {
+      const { small, answer } = contexts(w);
+      const s = decide(entry.cmd, w, small);
+      expect(s.decision, s.reason).toBe(g.decision);
+      expect(s.hardGate, s.reason).toBe(g.hardGate);
+      const a = decide(entry.cmd, w, answer);
+      expect(a.decision, a.reason).toBe(g.answer);
+      expect(a.hardGate, a.reason).toBe(g.answerHardGate);
+    });
+  }
+
+  it("R48: git fetch <name> is unknown when <name>, <name>.git or <name>.bundle exists; plain remotes keep their class", () => {
+    const { small, answer } = contexts(w);
+    for (const entry of ["backup", "backup.git", "backup.bundle"]) {
+      writeFileSync(join(w.project, entry), "not a remote\n");
+      for (const ctx of [small, answer]) expect(decide("git fetch backup", w, ctx).decision, entry).not.toBe("allow");
+      rmSync(join(w.project, entry));
+    }
+    for (const ctx of [small, answer]) expect(decide("git fetch origin", w, ctx).decision).toBe("allow");
+  });
+
+  it("R48: git show --stat with a ref selector asks for a tracked secret", () => {
+    const { small } = contexts(w);
+    expect(decide("git show --stat --tags", w, small)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    expect(decide("git show --stat HEAD", w, small).decision).toBe("allow");
+  });
+
+  it("bash facts carry whether each path is a directory (R43)", () => {
+    const action = toToolAction({ toolName: "bash", toolCallId: "c2", input: { command: "diff a safe.txt" } }, { cwd: w.project, home: w.home, projectCommands: [] });
+    if (action.kind !== "command") throw new Error("expected a command");
+    expect(action.pathFacts.find((f) => f.input === "a")?.directory).toBe(true);
+    expect(action.pathFacts.find((f) => f.input === "safe.txt")?.directory).toBe(false);
+  });
+
+  it("the tracked-secret fact is supplied only for content-printing git commands (R41)", () => {
+    const facts = { cwd: w.project, home: w.home, projectCommands: [] };
+    const diff = toToolAction({ toolName: "bash", toolCallId: "c3", input: { command: "git diff HEAD" } }, facts);
+    const status = toToolAction({ toolName: "bash", toolCallId: "c4", input: { command: "git status" } }, facts);
+    expect(diff).toMatchObject({ kind: "command", trackedSecret: true });
+    expect(status).not.toHaveProperty("trackedSecret");
+  });
+
+  it("the grep tool on a mixed-case secret directory asks (R27)", () => {
+    const { answer } = contexts(w);
+    const upper = canonicalDir(w.home).replace(/home$/, "HOME");
+    for (const p of [join(canonicalDir(w.home), ".AWS"), join(upper, ".aws")]) {
+      const action = toToolAction({ toolName: "grep", toolCallId: "c5", input: { pattern: "x", path: p } }, { cwd: w.project, home: w.home, projectCommands: [] });
+      expect(evaluateGate(action, answer), p).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    }
+  });
+});
+
+describe("tracked-secret fact (R41)", () => {
+  const worlds: World[] = [];
+  afterAll(async () => {
+    for (const w of worlds) await w.tmp.cleanup();
+  });
+
+  it("is false in a repository that tracks no secret path, so content-printing git is allowed", async () => {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    const { small, answer } = contexts(w);
+    expect(trackedSecretFact(w.project, w.home, small.piAgentDir)).toBe(false);
+    for (const cmd of ["git diff HEAD", "git show HEAD", "git log -p -1"]) {
+      expect(decide(cmd, w, answer), cmd).toMatchObject({ decision: "allow", reconcile: false });
+      expect(decide(cmd, w, small).decision, cmd).toBe("allow");
+    }
+    // A named secret blob still asks without being tracked (it may exist in history).
+    expect(decide("git show HEAD^:.env", w, answer)).toMatchObject({ decision: "ask", hardGate: "secrets" });
+  });
+
+  it("fix round 5: without a tracked secret, --no-index behind an option value and a bare -U still do not run (N1, N2)", async () => {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    const { small, answer } = contexts(w);
+    for (const cmd of ["git diff --src-prefix --no-index a b", "git diff --line-prefix --no-index src out", "git diff -U --no-index a b", "git diff --unified --no-index a b"]) {
+      expect(decide(cmd, w, small), cmd).toMatchObject({ decision: "ask" });
+      expect(decide(cmd, w, answer).decision, cmd).toBe("deny");
+    }
+    for (const cmd of ["git show -U HEAD:.env", "git diff -U HEAD:.env HEAD:notes.txt"]) {
+      expect(decide(cmd, w, answer), cmd).toMatchObject({ decision: "ask", hardGate: "secrets" });
+    }
+    // Nothing secret is tracked: a stat-only show and --check are allowed.
+    expect(decide("git show --stat", w, answer).decision).toBe("allow");
+    expect(decide("git log --check", w, answer).decision).toBe("allow");
+  });
+
+  it("is true when a secret path is tracked, from a subdirectory too", async () => {
+    const w = await makeWorld(true);
+    worlds.push(w);
+    expect(trackedSecretFact(w.project, w.home, join(w.home, ".pi", "agent"))).toBe(true);
+    expect(trackedSecretFact(join(w.project, "src"), w.home, join(w.home, ".pi", "agent"))).toBe(true);
+  });
+
+  it("is undefined outside a repository (the gate then asks)", async () => {
+    const t = await makeTmp("classifier-gate-norepo");
+    worlds.push({ tmp: t, home: t.dir, project: t.dir, outside: t.dir, ledger: t.dir });
+    expect(trackedSecretFact(t.dir, t.dir, join(t.dir, ".pi", "agent"))).toBeUndefined();
+  });
+});
+
+describe("configured git helpers (R58)", () => {
+  const worlds: World[] = [];
+  beforeEach(() => {
+    vi.stubEnv("GIT_CONFIG_GLOBAL", process.platform === "win32" ? "NUL" : "/dev/null");
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+    vi.stubEnv("GIT_EXTERNAL_DIFF", "");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+  afterAll(async () => {
+    for (const w of worlds) await w.tmp.cleanup();
+  });
+  const world = async () => {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    return w;
+  };
+
+  it("without helpers nothing changes", async () => {
+    const w = await world();
+    const { small, answer } = contexts(w);
+    for (const ctx of [small, answer]) for (const cmd of ["git diff HEAD", "git status", "git log -1"]) expect(decide(cmd, w, ctx).decision, cmd).toBe("allow");
+    expect(toToolAction({ toolName: "bash", toolCallId: "h1", input: { command: "git diff" } }, { cwd: w.project, home: w.home, projectCommands: [] })).not.toHaveProperty("gitHelpers");
+  });
+
+  it("a configured textconv makes git diff ask unless both helpers are disabled; --textconv is never read-only", async () => {
+    const w = await world();
+    git(w.project, "config", "diff.pdf.textconv", "touch /nonexistent-marker");
+    const { small, answer } = contexts(w);
+    for (const ctx of [small, answer]) {
+      expect(decide("git diff HEAD", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff --no-ext-diff HEAD", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff --no-textconv HEAD", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, ctx).decision).toBe("allow");
+      expect(decide("git status", w, ctx).decision).not.toBe("allow");
+      // The disabling flags count only when git parses them as options (R64).
+      expect(decide("git diff --src-prefix --no-ext-diff --dst-prefix --no-textconv document.pdf", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff -- --no-ext-diff --no-textconv", w, ctx).decision).not.toBe("allow");
+    }
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    expect(decide("git diff HEAD", w, answer).decision).toBe("deny");
+  });
+
+  it("--textconv is unknown even when no helper is configured", async () => {
+    const w = await world();
+    const { small } = contexts(w);
+    expect(decide("git diff --textconv HEAD", w, small).decision).toBe("ask");
+    expect(decide("git diff --ext-diff HEAD", w, small).decision).toBe("ask");
+  });
+
+  it("diff.external, GIT_EXTERNAL_DIFF and a core.fsmonitor program each count; a boolean fsmonitor does not", async () => {
+    const w = await world();
+    const { small } = contexts(w);
+    git(w.project, "config", "core.fsmonitor", "true");
+    expect(decide("git diff HEAD", w, small).decision).toBe("allow");
+    git(w.project, "config", "core.fsmonitor", "/nonexistent-hook");
+    expect(decide("git status", w, small).decision).toBe("ask");
+    expect(decide("git diff --no-ext-diff --no-textconv", w, small).decision).toBe("ask");
+    git(w.project, "config", "--unset", "core.fsmonitor");
+    expect(decide("git diff HEAD", w, small).decision).toBe("allow");
+    git(w.project, "config", "diff.external", "/nonexistent-diff");
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    git(w.project, "config", "--unset", "diff.external");
+    expect(decide("git diff HEAD", w, small).decision).toBe("allow");
+    vi.stubEnv("GIT_EXTERNAL_DIFF", "/nonexistent-diff");
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, small).decision).toBe("allow");
+  });
+
+  it("the textconv Git for Windows sets in its system config is not a helper; the same entry in another scope or with another value is", async () => {
+    const w = await world();
+    const { small, answer } = contexts(w);
+    const system = join(w.tmp.dir, "system-gitconfig");
+    const gitForWindowsDefault = '[diff "astextplain"]\n\ttextconv = astextplain\n';
+    writeFileSync(system, gitForWindowsDefault);
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "0");
+    vi.stubEnv("GIT_CONFIG_SYSTEM", system);
+    for (const ctx of [small, answer]) {
+      expect(decide("git diff HEAD", w, ctx).decision).toBe("allow");
+      expect(decide("git log --oneline -5", w, ctx).decision).toBe("allow");
+    }
+    writeFileSync(system, '[diff "astextplain"]\n\ttextconv = touch /nonexistent-marker\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, `${gitForWindowsDefault}[diff "pdf"]\n\ttextconv = astextplain\n`);
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    // Exact match only: git keeps the subsection's case, and the value is compared as written.
+    writeFileSync(system, '[diff "AsTextPlain"]\n\ttextconv = astextplain\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, '[diff "astextplain"]\n\ttextconv = "astextplain\u00a0"\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, '[diff "astextplain"]\n\ttextconv = "astextplain "\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, "");
+    git(w.project, "config", "diff.astextplain.textconv", "astextplain");
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+  });
+});
+
+describe("where a command runs (R59) through adapter facts", () => {
+  const worlds: World[] = [];
+  beforeEach(() => {
+    vi.stubEnv("GIT_CONFIG_GLOBAL", process.platform === "win32" ? "NUL" : "/dev/null");
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+    vi.stubEnv("GIT_EXTERNAL_DIFF", "");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+  afterAll(async () => {
+    for (const w of worlds) await w.tmp.cleanup();
+  });
+
+  /** The project with a task worktree `<tmp>/home/wt` on branch factory/t1, and a feature-route context for it. */
+  async function featureWorld() {
+    const w = await makeWorld(false);
+    worlds.push(w);
+    const wt = join(w.home, "wt");
+    git(w.project, "worktree", "add", "-q", "-b", "factory/t1", wt);
+    const worktree = canonicalDir(wt);
+    const feature: RouteState = { route: "feature", tier: "feature", taskId: "t1", reason: "test", worktree, writeRoots: [worktree], needsReclassification: false };
+    const { small } = contexts(w);
+    return { w, wt: worktree, ctx: { ...small, route: feature, mode: "interactive" as const } satisfies GateContext };
+  }
+
+  function decideIn(cmd: string, cwd: string, w: World, ctx: GateContext) {
+    const action = toToolAction({ toolName: "bash", toolCallId: "c1", input: { command: cmd } }, { cwd, home: w.home, projectCommands: [], piAgentDir: ctx.piAgentDir });
+    return evaluateGate(action, ctx);
+  }
+
+  it("feature route with Pi's cwd in the main checkout: git commit and npm run build ask outside-root-write", async () => {
+    const { w, ctx } = await featureWorld();
+    for (const cmd of ["git commit -m x", "npm run build", "git checkout -b experiment main"]) {
+      const r = decideIn(cmd, w.project, w, ctx);
+      expect(r, cmd).toMatchObject({ decision: "ask", hardGate: "outside-root-write" });
+      expect(r.reason, cmd).toContain("R59");
+    }
+    expect(decideIn("git status", w.project, w, ctx).decision).toBe("allow");
+  });
+
+  it("`git -C <worktree>` and `cd <worktree> &&` follow the normal rules; the same commands run in the worktree are allowed", async () => {
+    const { w, wt, ctx } = await featureWorld();
+    for (const cmd of [`git -C ${quote(wt)} commit -m x`, `cd ${quote(wt)} && git commit -m x`, `cd ${quote(wt)} && npm run build`]) {
+      expect(decideIn(cmd, w.project, w, ctx).reason, cmd).not.toContain("R59");
+    }
+    expect(decideIn("git commit -m x", wt, w, ctx).decision).toBe("allow");
+    expect(decideIn("npm run build", wt, w, { ...ctx, mode: "unattended" }).decision).toBe("allow");
+  });
+
+  it("R58 addendum: helpers are looked up where each git segment runs, and an undetermined directory counts as configured", async () => {
+    const { w, wt } = await featureWorld();
+    const other = join(w.home, "other");
+    mkdirSync(other);
+    git(other, "init", "-q");
+    git(other, "config", "diff.pdf.textconv", "touch /nonexistent-marker");
+    const action = (cmd: string, cwd: string) => toToolAction({ toolName: "bash", toolCallId: "h", input: { command: cmd } }, { cwd, home: w.home, projectCommands: [] });
+    expect(action("git diff", w.project)).not.toHaveProperty("gitHelpers");
+    expect(action(`cd ${quote(other)} && git diff`, w.project)).toMatchObject({ gitHelpers: { diff: true } });
+    expect(action(`git -C ${quote(other)} diff`, wt)).toMatchObject({ gitHelpers: { diff: true } });
+    expect(action("git diff", other)).toMatchObject({ gitHelpers: { diff: true } });
+    expect(action("frobnicate && git diff", w.project)).toMatchObject({ gitHelpers: { diff: true, fsmonitor: true } });
+  });
+});

@@ -12,6 +12,7 @@ import type { CliIO } from "../../src/cli/io.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
 import { makeWorld, realisticApply, stateAt } from "../helpers/release-world.ts";
 import { makeTmp } from "../helpers/tmp.ts";
+import { RELEASE, NEWER } from "../helpers/release-version.ts";
 
 function capture(): { io: CliIO; out: string[]; err: string[] } {
   const out: string[] = [];
@@ -29,7 +30,7 @@ describe("main router", () => {
   it("version prints the release version", async () => {
     const c = capture();
     expect(await main(["version"], c.io)).toBe(0);
-    expect(c.out).toEqual(["0.1.0"]);
+    expect(c.out).toEqual([RELEASE]);
   });
 
   it.each(["runs", "eval", "radar"])("%s arrives in a later phase", async (cmd) => {
@@ -52,9 +53,9 @@ describe("main router", () => {
     [["_apply-release", "--reason", "update", "--parent-lock", "abc"]],
     [["_apply-release", "--reason", "update", "--parent-lock", "0"]],
     [["update", "--bogus"]],
-    [["update", "0.2.0"]],
-    [["rollback", "--to", "0.1.0"]],
-    [["rollback", "0.1.0", "0.0.9"]],
+    [["update", NEWER]],
+    [["rollback", "--to", RELEASE]],
+    [["rollback", RELEASE, "0.0.9"]],
   ])("%j is a usage error (exit 2)", async (argv) => {
     const c = capture();
     expect(await main(argv, c.io)).toBe(2);
@@ -86,9 +87,9 @@ describe("main _apply-release", () => {
         applyDeps: { detectLogins: async () => ({ claude: "absent", codex: "absent" }), runDoctor: async () => [] },
       });
       expect(code, c.err.join("\n")).toBe(0);
-      expect(installs).toEqual(["git:http://127.0.0.1:1/x/ai-factory.git@v0.1.0"]);
+      expect(installs).toEqual([`git:http://127.0.0.1:1/x/ai-factory.git@v${RELEASE}`]);
       const state = JSON.parse(readFileSync(paths.state, "utf8")) as { history: unknown[] };
-      expect(state.history).toEqual([{ version: "0.1.0", at: expect.any(String), reason: "update", from: "0.0.9" }]);
+      expect(state.history).toEqual([{ version: RELEASE, at: expect.any(String), reason: "update", from: "0.0.9" }]);
       expect(JSON.parse(readFileSync(paths.config, "utf8"))).toEqual({ schema: 1, profile: "codex-only" });
     } finally {
       await held.release();
@@ -197,17 +198,18 @@ describe("main update/rollback", () => {
   it("maps update --to/--yes and rollback <version>/--yes onto the commands", async () => {
     const w = await makeWorld("main-release");
     try {
-      await writeState(w.paths, stateAt("0.2.0", [{ version: "0.2.0", at: "2026-10-01T00:00:00.000Z", reason: "install" }]));
-      w.tags = ["v0.2.0"];
+      await writeState(w.paths, stateAt(NEWER, [{ version: NEWER, at: "2026-10-01T00:00:00.000Z", reason: "install" }]));
+      w.tags = [`v${NEWER}`];
       const c = capture();
       expect(await main(["update", "--to", "v9.9.9", "--yes"], c.io, { env: w.env, releaseDeps: w.ctx().deps })).toBe(1);
       expect(c.err.join("\n")).toContain("Release v9.9.9 was not found");
 
-      w.releases = { "v0.1.0": {} };
+      w.releases = { [`v${RELEASE}`]: {} };
       const r = capture();
-      expect(await main(["rollback", "v0.1.0", "--yes"], r.io, { env: w.env, releaseDeps: w.ctx().deps }), r.err.join("\n")).toBe(0);
-      expect(w.log).toContain("clone v0.1.0");
-      expect(w.log.at(-1)).toMatch(/_apply-release --reason rollback --from 0\.2\.0 --parent-lock \d+ --yes$/);
+      expect(await main(["rollback", `v${RELEASE}`, "--yes"], r.io, { env: w.env, releaseDeps: w.ctx().deps }), r.err.join("\n")).toBe(0);
+      expect(w.log).toContain(`clone v${RELEASE}`);
+      expect(w.log.at(-1)).toMatch(/_apply-release --reason rollback --from \d+\.\d+\.\d+ --parent-lock \d+ --yes$/);
+      expect(w.log.at(-1)).toContain(`--reason rollback --from ${NEWER} --parent-lock `);
     } finally {
       await w.cleanup();
     }
@@ -305,9 +307,9 @@ describe("relative directory overrides (I4)", () => {
   it("update hands the absolute directories to the new release's _apply-release", async () => {
     const w = await makeWorld("main-relative-update");
     try {
-      await writeState(w.paths, stateAt("0.1.0", [{ version: "0.1.0", at: "2026-10-01T00:00:00.000Z", reason: "install" }]));
-      w.tags = ["v0.2.0"];
-      w.releases = { "v0.2.0": {} };
+      await writeState(w.paths, stateAt(RELEASE, [{ version: RELEASE, at: "2026-10-01T00:00:00.000Z", reason: "install" }]));
+      w.tags = [`v${NEWER}`];
+      w.releases = { [`v${NEWER}`]: {} };
       const childEnv: Array<{ home?: string; agent?: string }> = [];
       const deps = w.ctx({
         runNode: async (args, env) => {
@@ -336,7 +338,7 @@ describe("relative directory overrides (I4)", () => {
         `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(report)}, JSON.stringify({ home: process.env.FACTORY_HOME, agent: process.env.PI_CODING_AGENT_DIR }));\n`,
       );
       const paths = factoryPaths({ ...env, FACTORY_HOME: home });
-      await writeState(paths, { ...stateAt("0.1.0", []), piCli });
+      await writeState(paths, { ...stateAt(RELEASE, []), piCli });
       const c = capture();
       expect(await main([], c.io, { env, cwd: t.dir, doctor: async () => [] }), c.err.join("\n")).toBe(0);
       expect(JSON.parse(readFileSync(report, "utf8"))).toEqual({ home, agent: join(t.dir, "pi agent") });

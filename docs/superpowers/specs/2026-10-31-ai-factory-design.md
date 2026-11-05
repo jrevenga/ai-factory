@@ -130,6 +130,7 @@ Factory state lives in `~/.factory/`, not inside `~/.pi/agent/`, so the factory 
 - The repo is both a **Pi package** (`pi` key in `package.json` pointing at the TypeScript extension source, loaded without a build step (below), `skills/`, `prompts/`) and the source of the `factory` CLI.
 - Releases are semver git tags with a changelog. Private now **[owner]**: installed from git using each user's git credentials; switching to public npm later changes only the install source **[call]**.
 - **Release manifest [call]**: every release contains `release.json` pinning **exact** versions: factory version, Pi version, `pi-claude-bridge` version (exact npm version or commit), and the lockfile of the factory's own dependencies. Installs are reproducible from the manifest; the "supported Pi range" (§6.3) only governs which versions the maintainer may pin in the next release, it is never resolved at install time.
+- **Signed releases [owner]** (2026-11-05, from the [harness radar](../../research/2026-11-04-harness-radar.md), idea 4), mechanics **[call]**: every release tag carries a signature over a statement that names the repository, the tag, the tagged commit and the SHA-256 of `release.json` (so a signature cannot be replayed for another tag or repository). `factory install`, `update` and `rollback` verify it before running, installing or handing over to anything from the target release (npm lifecycle scripts included) and abort without touching state when it is missing or invalid; `doctor` explains the failure. Trust anchors (public keys) are embedded in the installed CLI and also published through a channel independent of the release (the README on `master`); a new key is introduced only by a release signed with a current one. Verification uses Node built-ins only (Ed25519 in `node:crypto`), so it needs no extra binary on Windows; signing format and key storage **[builder]**. There is no bypass flag in consumer mode. Releases made before signing existed (v0.1.0, v0.2.0) are accepted only by an explicit `rollback` confirmation that names them as unsigned. The first bootstrap (`npx … install`) runs code from the tag before any installed verifier exists: the README documents how to verify that tag by hand first (trust on first install). Built with the release flow in Phase 8, and required before the switch to public npm.
 - Verified: Pi installs a package's runtime `dependencies` when installing from npm or git (docs/packages.md); host packages go in `peerDependencies "*"` (but see the peer-dependency requirement in §6.2). Extensions ship as **TypeScript source**: Pi 1.4.0 installed the package by tag from the private repo and loaded the TS extension with its runtime dependency (resolved from the checkout's `node_modules`) without a build step, on Node 22.19.0 and 24, Linux and Windows CI ([S2](../spikes/2026-10-31-phase0-report.md#s2-package-from-private-git), [S10](../spikes/2026-10-31-phase0-report.md#s10-windows)). A load is proven only by a positive signal from the extension (the handshake, §6.2), never by Pi's exit code.
 
 ### 6.2 `factory` CLI **[call]**
@@ -346,6 +347,7 @@ Guardrails:
 - Prompt-injection hygiene: content fetched from the web/issues is marked untrusted in context; untrusted content cannot trigger hard-gated actions without human approval.
 - Project trust: the factory never auto-trusts a repo's `.pi/` resources or `.factory/` overrides that would relax policy.
 - Secrets never written to memory, knowledge, logs or eval reports; redaction on the run ledger.
+- Signed releases verified before install, update and rollback (§6.1).
 - Optional container isolation in the owner's Linux personal layer **[call]**, never required.
 
 ## 12. Evaluation, radar, self-evolution
@@ -424,7 +426,7 @@ Full scope stays **[owner]**: every capability in this document is built; phases
 | 5. Delegation and parallelism | SubagentRunner, worktrees, integration protocol (§7.4), concurrency limit, project tier | Feature/project tasks with parallel writers integrate, verify and review the combined candidate; no regression vs phase 4 |
 | 6. Memory and knowledge | MemoryPort + SQLite store, knowledge store, read path, review/consolidation | Memory suite: cross-session recall tasks pass; measured gain vs no-memory |
 | 7. Observability and limits | `/status`, three-state limits, budgets, failover, Windows live-smoke checklist in the release process | Simulated quota exhaustion recovers without lost work; first release passes the Windows live-smoke |
-| 8. Radar and self-evolution | Watchlist, scan, triage, alerts, profile proposals, experiment pipeline, PR with eval report, release flow | One real improvement goes radar → experiment → eval → PR → release → opt-in update → rollback |
+| 8. Radar and self-evolution | Watchlist, scan, triage, alerts, profile proposals, experiment pipeline, PR with eval report, release flow with release signing and verification (§6.1) | One real improvement goes radar → experiment → eval → PR → release → opt-in update → rollback; an unsigned or tampered release tag is refused by install, update and rollback |
 | 9. Claude Code and Codex adapters | Claude Code plugin and Codex configuration per §7.5, memory MCP server, `factory gate check`, capability matrix in doctor, install support for each harness | Deterministic gate suite passes on each adapter's enforcement mechanism; a small task completes end-to-end in each harness (manual smoke) |
 
 ## 16. Decisions by the owner (recap)
@@ -437,6 +439,7 @@ Full scope stays **[owner]**: every capability in this document is built; phases
 - Windows (mostly) + Linux; no Docker on team machines; Git Bash acceptable.
 - Python skeleton removed; language chosen by the architect (TypeScript).
 - Private repository for now.
+- Releases are signed and verified before install, update and rollback (2026-11-05, §6.1).
 - Model-calling evals only on the owner's server; CI deterministic only.
 - Minimum requirements (Node, Git/Git Bash, repo access, provider logins) are prerequisites; the factory does not install or configure them.
 - Learning, radar and evolution live only in the core (maintainer mode); consumers only use the factory.
