@@ -33,7 +33,9 @@ function jsonLines<T>(file: string): T[] {
 function git(cwd: string, ...args: string[]): string {
   return execFileSync(
     "git",
-    ["-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", "-c", "init.defaultBranch=main", ...args],
+    // No automatic maintenance: a detached `git maintenance run --auto` after a commit holds `objects/maintenance.lock`
+    // for a moment, which would make the object-store comparisons below racy.
+    ["-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", "-c", "init.defaultBranch=main", "-c", "maintenance.auto=false", "-c", "gc.auto=0", ...args],
     { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: isWin ? "NUL" : "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } },
   ).trim();
 }
