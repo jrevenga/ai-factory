@@ -41,8 +41,13 @@ function ledgerRuns(factoryHome: string): LedgerEvent[][] {
   const runs = join(factoryHome, "runs");
   return readdirSync(runs)
     .flatMap((p) => readdirSync(join(runs, p)).map((r) => join(runs, p, r, "events.jsonl")))
-    .sort()
-    .map((f) => jsonLines<LedgerEvent>(f));
+    .map((f) => jsonLines<LedgerEvent>(f))
+    .sort(byStart);
+}
+
+/** Chronological: run ids have one-second resolution and end in the pid, so two runs started in the same second sort by pid. */
+function byStart(a: LedgerEvent[], b: LedgerEvent[]): number {
+  return String(a[0]?.ts ?? "").localeCompare(String(b[0]?.ts ?? ""));
 }
 
 function git(cwd: string, ...args: string[]): string {

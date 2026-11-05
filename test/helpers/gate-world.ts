@@ -184,8 +184,8 @@ export function ledgerRuns(w: GateWorld): LedgerEvent[][] {
   if (!existsSync(runs)) return [];
   return readdirSync(runs)
     .flatMap((p) => readdirSync(join(runs, p)).map((r) => join(runs, p, r, "events.jsonl")))
-    .sort()
-    .map((f) => jsonLines<LedgerEvent>(f));
+    .map((f) => jsonLines<LedgerEvent>(f))
+    .sort((a, b) => String(a[0]?.ts ?? "").localeCompare(String(b[0]?.ts ?? "")));
 }
 
 export function gateEvents(w: GateWorld): LedgerEvent[] {
