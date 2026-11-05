@@ -94,8 +94,6 @@ export function secretTestFor(top: string, ctx: { home: string; piAgentDir: stri
 }
 
 /**
- * Ruling 11: the tree id of the work tree containing `dir` as it is on disk — committed, tracked-modified and
- * untracked non-ignored files — without the task files (`.factory/knowledge/tasks/**
  * Copies the index for a scratch `git add`, keeping its modification time no later than the original's. Git trusts an
  * entry's cached stat data only when the entry is older than the index file; an entry written in the same timestamp
  * tick as the index ("racily clean") is compared by content instead. A copy with a fresh mtime would turn those
@@ -117,7 +115,9 @@ export function copyIndexKeepingMtime(index: string, copy: string, afterOpen?: (
   }
 }
 
-/**`). Computed in a copy of the
+/**
+ * Ruling 11: the tree id of the work tree containing `dir` as it is on disk — committed, tracked-modified and
+ * untracked non-ignored files — without the task files (`.factory/knowledge/tasks/**`). Computed in a copy of the
  * work tree's index under `os.tmpdir()` (removed in `finally`), with the safe git wrapper (no hooks, no fsmonitor,
  * inherited `GIT_*` location and pathspec variables stripped). The user's index is never written.
  *
