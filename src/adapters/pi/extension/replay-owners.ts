@@ -1,9 +1,9 @@
-// Exclusive replay of an interrupted run's answer-route reconciles (Phase 2 Task 13, ruling R52). Two Pi sessions must
-// never replay the same run at once. Earlier designs renamed a shared lock path and kept racing (a contender acting on a
+// Exclusive replay of the answer-route reconciles interrupted runs left in one work tree (Phase 2 Task 13, ruling R52;
+// R61 keys it by the work tree instead of the run). Two Pi sessions must never replay the same work tree at once. Earlier designs renamed a shared lock path and kept racing (a contender acting on a
 // stale view could displace or delete a live holder's lock). R52 never renames or deletes an entry whose owner might be
 // alive:
 //
-// 1. Each contender creates its own entry in `<runDir>/replay.owners/`, named `<pid>-<start>-<random>` (never reused).
+// 1. Each contender creates its own entry in the work tree's owners directory (`replayOwnersDir`), named `<pid>-<start>-<random>` (never reused).
 //    It is written to a temp file `.<name>.tmp` in the same directory and renamed into place, so a reader never sees
 //    partial content.
 // 2. Only after its entry exists does it list the directory and classify every other entry: dead (pid not alive, or a
@@ -15,11 +15,20 @@
 // while the owner lives. Of two overlapping owners, the one that listed later did so after both entries existed, so it
 // saw the other's entry live and backed off. Two simultaneous contenders may both back off: exclusion over progress.
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { join } from "node:path";
 
-/** `<runDir>/replay.owners/`: one entry per contender for the run's replay. */
+/** `<project ledger dir>/replay.owners/<work tree key>/`: one entry per contender for a work tree's replay. */
 export const REPLAY_OWNERS = "replay.owners";
+
+/**
+ * R61: the owners directory of the replay of `workTree` (the realpath a manifest records as its `root`) in the project
+ * whose ledger directory is `projectLedgerDir`: keyed by a hash of the work tree, so every run's reconciles of one work
+ * tree share one replay owner.
+ */
+export function replayOwnersDir(projectLedgerDir: string, workTree: string): string {
+  return join(projectLedgerDir, REPLAY_OWNERS, createHash("sha256").update(workTree, "utf8").digest("hex").slice(0, 32));
+}
 
 const RUN_ID = /^\d{8}T\d{6}Z-(\d+)$/;
 /** A temp entry: `.<pid>-<start>-<random>.tmp` (its writer has not yet listed, so it is not an owner). */
@@ -111,13 +120,13 @@ const isNoEnt = (e: unknown): boolean => (e as NodeJS.ErrnoException).code === "
  * R52, step by step: yields at each pause point and returns the claim, or undefined after backing off. `claimReplay`
  * runs it to completion; tests drive several at once.
  */
-export function* claimSteps(runDir: string, selfRunId: string, isAlive: (pid: number) => boolean, opts: ClaimOptions = {}): Generator<ClaimStep, ReplayClaim | undefined, void> {
+export function* claimSteps(ownersDir: string, selfRunId: string, isAlive: (pid: number) => boolean, opts: ClaimOptions = {}): Generator<ClaimStep, ReplayClaim | undefined, void> {
   const fs = opts.fs ?? nodeOwnersFs;
   const m = RUN_ID.exec(selfRunId);
   const pid = m ? Number(m[1]) : process.pid;
   const startOf = opts.startOf ?? processStart;
   const start = opts.startOf !== undefined ? opts.startOf(pid) : pid === process.pid ? processStart(pid) : undefined;
-  const dir = join(runDir, REPLAY_OWNERS);
+  const dir = ownersDir;
   const name = `${pid}-${start ?? NO_START}-${opts.random?.() ?? randomBytes(8).toString("hex")}`;
   const own = join(dir, name);
   const tmp = join(dir, `.${name}.tmp`);
@@ -197,12 +206,13 @@ export function* claimSteps(runDir: string, selfRunId: string, isAlive: (pid: nu
 }
 
 /**
- * The exclusive right to replay the reconciles of the interrupted run in `runDir` (R52). Undefined: another live (or
+ * The exclusive right to replay the reconciles of the work tree whose owners directory is `ownersDir` (R52, R61:
+ * `replayOwnersDir`). Undefined: another live (or
  * unreadable) entry exists, so a replay is in progress elsewhere or a contest was lost; retried at a later startup.
  * Throws on a filesystem error (the contender's own entry is removed first).
  */
-export function claimReplay(runDir: string, selfRunId: string, isAlive: (pid: number) => boolean, opts: ClaimOptions = {}): ReplayClaim | undefined {
-  const steps = claimSteps(runDir, selfRunId, isAlive, opts);
+export function claimReplay(ownersDir: string, selfRunId: string, isAlive: (pid: number) => boolean, opts: ClaimOptions = {}): ReplayClaim | undefined {
+  const steps = claimSteps(ownersDir, selfRunId, isAlive, opts);
   for (;;) {
     const r = steps.next();
     if (r.done) return r.value;

@@ -6,14 +6,15 @@ import {
   claimSteps,
   processStart,
   REPLAY_OWNERS,
+  replayOwnersDir,
   type ClaimStep,
   type OwnersFs,
   type ReplayClaim,
 } from "../../../../src/adapters/pi/extension/replay-owners.ts";
 import { makeTmp } from "../../../helpers/tmp.ts";
 
-const RUN = "/runs/p/20261104T100000Z-11";
-const DIR = `${RUN}/${REPLAY_OWNERS}`;
+/** R61: the replay is owned per work tree (`replayOwnersDir`), not per run. */
+const DIR = replayOwnersDir("/runs/p", "/work/tree");
 const X = "20261104T100000Z-40";
 const A = "20261104T110000Z-50";
 const B = "20261104T110500Z-60";
@@ -94,7 +95,7 @@ class Contender {
   readonly runId: string;
   constructor(runId: string, fs: MemFs, probe: Probe) {
     this.runId = runId;
-    this.gen = claimSteps(RUN, runId, probe.isAlive, opts(fs, probe, runId));
+    this.gen = claimSteps(DIR, runId, probe.isAlive, opts(fs, probe, runId));
   }
   /** Advance to the next pause point (or the end). */
   step(): void {
@@ -142,7 +143,7 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
   it("a lone contender owns the replay; its entry is complete, uniquely named, and removed on release", () => {
     const fs = new MemFs();
     const probe = new Probe();
-    const claim = claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A));
+    const claim = claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A));
     expect(claim).toBeDefined();
     const names = fs.names();
     expect(names).toEqual([`50-s50-${"1".padStart(16, "0")}`]);
@@ -166,9 +167,9 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
   it("another live entry makes the contender back off and remove only its own entry", () => {
     const fs = new MemFs();
     const probe = new Probe();
-    const b = claimReplay(RUN, B, probe.isAlive, opts(fs, probe, B));
+    const b = claimReplay(DIR, B, probe.isAlive, opts(fs, probe, B));
     const bEntry = fs.entryOf(B);
-    expect(claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A))).toBeUndefined();
+    expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A))).toBeUndefined();
     expect(fs.names()).toEqual([bEntry]);
     expect(b?.owns()).toBe(true);
   });
@@ -178,9 +179,9 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
     const probe = new Probe();
     deadX(fs, probe);
     // A live pid whose start identity changed: the recorded owner is gone and the pid was reused.
-    claimReplay(RUN, B, probe.isAlive, opts(fs, probe, B));
+    claimReplay(DIR, B, probe.isAlive, opts(fs, probe, B));
     probe.starts.set(pidOf(B), "reused");
-    const claim = claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A));
+    const claim = claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A));
     expect(claim).toBeDefined();
     expect(fs.names()).toEqual([fs.entryOf(A)]);
   });
@@ -189,9 +190,9 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
     const fs = new MemFs();
     const probe = new Probe();
     fs.files.set(`${DIR}/60-none-ffff`, JSON.stringify({ runId: B, pid: 60, createdAt: "x" }));
-    expect(claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A))).toBeUndefined();
+    expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A))).toBeUndefined();
     probe.dead.add(60);
-    expect(claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A))).toBeDefined();
+    expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A))).toBeDefined();
   });
 
   it("an unreadable or unparsable entry counts as live: it blocks and is kept (fail closed)", () => {
@@ -200,7 +201,7 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
       const probe = new Probe();
       fs.files.set(`${DIR}/60-s60-junk`, bad);
       if (bad === "unreadable") fs.unreadable.add(`${DIR}/60-s60-junk`);
-      expect(claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A)), bad).toBeUndefined();
+      expect(claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A)), bad).toBeUndefined();
       expect(fs.names()).toEqual(["60-s60-junk"]);
     }
   });
@@ -211,7 +212,7 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
     fs.files.set(`${DIR}/.40-s40-aaaa.tmp`, "{");
     fs.files.set(`${DIR}/.60-s60-bbbb.tmp`, "{");
     probe.dead.add(40);
-    const claim = claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A));
+    const claim = claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A));
     expect(claim).toBeDefined();
     expect(fs.names()).toEqual([".60-s60-bbbb.tmp", fs.entryOf(A)].sort());
   });
@@ -229,7 +230,7 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
   it("an entry that vanished between the listing and its read (released or pruned) does not block", () => {
     const fs = new MemFs();
     const probe = new Probe();
-    const b = claimReplay(RUN, B, probe.isAlive, opts(fs, probe, B));
+    const b = claimReplay(DIR, B, probe.isAlive, opts(fs, probe, B));
     const a = new Contender(A, fs, probe);
     a.until("listed");
     b?.release();
@@ -246,14 +247,14 @@ describe("claimReplay (R52: create-then-list unique owner entries)", () => {
         throw errno("EIO", DIR);
       },
     };
-    expect(() => claimReplay(RUN, A, probe.isAlive, { ...opts(fs, probe, A), fs: failing })).toThrow(/EIO/);
+    expect(() => claimReplay(DIR, A, probe.isAlive, { ...opts(fs, probe, A), fs: failing })).toThrow(/EIO/);
     expect(fs.names()).toEqual([]);
   });
 
   it("owns() is false once the contender's own entry is gone", () => {
     const fs = new MemFs();
     const probe = new Probe();
-    const claim = claimReplay(RUN, A, probe.isAlive, opts(fs, probe, A));
+    const claim = claimReplay(DIR, A, probe.isAlive, opts(fs, probe, A));
     fs.files.clear();
     expect(claim?.owns()).toBe(false);
   });
@@ -430,7 +431,7 @@ describe("claimReplay: interleavings (mutual exclusion over progress)", () => {
       for (const order of [base, [...base.slice(7), ...base.slice(0, 7)], base.map((_, k) => (k % 2) as number)]) {
         const r = runSchedule([A, B], order, { actor: 0, at });
         // After the death, a fresh contender can always proceed: A's leftover entry is dead.
-        const f = claimReplay(RUN, C, r.probe.isAlive, opts(r.fs, r.probe, C));
+        const f = claimReplay(DIR, C, r.probe.isAlive, opts(r.fs, r.probe, C));
         const liveOwner = r.fs.entryOf(B) !== undefined;
         if (!liveOwner) expect(f, `at ${at}`).toBeDefined();
         f?.release();
@@ -445,39 +446,48 @@ describe("claimReplay on the real filesystem", () => {
   afterEach(async () => {
     for (const c of cleanups.splice(0)) await c();
   });
-  async function runDir(): Promise<string> {
+  async function ownersDir(): Promise<string> {
     const t = await makeTmp("owners");
     cleanups.push(t.cleanup);
-    const d = join(t.dir, "run");
-    mkdirSync(d);
-    return d;
+    const project = join(t.dir, "runs", "p");
+    mkdirSync(project, { recursive: true });
+    return replayOwnersDir(project, join(t.dir, "work tree"));
   }
 
   it("creates the owners directory, writes a complete entry, leaves no temp file, and releases it", async () => {
-    const d = await runDir();
+    const d = await ownersDir();
     const claim = claimReplay(d, A, () => true);
     expect(claim).toBeDefined();
-    const names = readdirSync(join(d, REPLAY_OWNERS));
+    const names = readdirSync(d);
     expect(names).toHaveLength(1);
     expect(names[0]).toMatch(/^50-none-[0-9a-f]{16}$/);
-    expect(JSON.parse(readFileSync(join(d, REPLAY_OWNERS, names[0] as string), "utf8"))).toMatchObject({ runId: A, pid: 50 });
+    expect(JSON.parse(readFileSync(join(d, names[0] as string), "utf8"))).toMatchObject({ runId: A, pid: 50 });
     expect(claimReplay(d, B, () => true)).toBeUndefined();
-    expect(readdirSync(join(d, REPLAY_OWNERS))).toEqual(names);
+    expect(readdirSync(d)).toEqual(names);
     claim?.release();
-    expect(readdirSync(join(d, REPLAY_OWNERS))).toEqual([]);
+    expect(readdirSync(d)).toEqual([]);
   });
 
   it.skipIf(process.platform !== "linux")("records this process's start identity; a live pid with another start identity is a dead owner", async () => {
-    const d = await runDir();
-    mkdirSync(join(d, REPLAY_OWNERS));
-    writeFileSync(join(d, REPLAY_OWNERS, `${process.pid}-1-aaaa`), JSON.stringify({ runId: X, pid: process.pid, start: "1", createdAt: "x" }));
+    const d = await ownersDir();
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, `${process.pid}-1-aaaa`), JSON.stringify({ runId: X, pid: process.pid, start: "1", createdAt: "x" }));
     const own = `20261104T120000Z-${process.pid}`;
     const claim = claimReplay(d, own, () => true);
     expect(claim).toBeDefined();
-    const names = readdirSync(join(d, REPLAY_OWNERS));
+    const names = readdirSync(d);
     expect(names).toEqual([expect.stringMatching(new RegExp(`^${process.pid}-${processStart(process.pid)}-[0-9a-f]{16}$`))]);
-    expect(JSON.parse(readFileSync(join(d, REPLAY_OWNERS, names[0] as string), "utf8"))).toMatchObject({ pid: process.pid, start: processStart(process.pid) });
+    expect(JSON.parse(readFileSync(join(d, names[0] as string), "utf8"))).toMatchObject({ pid: process.pid, start: processStart(process.pid) });
     // That entry is alive for any other contender.
     expect(claimReplay(d, A, () => true)).toBeUndefined();
+  });
+});
+
+describe("replayOwnersDir (R61)", () => {
+  it("keys the owners directory by the work tree, below the project ledger's replay.owners", () => {
+    const a = replayOwnersDir("/runs/p", "/work/tree");
+    expect(a).toMatch(new RegExp(`^/runs/p/${REPLAY_OWNERS}/[0-9a-f]{32}$`.replaceAll("/", "[\\\\/]")));
+    expect(replayOwnersDir("/runs/p", "/work/tree")).toBe(a);
+    expect(replayOwnersDir("/runs/p", "/work/other")).not.toBe(a);
   });
 });

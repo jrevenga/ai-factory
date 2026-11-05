@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { ledgerDirFor, RunLedger, type InterruptedRun } from "../../../../src/adapters/pi/extension/ledger.ts";
-import { claimReplay, REPLAY_OWNERS } from "../../../../src/adapters/pi/extension/replay-owners.ts";
+import { claimReplay, replayOwnersDir } from "../../../../src/adapters/pi/extension/replay-owners.ts";
 import { loadSnapshot, Reconciler, replayInterrupted, takeSnapshot } from "../../../../src/adapters/pi/extension/reconcile.ts";
 import { lastRouteEntryRunId, recoverRuns, replayInterruptedRuns, resumeLine, resumeSection } from "../../../../src/adapters/pi/extension/resume.ts";
 import { ROUTE_ENTRY } from "../../../../src/adapters/pi/extension/route-state.ts";
@@ -168,8 +168,8 @@ describe("replayInterruptedRuns", () => {
     const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: "20261104T110000Z-50", isAlive: dead }, first.ledger);
     expect(notes.join("\n")).toContain("failed");
     expect(loadSnapshot(join(runDir, "reconcile", "call_1")).status).not.toBe("done");
-    // R52: the claimant removed its owner entry when its replay ended, failed or not.
-    expect(readdirSync(join(runDir, REPLAY_OWNERS))).toEqual([]);
+    // R52/R61: the claimant removed its owner entry (keyed by the work tree) when its replay ended, failed or not.
+    expect(readdirSync(replayOwnersDir(ledgerDirFor(h, PROJECT), loadSnapshot(join(runDir, "reconcile", "call_1")).root))).toEqual([]);
     renameSync(`${root}.gone`, root);
     // The next startup retries.
     const second = sinkOf();
@@ -184,20 +184,22 @@ describe("replayInterruptedRuns", () => {
   it("R52: while another live session owns the replay no other session replays the run; once it is gone, one does and releases", async () => {
     const h = await home();
     const root = gitRepo(h);
-    const runDir = pendingRun(h, root);
+    pendingRun(h, root);
     const holder = "20261104T110000Z-50";
     const alive = (pid: number) => pid === 50;
-    expect(claimReplay(runDir, holder, alive)).toBeDefined();
+    // R61: the replay is owned per work tree.
+    const owners = replayOwnersDir(ledgerDirFor(h, PROJECT), realpathSync.native(root));
+    expect(claimReplay(owners, holder, alive)).toBeDefined();
     // A second contender while the holder lives: refused, its own entry removed, and nothing is replayed.
-    expect(claimReplay(runDir, SELF, alive)).toBeUndefined();
-    expect(readdirSync(join(runDir, REPLAY_OWNERS))).toHaveLength(1);
+    expect(claimReplay(owners, SELF, alive)).toBeUndefined();
+    expect(readdirSync(owners)).toHaveLength(1);
     const s = sinkOf();
     expect(replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: alive }, s.ledger)).toEqual([expect.stringContaining("replay in progress elsewhere")]);
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("runner\n");
     // The holder died: the next startup prunes its entry, replays, and removes its own entry when done.
     replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
-    expect(readdirSync(join(runDir, REPLAY_OWNERS))).toEqual([]);
+    expect(readdirSync(owners)).toEqual([]);
   });
 });
 
@@ -244,5 +246,119 @@ describe("R62: unfinished reconciles of a run that ended cleanly", () => {
     expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
     expect(s.events).toEqual([expect.objectContaining({ type: "reconciled", runId: SELF, toolCallId: "call-1", reverted: ["a.txt"] })]);
     expect(loadSnapshot(join(runDir, "reconcile", "call-1")).status).toBe("done");
+  });
+});
+
+describe("R61: replay per work tree across runs", () => {
+  const OLD = "20261104T090000Z-21";
+  const NEW = "20261104T100000Z-22";
+  const reconciledIds = (events: RunEvent[]) => events.flatMap((e) => (e.type === "reconciled" ? [e.toolCallId] : []));
+
+  /** Pins a manifest's snapshot time (two snapshots can fall in the same millisecond). */
+  function pinCreatedAt(backupDir: string, at: string): void {
+    const file = join(backupDir, "manifest.json");
+    writeFileSync(file, JSON.stringify({ ...(JSON.parse(readFileSync(file, "utf8")) as object), createdAt: at }));
+  }
+
+  /** The newer session snapshots A and its runner writes B; then the older session snapshots B and its runner writes C. */
+  function crossedRuns(h: string, root: string) {
+    interruptedRun(h, OLD, "session-old", []);
+    interruptedRun(h, NEW, "session-new", []);
+    const dir = ledgerDirFor(h, PROJECT);
+    const newDir = join(dir, NEW, "reconcile", "call_n");
+    const oldDir = join(dir, OLD, "reconcile", "call_o");
+    takeSnapshot(root, newDir, undefined, { toolCallId: "call-n", seq: 1 });
+    writeFileSync(join(root, "a.txt"), "B\n");
+    takeSnapshot(root, oldDir, undefined, { toolCallId: "call-o", seq: 1 });
+    writeFileSync(join(root, "a.txt"), "C\n");
+    pinCreatedAt(newDir, "2026-11-04T10:30:00.000Z");
+    pinCreatedAt(oldDir, "2026-11-04T10:30:01.000Z");
+    return { dir, newDir, oldDir };
+  }
+
+  it("an older session that took a later snapshot is replayed first, so the work tree ends in the original state", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    crossedRuns(h, root);
+    const s = sinkOf();
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    expect(reconciledIds(s.events)).toEqual(["call-o", "call-n"]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+  });
+
+  it.skipIf(isWin || process.getuid?.() === 0)("a failed manifest stops the work tree's tail across runs; the next startup retries it in order", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    const { oldDir, newDir } = crossedRuns(h, root);
+    // The later snapshot cannot be reconciled while its backup directory is read-only.
+    chmodSync(oldDir, 0o500);
+    const s = sinkOf();
+    let notes: string[];
+    try {
+      notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    } finally {
+      chmodSync(oldDir, 0o700);
+    }
+    expect(reconciledIds(s.events)).toEqual([]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("C\n");
+    expect(loadSnapshot(newDir).status).toBe("pending");
+    expect(notes.join("\n")).toContain(`Interrupted factory run ${NEW}: the answer-route reconcile in ${newDir} was not replayed`);
+    const s2 = sinkOf();
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: "20261104T130000Z-77", isAlive: dead }, s2.ledger);
+    expect(reconciledIds(s2.events)).toEqual(["call-o", "call-n"]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+  });
+
+  it("work without a readable manifest in any eligible run blocks the replay (its work tree is unknown)", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    const { dir } = crossedRuns(h, root);
+    const third = "20261104T080000Z-23";
+    interruptedRun(h, third, "session-third", []);
+    mkdirSync(join(dir, third, "reconcile", "torn", "after"), { recursive: true });
+    writeFileSync(join(dir, third, "reconcile", "torn", "after", "x"), "keep\n");
+    const s = sinkOf();
+    const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    expect(reconciledIds(s.events)).toEqual([]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("C\n");
+    expect(notes.join("\n")).toContain("no manifest");
+    expect(notes.join("\n")).toContain("not replayed");
+  });
+
+  it("a run whose process is alive with unfinished reconciles in the same work tree defers the work tree's replay", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    crossedRuns(h, root);
+    const live = "20261104T110000Z-55";
+    new RunLedger(ledgerDirFor(h, PROJECT), live).append({ v: 1, ts: TS, runId: live, type: "run_start", pid: 55, projectId: PROJECT, projectRoot: "/repo", factoryVersion: "0.1.0", piSession: "session-live" });
+    takeSnapshot(root, join(ledgerDirFor(h, PROJECT), live, "reconcile", "call_l"), undefined, { toolCallId: "call-l", seq: 1 });
+    const alive = (pid: number) => pid === 55;
+    const s = sinkOf();
+    const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: alive }, s.ledger);
+    expect(reconciledIds(s.events)).toEqual([]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("C\n");
+    expect(notes.join("\n")).toContain(`run ${live}`);
+    // Once that process is gone, its manifest joins the tail (latest snapshot first) and the original state wins.
+    const s2 = sinkOf();
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s2.ledger);
+    expect(reconciledIds(s2.events)).toEqual(["call-l", "call-o", "call-n"]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+  });
+
+  it("ownership is per work tree: while another live session owns the work tree's replay, no run of it is replayed", async () => {
+    const h = await home();
+    const root = gitRepo(h);
+    const { dir } = crossedRuns(h, root);
+    const holder = "20261104T110000Z-50";
+    const alive = (pid: number) => pid === 50;
+    const owners = replayOwnersDir(dir, realpathSync.native(root));
+    expect(claimReplay(owners, holder, alive)).toBeDefined();
+    const s = sinkOf();
+    const notes = replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: alive }, s.ledger);
+    expect(notes).toEqual([expect.stringContaining(`${OLD}: replay in progress elsewhere`), expect.stringContaining(`${NEW}: replay in progress elsewhere`)]);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("C\n");
+    replayInterruptedRuns({ factoryHome: h, projectId: PROJECT, runId: SELF, isAlive: dead }, s.ledger);
+    expect(readFileSync(join(root, "a.txt"), "utf8")).toBe("original\n");
+    expect(readdirSync(owners)).toEqual([]);
   });
 });

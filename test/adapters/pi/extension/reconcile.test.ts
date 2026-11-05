@@ -10,7 +10,9 @@ import {
   JOURNAL_FILE,
   reconcileNote,
   Reconciler,
+  mergeReplayOrder,
   replayInterrupted,
+  type ReplayItem,
   takeSnapshot,
   UNTRACKED_LIMITS,
   type Snapshot,
@@ -868,5 +870,32 @@ describe("Task 13: replayInterrupted (startup replay of an interrupted run's rec
     expect(s.events[0]).toMatchObject({ type: "reconciled", notRestored: [expect.stringContaining("index not checked")] });
     expect(existsSync(lock)).toBe(true);
     expect(existsSync(bd)).toBe(true);
+  });
+});
+
+describe("mergeReplayOrder (R61)", () => {
+  const item = (run: string, seq: number, createdAt: string, mtime = 0): ReplayItem => ({
+    runDir: `/runs/p/${run}`,
+    name: `${run}-${seq}`,
+    mtime,
+    snapshot: { v: 1, status: "pending", createdAt, root: "/w", backupDir: `/runs/p/${run}/reconcile/${seq}`, indexFile: "/w/.git/index", indexExisted: true, tracked: [], untracked: [], skipped: [], seq },
+  });
+  const names = (xs: ReplayItem[]) => xs.map((x) => x.name);
+
+  it("takes the latest snapshot across runs first, keeping each run's own order", () => {
+    const older = [item("r1", 2, "2026-11-04T10:00:03.000Z"), item("r1", 1, "2026-11-04T10:00:01.000Z")];
+    const newer = [item("r2", 2, "2026-11-04T10:00:02.000Z"), item("r2", 1, "2026-11-04T10:00:00.000Z")];
+    expect(names(mergeReplayOrder([older, newer]))).toEqual(["r1-2", "r2-2", "r1-1", "r2-1"]);
+  });
+
+  it("breaks equal snapshot times by the later run, then by the run's own order; an unreadable time falls back to mtime", () => {
+    const t = "2026-11-04T10:00:00.000Z";
+    expect(names(mergeReplayOrder([[item("r1", 2, t), item("r1", 1, t)], [item("r2", 1, t)]]))).toEqual(["r2-1", "r1-2", "r1-1"]);
+    expect(names(mergeReplayOrder([[item("r1", 1, "x", 5)], [item("r2", 1, "y", 3)]]))).toEqual(["r1-1", "r2-1"]);
+  });
+
+  it("keeps a run's order even when its clock disagrees (nested calls replay innermost first)", () => {
+    const run = [item("r1", 2, "2026-11-04T10:00:00.000Z"), item("r1", 1, "2026-11-04T10:00:05.000Z")];
+    expect(names(mergeReplayOrder([run]))).toEqual(["r1-2", "r1-1"]);
   });
 });
