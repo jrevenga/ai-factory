@@ -311,6 +311,13 @@ describe("configured git helpers (R58)", () => {
     expect(decide("git diff HEAD", w, small).decision).toBe("ask");
     writeFileSync(system, `${gitForWindowsDefault}[diff "pdf"]\n\ttextconv = astextplain\n`);
     expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    // Exact match only: git keeps the subsection's case, and the value is compared as written.
+    writeFileSync(system, '[diff "AsTextPlain"]\n\ttextconv = astextplain\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, '[diff "astextplain"]\n\ttextconv = "astextplain\u00a0"\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, '[diff "astextplain"]\n\ttextconv = "astextplain "\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
     writeFileSync(system, "");
     git(w.project, "config", "diff.astextplain.textconv", "astextplain");
     expect(decide("git diff HEAD", w, small).decision).toBe("ask");

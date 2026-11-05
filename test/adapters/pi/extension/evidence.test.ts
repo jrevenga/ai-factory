@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { currentRoute as currentRouteForTest, enforce, GatedChecks, InFlightCalls, MachinePostChecks, setRoute, type GateUi } from "../../../../src/adapters/pi/extension/enforce.ts";
 import {
   CheckOutput,
+  copyIndexKeepingMtime,
   fingerprint,
   loadEvidence,
   RECORD_DECISION_TOOL,
@@ -273,6 +274,24 @@ describe("fingerprint (ruling 11)", () => {
     const gitPath = git(x.wt, "rev-parse", "--git-path", "index").trim();
     utimesSync(isAbsolute(gitPath) ? gitPath : join(x.wt, gitPath), tick, tick);
     expect(fingerprint(x.wt)).not.toBe(fp);
+  });
+
+  it("the scratch index pairs the bytes and the time of one index version, even when git replaces the index meanwhile", async () => {
+    const t = await makeTmp("index-copy");
+    cleanups.push(t.cleanup);
+    const index = join(t.dir, "index");
+    const copy = join(t.dir, "copy");
+    const old = new Date("2026-01-01T00:00:00.000Z");
+    writeFileSync(index, "old entries");
+    utimesSync(index, old, old);
+    copyIndexKeepingMtime(index, copy, () => {
+      // Git writes `index.lock` and renames it over the index.
+      writeFileSync(join(t.dir, "index.lock"), "new entries, newer time");
+      renameSync(join(t.dir, "index.lock"), index);
+    });
+    expect(readFileSync(copy, "utf8")).toBe("old entries");
+    expect(statSync(copy).mtimeMs).toBeLessThanOrEqual(old.getTime());
+    expect(statSync(copy).mtimeMs).toBeGreaterThan(old.getTime() - 1);
   });
 
   it("never writes the user's index and leaves no temporary index behind", async () => {

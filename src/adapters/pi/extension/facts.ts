@@ -678,26 +678,24 @@ const FALSE_OR_TRUE = /^(?:true|false|yes|no|on|off|[-+]?\d*)$/i;
  */
 export function gitHelpersFact(cwd: string, env: NodeJS.ProcessEnv = process.env): { diff: boolean; fsmonitor: boolean } {
   const envDiff = (env.GIT_EXTERNAL_DIFF ?? "") !== "";
-  const r = gitRunBytes(cwd, ["config", "--show-scope", "--get-regexp", "^(diff\\.external|diff\\..*\\.(textconv|command)|core\\.fsmonitor)$"], GIT_TIMEOUT_MS, 1024 * 1024);
+  const r = gitRunBytes(cwd, ["config", "--show-scope", "-z", "--get-regexp", "^(diff\\.external|diff\\..*\\.(textconv|command)|core\\.fsmonitor)$"], GIT_TIMEOUT_MS, 1024 * 1024);
   if (r.status === 1 && r.stdout.length === 0) return { diff: envDiff, fsmonitor: false };
   if (r.status !== 0) return { diff: true, fsmonitor: true };
   let diff = envDiff;
   let fsmonitor = false;
-  for (const line of r.stdout.toString("utf8").split("\n")) {
-    if (line === "") continue;
-    const tab = line.indexOf("\t");
-    if (tab < 0) {
-      // Not the `<scope>\t<key> <value>` shape: fail closed.
-      diff = true;
-      continue;
-    }
-    const scope = line.slice(0, tab);
-    const entry = line.slice(tab + 1);
-    const space = entry.search(/\s/);
-    const key = (space < 0 ? entry : entry.slice(0, space)).toLowerCase();
-    const value = space < 0 ? "" : entry.slice(space + 1).trim();
-    if (key === "core.fsmonitor") {
-      if (space >= 0 && !FALSE_OR_TRUE.test(value)) fsmonitor = true;
+  // `-z`: each entry is `<scope>\0<key>\n<value>\0`, or `<scope>\0<key>\0` for a key without a value. Git prints the
+  // section and variable names in lower case and the subsection as written. Any other shape fails closed.
+  const fields = r.stdout.toString("utf8").split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  if (fields.length % 2 !== 0) return { diff: true, fsmonitor: true };
+  for (let i = 0; i < fields.length; i += 2) {
+    const scope = fields[i]!;
+    const entry = fields[i + 1]!;
+    const nl = entry.indexOf("\n");
+    const key = nl < 0 ? entry : entry.slice(0, nl);
+    const value = nl < 0 ? undefined : entry.slice(nl + 1);
+    if (key.toLowerCase() === "core.fsmonitor") {
+      if (value !== undefined && !FALSE_OR_TRUE.test(value.trim())) fsmonitor = true;
     } else if (!(scope === "system" && key === GIT_FOR_WINDOWS_TEXTCONV.key && value === GIT_FOR_WINDOWS_TEXTCONV.value)) {
       diff = true;
     }
@@ -709,7 +707,8 @@ export function gitHelpersFact(cwd: string, env: NodeJS.ProcessEnv = process.env
  * The one diff helper every Git for Windows installation configures in its system config (`etc/gitconfig`, mapped to
  * `*.doc`, `*.pdf` and similar files by its system gitattributes): a script shipped with Git that prints a document as
  * text. Counting it would make every read-only git command ask on Windows. Only this exact key and value, and only in
- * the system scope, is exempt; the same entry in the repository, global or command scope still counts.
+ * the system scope, is exempt (subsection case and value compared exactly); the same entry in the repository, global or
+ * command scope still counts.
  */
 const GIT_FOR_WINDOWS_TEXTCONV = { key: "diff.astextplain.textconv", value: "astextplain" } as const;
 

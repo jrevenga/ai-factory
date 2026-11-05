@@ -11,7 +11,7 @@
 // The `CheckRecord` holds the fingerprints before and after (`mutated` when they differ).
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { constants as osConstants, homedir, tmpdir } from "node:os";
 import path, { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -95,7 +95,29 @@ export function secretTestFor(top: string, ctx: { home: string; piAgentDir: stri
 
 /**
  * Ruling 11: the tree id of the work tree containing `dir` as it is on disk — committed, tracked-modified and
- * untracked non-ignored files — without the task files (`.factory/knowledge/tasks/**`). Computed in a copy of the
+ * untracked non-ignored files — without the task files (`.factory/knowledge/tasks/**
+ * Copies the index for a scratch `git add`, keeping its modification time no later than the original's. Git trusts an
+ * entry's cached stat data only when the entry is older than the index file; an entry written in the same timestamp
+ * tick as the index ("racily clean") is compared by content instead. A copy with a fresh mtime would turn those
+ * entries into trusted ones, so a same-size edit made in that tick would be missed. The bytes and the time come from
+ * one open descriptor: git replaces the index by renaming a new file over it, so a replacement after the open cannot
+ * pair old entries with a newer time. The time is rounded down by one microsecond (`utimes` takes a double): an
+ * earlier index only makes more entries compared by content. `afterOpen` is a test hook.
+ */
+export function copyIndexKeepingMtime(index: string, copy: string, afterOpen?: () => void): void {
+  const fd = openSync(index, "r");
+  try {
+    afterOpen?.();
+    const st = fstatSync(fd, { bigint: true });
+    writeFileSync(copy, readFileSync(fd));
+    const seconds = (ns: bigint) => Number(ns / 1000n - 1n) / 1e6;
+    utimesSync(copy, seconds(st.atimeNs), seconds(st.mtimeNs));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**`). Computed in a copy of the
  * work tree's index under `os.tmpdir()` (removed in `finally`), with the safe git wrapper (no hooks, no fsmonitor,
  * inherited `GIT_*` location and pathspec variables stripped). The user's index is never written.
  *
@@ -104,20 +126,6 @@ export function secretTestFor(top: string, ctx: { home: string; piAgentDir: stri
  * their hash without writing the blob; the tree is then written with `--missing-ok`. A change to a non-ignored
  * secret file still changes the fingerprint, but its content never reaches the object database.
  */
-/**
- * Copies the index for a scratch `git add`, keeping its modification time no later than the original's. Git trusts an
- * entry's cached stat data only when the entry is older than the index file; an entry written in the same timestamp
- * tick as the index ("racily clean") is compared by content instead. A copy with a fresh mtime would turn those
- * entries into trusted ones, so a same-size edit made in that tick would be missed. The time is rounded down by one
- * microsecond (`utimes` takes a double): an earlier index only makes more entries compared by content.
- */
-function copyIndexKeepingMtime(index: string, copy: string): void {
-  copyFileSync(index, copy);
-  const st = statSync(index, { bigint: true });
-  const seconds = (ns: bigint) => Number(ns / 1000n - 1n) / 1e6;
-  utimesSync(copy, seconds(st.atimeNs), seconds(st.mtimeNs));
-}
-
 export function fingerprint(dir: string, isSecret?: SecretTest, opts: FingerprintOptions = {}): string {
   return withSafeGit((git) => {
     const topRun = git(dir, ["rev-parse", "--show-toplevel"]);
