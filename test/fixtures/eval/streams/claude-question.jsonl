@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"sess-claude-q","model":"claude-sonnet-5-5"}
+{"type":"result","subtype":"success","is_error":false,"result":"I need a decision.\n\nWhich option do you prefer?","session_id":"sess-claude-q","num_turns":1,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":5,"output_tokens":7}}

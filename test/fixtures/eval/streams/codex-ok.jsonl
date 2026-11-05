@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"thread-1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"i1","type":"reasoning","text":"thinking"}}
+{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Intermediate."}}
+{"type":"item.completed","item":{"id":"i3","type":"command_execution","command":"ls"}}
+{"type":"item.completed","item":{"id":"i4","type":"agent_message","text":"Finished the task."}}
+{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":60}}
+{"type":"turn.started"}
+{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":100,"output_tokens":40}}

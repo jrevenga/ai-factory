@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"sess-claude-rl","model":"claude-sonnet-5-5"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.9,"resetsAt":1767225600},"uuid":"u1","session_id":"sess-claude-rl"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1767225600},"uuid":"u2","session_id":"sess-claude-rl"}
+{"type":"result","subtype":"success","is_error":true,"result":"You've hit your limit","session_id":"sess-claude-rl","num_turns":1,"usage":{"input_tokens":1,"output_tokens":2}}

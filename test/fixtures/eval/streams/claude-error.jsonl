@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"sess-claude-e","model":"claude-sonnet-5-5"}
+{"type":"result","subtype":"error_max_turns","is_error":false,"session_id":"sess-claude-e","num_turns":30,"usage":{"input_tokens":1000,"cache_creation_input_tokens":10,"cache_read_input_tokens":20,"output_tokens":400}}

@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"pi-sess-3","timestamp":"2026-11-05T10:00:00.000Z","cwd":"/tmp/work"}
+{"type":"message_end","message":{"role":"assistant","provider":"claude-bridge","model":"claude-sonnet-5-5","content":[],"usage":{"input":3,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":3,"cost":{"total":0}},"stopReason":"error","errorMessage":"Claude usage limit reached"}}

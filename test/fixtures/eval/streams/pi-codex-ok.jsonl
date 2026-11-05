@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"pi-sess-2","timestamp":"2026-11-05T10:00:00.000Z","cwd":"/tmp/work"}
+{"type":"message_end","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5","content":[{"type":"text","text":"Codex via Pi done."}],"usage":{"input":200,"output":30,"cacheRead":400,"cacheWrite":0,"totalTokens":630,"cost":{"total":0.02}},"stopReason":"stop"}}
+{"type":"message_end","message":{"role":"assistant","provider":"some-other","model":"x","content":[{"type":"text","text":"ignored provider"}],"usage":{"input":999,"output":999,"cacheRead":0,"cacheWrite":0,"totalTokens":1998,"cost":{"total":0}},"stopReason":"stop"}}
