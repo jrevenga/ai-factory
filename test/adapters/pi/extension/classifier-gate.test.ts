@@ -294,6 +294,27 @@ describe("configured git helpers (R58)", () => {
     expect(decide("git diff HEAD", w, small).decision).toBe("ask");
     expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, small).decision).toBe("allow");
   });
+
+  it("the textconv Git for Windows sets in its system config is not a helper; the same entry in another scope or with another value is", async () => {
+    const w = await world();
+    const { small, answer } = contexts(w);
+    const system = join(w.tmp.dir, "system-gitconfig");
+    const gitForWindowsDefault = '[diff "astextplain"]\n\ttextconv = astextplain\n';
+    writeFileSync(system, gitForWindowsDefault);
+    vi.stubEnv("GIT_CONFIG_NOSYSTEM", "0");
+    vi.stubEnv("GIT_CONFIG_SYSTEM", system);
+    for (const ctx of [small, answer]) {
+      expect(decide("git diff HEAD", w, ctx).decision).toBe("allow");
+      expect(decide("git log --oneline -5", w, ctx).decision).toBe("allow");
+    }
+    writeFileSync(system, '[diff "astextplain"]\n\ttextconv = touch /nonexistent-marker\n');
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, `${gitForWindowsDefault}[diff "pdf"]\n\ttextconv = astextplain\n`);
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+    writeFileSync(system, "");
+    git(w.project, "config", "diff.astextplain.textconv", "astextplain");
+    expect(decide("git diff HEAD", w, small).decision).toBe("ask");
+  });
 });
 
 describe("where a command runs (R59) through adapter facts", () => {

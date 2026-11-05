@@ -678,24 +678,40 @@ const FALSE_OR_TRUE = /^(?:true|false|yes|no|on|off|[-+]?\d*)$/i;
  */
 export function gitHelpersFact(cwd: string, env: NodeJS.ProcessEnv = process.env): { diff: boolean; fsmonitor: boolean } {
   const envDiff = (env.GIT_EXTERNAL_DIFF ?? "") !== "";
-  const r = gitRunBytes(cwd, ["config", "--get-regexp", "^(diff\\.external|diff\\..*\\.(textconv|command)|core\\.fsmonitor)$"], GIT_TIMEOUT_MS, 1024 * 1024);
+  const r = gitRunBytes(cwd, ["config", "--show-scope", "--get-regexp", "^(diff\\.external|diff\\..*\\.(textconv|command)|core\\.fsmonitor)$"], GIT_TIMEOUT_MS, 1024 * 1024);
   if (r.status === 1 && r.stdout.length === 0) return { diff: envDiff, fsmonitor: false };
   if (r.status !== 0) return { diff: true, fsmonitor: true };
   let diff = envDiff;
   let fsmonitor = false;
   for (const line of r.stdout.toString("utf8").split("\n")) {
     if (line === "") continue;
-    const space = line.search(/\s/);
-    const key = (space < 0 ? line : line.slice(0, space)).toLowerCase();
-    const value = space < 0 ? "" : line.slice(space + 1).trim();
+    const tab = line.indexOf("\t");
+    if (tab < 0) {
+      // Not the `<scope>\t<key> <value>` shape: fail closed.
+      diff = true;
+      continue;
+    }
+    const scope = line.slice(0, tab);
+    const entry = line.slice(tab + 1);
+    const space = entry.search(/\s/);
+    const key = (space < 0 ? entry : entry.slice(0, space)).toLowerCase();
+    const value = space < 0 ? "" : entry.slice(space + 1).trim();
     if (key === "core.fsmonitor") {
       if (space >= 0 && !FALSE_OR_TRUE.test(value)) fsmonitor = true;
-    } else {
+    } else if (!(scope === "system" && key === GIT_FOR_WINDOWS_TEXTCONV.key && value === GIT_FOR_WINDOWS_TEXTCONV.value)) {
       diff = true;
     }
   }
   return { diff, fsmonitor };
 }
+
+/**
+ * The one diff helper every Git for Windows installation configures in its system config (`etc/gitconfig`, mapped to
+ * `*.doc`, `*.pdf` and similar files by its system gitattributes): a script shipped with Git that prints a document as
+ * text. Counting it would make every read-only git command ask on Windows. Only this exact key and value, and only in
+ * the system scope, is exempt; the same entry in the repository, global or command scope still counts.
+ */
+const GIT_FOR_WINDOWS_TEXTCONV = { key: "diff.astextplain.textconv", value: "astextplain" } as const;
 
 /** Bound for the `git ls-files -z` listing of a large repository. */
 const LS_FILES_MAX_BUFFER = 256 * 1024 * 1024;
