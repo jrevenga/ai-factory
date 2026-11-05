@@ -27,9 +27,11 @@ export const ROUTE_ENTRY = "factory-route";
 /**
  * The data of a `factory-route` entry: the route state and the run that wrote it (Task 13, review M5: the next start
  * checks whether that run was interrupted). `restoreRoute` re-validates the state and ignores `runId`.
+ * Fix round 2 (R50.1): `reclassificationOwed` is stored (only when true) while a restore after an interruption still
+ * owes a `set_route`, so the obligation survives a session that exits without declaring a route.
  */
-export function routeEntryData(state: RouteState, runId: string): RouteState & { runId: string } {
-  return { ...state, runId };
+export function routeEntryData(state: RouteState, runId: string, owed = false): RouteState & { runId: string; reclassificationOwed?: true } {
+  return { ...state, runId, ...(owed ? { reclassificationOwed: true as const } : {}) };
 }
 
 /** Key of the routing rule in `systemPromptOptions.sections` (rendered as a tag of this name). */
@@ -110,6 +112,17 @@ export function lastRouteEntryRunId(entries: readonly unknown[]): string | undef
     }
   }
   return undefined;
+}
+
+/** Fix round 2 (R50.1): the branch's last `factory-route` entry records an owed reclassification. */
+export function lastRouteEntryOwed(entries: readonly unknown[]): boolean {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as { type?: unknown; customType?: unknown; data?: unknown } | null;
+    if (e?.type === "custom" && e.customType === ROUTE_ENTRY) {
+      return (e.data as { reclassificationOwed?: unknown } | null | undefined)?.reclassificationOwed === true;
+    }
+  }
+  return false;
 }
 
 const fold = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
@@ -303,6 +316,8 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
   /**
    * Fix round 1 (Task 13, ruling 20): a restore after an interruption owes a `set_route` declaration. Until one
    * succeeds, every restore (branch navigation included) starts flagged, whichever entry it restores.
+   * Fix round 2 (R50.1): the obligation is persisted in every `factory-route` entry written while it holds, and read
+   * back from the restored entry at startup and on navigation; only a successful `set_route` clears it.
    */
   let reclassificationOwed = false;
   pi.registerTool({
@@ -327,7 +342,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       // Audited and persisted before it takes effect: a route change that cannot be recorded is not made.
       try {
         routeEvent(s, next, "set_route");
-        pi.appendEntry(ROUTE_ENTRY, routeEntryData(next, s.runId));
+        pi.appendEntry(ROUTE_ENTRY, routeEntryData(next, s.runId, false));
       } catch (e) {
         return toolResult(`set_route failed: the route change could not be recorded (${(e as Error).message})`, currentRoute(), true);
       }
@@ -355,7 +370,7 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       process.stderr.write(`factory: could not audit the consumed user message: ${(e as Error).message}\n`);
     }
     try {
-      pi.appendEntry(ROUTE_ENTRY, routeEntryData(next, s.runId));
+      pi.appendEntry(ROUTE_ENTRY, routeEntryData(next, s.runId, reclassificationOwed));
     } catch (e) {
       // Review M3: the session entry would restore unflagged; the ledger keeps the flag and this error.
       const message = `could not persist the flagged route as a session entry: ${(e as Error).message}`;
@@ -384,12 +399,18 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
   });
 
   const restore = (s: RouteSession, ctx: NoticeCtx, opts: { interrupted: boolean }): void => {
-    // At session start this also clears what a previous session owed; on branch navigation `interrupted` already
-    // includes it.
-    reclassificationOwed = opts.interrupted;
+    // On branch navigation `interrupted` already includes what is owed in memory. Fix round 2 (R50.1): an obligation
+    // persisted in the restored entry (a session that exited without set_route) is owed again.
+    let interrupted = opts.interrupted;
+    try {
+      if (lastRouteEntryOwed(ctx.sessionManager.getBranch())) interrupted = true;
+    } catch {
+      // restoreRoute below reports an unreadable branch.
+    }
+    reclassificationOwed = interrupted;
     let r: RestoredRoute;
     try {
-      r = restoreRoute(ctx.sessionManager.getBranch(), s.facts, opts, s.io ?? ROUTE_IO);
+      r = restoreRoute(ctx.sessionManager.getBranch(), s.facts, { interrupted }, s.io ?? ROUTE_IO);
     } catch (e) {
       r = { state: INITIAL_ROUTE, restored: false, notice: `factory: the stored route could not be restored (${(e as Error).message}); the route is answer (read-only)` };
     }
@@ -398,15 +419,25 @@ export function registerRouteState(pi: RoutePi, deps: RouteStateDeps): RouteStat
       warn(ctx, r.notice);
       try {
         s.ledger.append({ v: 1, ts: new Date().toISOString(), runId: s.runId, type: "error", where: "route-restore", message: r.notice });
-        pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId));
+        pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId, reclassificationOwed));
       } catch (e) {
         process.stderr.write(`factory: could not record the route restore: ${(e as Error).message}\n`);
       }
     }
-    if (!r.restored) return;
+    if (!r.restored) {
+      // Nothing restored and nothing recorded above: the obligation is still persisted on this branch.
+      if (reclassificationOwed && r.notice === undefined) {
+        try {
+          pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId, true));
+        } catch (e) {
+          process.stderr.write(`factory: could not record the owed reclassification: ${(e as Error).message}\n`);
+        }
+      }
+      return;
+    }
     try {
       routeEvent(s, r.state, "restored from session");
-      if (opts.interrupted && r.notice === undefined) pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId));
+      if (interrupted && r.notice === undefined) pi.appendEntry(ROUTE_ENTRY, routeEntryData(r.state, s.runId, reclassificationOwed));
     } catch (e) {
       process.stderr.write(`factory: could not record the restored route: ${(e as Error).message}\n`);
     }

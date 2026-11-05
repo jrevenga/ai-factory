@@ -286,8 +286,8 @@ interface ToolLike {
   execute(id: string, params: unknown, signal: undefined, onUpdate: undefined, ctx: unknown): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean; details: unknown }>;
 }
 
-async function wired(opts: { session?: boolean; effectiveTools?: () => Array<{ name: string; parameters: unknown }> } = {}) {
-  const w = await world();
+async function wired(opts: { session?: boolean; effectiveTools?: () => Array<{ name: string; parameters: unknown }>; world?: Awaited<ReturnType<typeof world>> } = {}) {
+  const w = opts.world ?? (await world());
   const handlers = new Map<string, Handler[]>();
   const tools: ToolLike[] = [];
   const entries: Array<{ customType: string; data: unknown }> = [];
@@ -512,6 +512,49 @@ describe("registerRouteState (set_route tool, reclassification, prompt)", () => 
     // An older entry without a runId (written before Task 13) on another branch.
     await x.fire("session_tree", { newLeafId: "a", oldLeafId: "b" }, branch([entry]));
     expect(currentRoute()).toMatchObject({ route: "small", needsReclassification: true });
+  });
+
+  it("fix round 2 (I1, R50.1): a recovery session that exits without set_route leaves the obligation persisted; the next startup and navigation keep it", async () => {
+    const branch = (entries: unknown[]) => ({ hasUI: false, sessionManager: { getBranch: () => entries } });
+    const clean = "20261104T080000Z-6";
+    // Recovery session: its startup restore is flagged by the interruption; it exits cleanly without set_route.
+    const first = await wired();
+    const cleanEntry = custom(ROUTE_ENTRY, { ...small(first.w.project), runId: clean });
+    const killedEntry = custom(ROUTE_ENTRY, { ...small(first.w.project), runId: "20261104T090000Z-7" });
+    first.routes.restore(first.session, branch([cleanEntry, killedEntry]) as never, { interrupted: true });
+    expect(currentRoute().needsReclassification).toBe(true);
+    const persisted = first.entries.filter((e) => e.customType === ROUTE_ENTRY).at(-1);
+    expect(persisted?.data).toMatchObject({ needsReclassification: true, reclassificationOwed: true });
+    // Next startup: that run ended cleanly, so the startup itself is not an interrupted restore.
+    const second = await wired({ world: first.w });
+    const sessionEntries = [cleanEntry, killedEntry, custom(ROUTE_ENTRY, persisted!.data)];
+    second.routes.restore(second.session, branch(sessionEntries) as never, { interrupted: false });
+    expect(currentRoute().needsReclassification).toBe(true);
+    // Navigating to an entry of a clean run keeps the flag: no set_route was ever declared.
+    await second.fire("session_tree", { newLeafId: "a", oldLeafId: "b" }, branch([cleanEntry]));
+    expect(currentRoute()).toMatchObject({ route: "small", needsReclassification: true });
+    // The persisted entry from the navigation carries the obligation too.
+    expect(second.entries.at(-1)?.data).toMatchObject({ reclassificationOwed: true });
+    // Only a successful set_route clears it (and its entry no longer carries it).
+    const refused = await second.setRouteCall({ route: "feature", reason: "x" });
+    expect(refused.isError).toBe(true);
+    await second.fire("session_tree", { newLeafId: "a", oldLeafId: "b" }, branch([cleanEntry]));
+    expect(currentRoute().needsReclassification).toBe(true);
+    await second.setRouteCall({ route: "small", reason: "fix a typo" });
+    expect(second.entries.at(-1)?.data).not.toHaveProperty("reclassificationOwed");
+    await second.fire("session_tree", { newLeafId: "a", oldLeafId: "b" }, branch([cleanEntry]));
+    expect(currentRoute()).toMatchObject({ route: "small", needsReclassification: false });
+  });
+
+  it("fix round 2 (I1, R50.1): navigating to an entry that carries the obligation restores flagged and owes set_route", async () => {
+    const x = await wired();
+    const branch = (entries: unknown[]) => ({ hasUI: false, sessionManager: { getBranch: () => entries } });
+    const clean = "20261104T080000Z-6";
+    const owedEntry = custom(ROUTE_ENTRY, { ...small(x.w.project), runId: clean, reclassificationOwed: true });
+    await x.fire("session_tree", { newLeafId: "a", oldLeafId: "b" }, branch([owedEntry]));
+    expect(currentRoute().needsReclassification).toBe(true);
+    await x.fire("session_tree", { newLeafId: "c", oldLeafId: "a" }, branch([custom(ROUTE_ENTRY, { ...small(x.w.project), runId: clean })]));
+    expect(currentRoute().needsReclassification).toBe(true);
   });
 
   it("announce names the route and the reason", () => {
