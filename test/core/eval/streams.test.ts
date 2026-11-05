@@ -118,3 +118,48 @@ describe("endsWithQuestion", () => {
     expect(endsWithQuestion(null)).toBe(false);
   });
 });
+
+describe("fix round 1 regressions", () => {
+  const claudeResult = (usage: unknown) => JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "x", usage });
+  const codexTurn = (usage: unknown) => JSON.stringify({ type: "turn.completed", usage });
+  const piMsg = (usage: unknown) =>
+    JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "claude-bridge", usage, content: [] } });
+
+  it("I1: empty usage objects create no provider entry", () => {
+    expect(parseClaudeStream(claudeResult({})).usage).toEqual({});
+    expect(parseCodexStream(codexTurn({})).usage).toEqual({});
+    expect(parsePiStream(piMsg({})).usage).toEqual({});
+    expect(parseClaudeStream(claudeResult({})).quota).toEqual({});
+  });
+  it("I1: invalid input/output counters create no entry", () => {
+    expect(parseClaudeStream(claudeResult({ input_tokens: "5", output_tokens: 1 })).usage).toEqual({});
+    expect(parseClaudeStream(claudeResult({ input_tokens: -1, output_tokens: 1 })).usage).toEqual({});
+    expect(parseCodexStream(codexTurn({ input_tokens: 1, output_tokens: "2" })).usage).toEqual({});
+    expect(parseCodexStream(codexTurn({ input_tokens: -3, output_tokens: 2 })).usage).toEqual({});
+    expect(parsePiStream(piMsg({ input: "1", output: 1 })).usage).toEqual({});
+    expect(parsePiStream(piMsg({ input: 1, output: -1 })).usage).toEqual({});
+  });
+  it("I1: legitimate zero input/output with absent cache fields yields zeros", () => {
+    const zeros = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    expect(parseClaudeStream(claudeResult({ input_tokens: 0, output_tokens: 0 })).usage).toEqual({ claude: zeros });
+    expect(parseCodexStream(codexTurn({ input_tokens: 0, output_tokens: 0 })).usage).toEqual({ codex: zeros });
+    expect(parsePiStream(piMsg({ input: 0, output: 0 })).usage).toEqual({ claude: zeros });
+  });
+  it("I2: Claude execution error with rate limit text sets limitHit and combined error", () => {
+    const line = JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, result: "Rate limit exceeded" });
+    const p = parseClaudeStream(line);
+    expect(p.error).toBe("error_during_execution: Rate limit exceeded");
+    expect(p.limitHit).toBe("claude");
+  });
+  it("I2: success subtype with is_error uses the result text", () => {
+    const line = JSON.stringify({ type: "result", subtype: "success", is_error: true, result: "Usage limit reached" });
+    const p = parseClaudeStream(line);
+    expect(p.error).toBe("Usage limit reached");
+    expect(p.limitHit).toBe("claude");
+  });
+  it("M1: out-of-range resetsAt is omitted", () => {
+    const rl = JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", utilization: 0.1, resetsAt: 1e20 } });
+    const p = parseClaudeStream(rl);
+    expect(p.quota.claude).toEqual({ state: "known", utilization: 0.1 });
+  });
+});

@@ -22,6 +22,9 @@ function isObj(v: unknown): v is Json {
 function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0;
 }
+function validCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+}
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
@@ -72,7 +75,7 @@ export function parseClaudeStream(text: string): ParsedStream {
     } else if (e.type === "result") {
       out.sessionId = str(e.session_id) ?? out.sessionId;
       out.finalMessage = typeof e.result === "string" ? e.result : out.finalMessage;
-      if (isObj(e.usage)) {
+      if (isObj(e.usage) && validCount(e.usage.input_tokens) && validCount(e.usage.output_tokens)) {
         usage = {
           input: num(e.usage.input_tokens),
           output: num(e.usage.output_tokens),
@@ -81,8 +84,9 @@ export function parseClaudeStream(text: string): ParsedStream {
         };
       }
       if (e.is_error === true || (e.subtype !== undefined && e.subtype !== "success")) {
-        out.error = str(e.subtype !== "success" ? e.subtype : null) ?? str(e.result) ?? "error";
-        if (e.is_error === true && e.subtype === "success") out.error = str(e.result) ?? "error";
+        const sub = e.subtype !== "success" ? str(e.subtype) : null;
+        const text = str(e.result);
+        out.error = sub !== null && text !== null && e.is_error === true ? `${sub}: ${text}` : (sub ?? text ?? "error");
       }
     }
   }
@@ -93,7 +97,8 @@ export function parseClaudeStream(text: string): ParsedStream {
       const q: QuotaStatus = { state: "known", utilization: rate.utilization };
       if (typeof rate.rateLimitType === "string") q.window = rate.rateLimitType;
       if (typeof rate.resetsAt === "number" && Number.isFinite(rate.resetsAt)) {
-        q.resetsAt = new Date(rate.resetsAt * 1000).toISOString();
+        const d = new Date(rate.resetsAt * 1000);
+        if (!Number.isNaN(d.getTime())) q.resetsAt = d.toISOString();
       }
       out.quota.claude = q;
     } else out.quota.claude = { state: "unknown" };
@@ -114,7 +119,7 @@ export function parseCodexStream(text: string): ParsedStream {
       out.sessionId = str(e.thread_id) ?? out.sessionId;
     } else if (e.type === "item.completed" && isObj(e.item) && e.item.type === "agent_message") {
       if (typeof e.item.text === "string") out.finalMessage = e.item.text;
-    } else if (e.type === "turn.completed" && isObj(e.usage)) {
+    } else if (e.type === "turn.completed" && isObj(e.usage) && validCount(e.usage.input_tokens) && validCount(e.usage.output_tokens)) {
       const cached = num(e.usage.cached_input_tokens);
       usage = addUsage(usage, {
         input: Math.max(0, num(e.usage.input_tokens) - cached),
@@ -150,7 +155,7 @@ export function parsePiStream(text: string): ParsedStream {
     if (e.type !== "message_end" || !isObj(e.message) || e.message.role !== "assistant") continue;
     const m = e.message;
     const provider = typeof m.provider === "string" ? PI_PROVIDERS[m.provider] : undefined;
-    if (provider && isObj(m.usage)) {
+    if (provider && isObj(m.usage) && validCount(m.usage.input) && validCount(m.usage.output)) {
       out.usage[provider] = addUsage(out.usage[provider], {
         input: num(m.usage.input),
         output: num(m.usage.output),
