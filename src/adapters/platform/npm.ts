@@ -64,12 +64,13 @@ export function resolveNpm(env: NodeJS.ProcessEnv = process.env): NpmCommand {
 }
 
 /** Runs npm non-interactively (no git credential prompts) with a timeout. */
-export function npm(args: string[], opts: { env?: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number } = {}): Promise<RunResult> {
+export function npm(args: string[], opts: { env?: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RunResult> {
   const base = opts.env ?? process.env;
   const { cmd, args: prefix } = resolveNpm(base);
   return runBounded(cmd, [...prefix, ...args], {
     cwd: opts.cwd,
     env: { ...base, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" },
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    signal: opts.signal,
   });
 }

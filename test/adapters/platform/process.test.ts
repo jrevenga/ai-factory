@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { UnsafeCmdArgument } from "../../../src/adapters/platform/cmd-quote.ts";
-import { ProcessTeardownFailed, runBounded, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
+import { liveRecordedProcessGroups, ProcessTeardownFailed, recordedProcessGroups, recordProcessGroupsIn, runBounded, runSupervised, stopRecordedProcessGroups, WRITER_GATE, WRITER_TOKEN_ENV, type ProcessDeps } from "../../../src/adapters/platform/process.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
 
 const FIXTURES = fileURLToPath(new URL("../../fixtures/proc/", import.meta.url));
@@ -158,7 +158,7 @@ describe("runBounded", () => {
     expect(process.listenerCount("SIGINT")).toBe(before);
   });
 
-  it.runIf(!isWindows)("POSIX: a parent SIGTERM tears down active children and then re-raises the signal", async () => {
+  it.runIf(!isWindows).each(["SIGTERM", "SIGHUP"] as const)("POSIX: a parent %s tears down active children and then re-raises the signal", async (sig) => {
     const pidFile = join(tmp.dir, "grandchild.pid");
     const runner = spawn(process.execPath, ["--import", "jiti/register", fixture("signal-runner.ts"), pidFile], {
       cwd: REPO,
@@ -174,9 +174,9 @@ describe("runBounded", () => {
       await waitForFile(pidFile);
       const { leader, grandchild } = await readTreePids(pidFile);
       expect(killProbe(grandchild)).toBe("alive");
-      runner.kill("SIGTERM");
+      runner.kill(sig);
       const result = await exited;
-      expect(result, output).toEqual({ code: null, signal: "SIGTERM" });
+      expect(result, output).toEqual({ code: null, signal: sig });
       expect(killProbe(grandchild)).toBe("ESRCH");
       expect(killProbe(leader)).toBe("ESRCH");
     } finally {
@@ -242,5 +242,166 @@ describe("runBounded Windows teardown", () => {
   it("rejects with ProcessTeardownFailed when taskkill does not finish in time", async () => {
     const failure = await expectTeardownFailure({ spawnTaskkill: fakeTaskkill("setInterval(() => {}, 1000)"), taskkillTimeoutMs: 300 });
     expect(failure.reason).toMatch(/did not finish within 300 ms/);
+  });
+});
+
+describe("runSupervised (R17)", () => {
+  /** Delivers `sig` to this process's listeners only (no real signal), with other listeners set aside. */
+  function emitSignal(sig: NodeJS.Signals): void {
+    const others = process.listeners(sig).slice(0, -1);
+    for (const l of others) process.off(sig, l);
+    try {
+      process.emit(sig, sig);
+    } finally {
+      for (const l of others) process.on(sig, l);
+    }
+  }
+
+  it("resolves to the child's exit code and leaves no signal listener behind", async () => {
+    const before = process.listenerCount("SIGTERM");
+    expect(await runSupervised(process.execPath, ["-e", "process.exit(5)"])).toBe(5);
+    expect(process.listenerCount("SIGTERM")).toBe(before);
+  });
+
+  it("on a signal, POSIX: stops the child and resolves 128 + signal only after it exited", async () => {
+    if (isWindows) return;
+    const marker = join(tmp.dir, "child-done");
+    const script = `process.on("SIGTERM", () => setTimeout(() => { require("fs").writeFileSync(${JSON.stringify(marker)}, ""); process.exit(0); }, 300)); setInterval(() => {}, 1000); console.log("ready");`;
+    const running = runSupervised(process.execPath, ["-e", script], {});
+    await new Promise((r) => setTimeout(r, 500));
+    emitSignal("SIGHUP");
+    expect(await running).toBe(129);
+    await expect(stat(marker)).resolves.toBeDefined();
+  });
+
+  it("on a signal, Windows branch: awaits taskkill of the child's tree", async () => {
+    let killed: number | undefined;
+    const deps: Partial<ProcessDeps> = {
+      platform: "win32",
+      spawnTaskkill: (pid) => {
+        killed = pid;
+        return spawn(process.execPath, ["-e", `process.kill(${pid}, "SIGKILL")`], { stdio: "ignore" });
+      },
+    };
+    const running = runSupervised(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {}, deps);
+    await new Promise((r) => setTimeout(r, 300));
+    emitSignal("SIGTERM");
+    expect(await running).toBe(143);
+    expect(killed).toBeTypeOf("number");
+    expect(killProbe(killed as number)).toBe("ESRCH");
+  });
+});
+
+describe.runIf(!isWindows)("writer process groups (R17 amended, POSIX)", () => {
+  it("records each child's process group while a registry is active and removes it once the group is gone", async () => {
+    const dir = join(tmp.dir, "writers");
+    const stop = recordProcessGroupsIn(dir);
+    let seen: number[] = [];
+    try {
+      const run = runBounded(process.execPath, ["-e", "setTimeout(() => {}, 300)"]);
+      seen = await recordedProcessGroups(dir);
+      await run;
+    } finally {
+      stop();
+    }
+    expect(seen).toHaveLength(1);
+    expect(await recordedProcessGroups(dir)).toEqual([]);
+    await runBounded(process.execPath, ["-e", ""]);
+    expect(await recordedProcessGroups(dir)).toEqual([]); // no registry active any more
+  });
+
+  it("stopRecordedProcessGroups stops live groups (even one ignoring SIGTERM) and removes every entry", async () => {
+    const dir = join(tmp.dir, "writers");
+    const pidFile = join(tmp.dir, "stubborn.pid");
+    const leader = spawn(process.execPath, [fixture("ignore-term.mjs"), pidFile], { detached: true, stdio: "ignore", env: { ...process.env, [WRITER_TOKEN_ENV]: "tok-1" } });
+    await waitForFile(pidFile);
+    const pid = await readPid(pidFile);
+    spawnedPids.push(pid);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, String(pid)), "tok-1");
+    await writeFile(join(dir, "999999999"), ""); // a group that is long gone
+    expect(await stopRecordedProcessGroups(dir)).toEqual([]);
+    expect(killProbe(pid)).toBe("ESRCH");
+    expect(await recordedProcessGroups(dir)).toEqual([]);
+    leader.unref();
+  });
+});
+
+describe.runIf(!isWindows)("writer gate (R20, POSIX)", () => {
+  async function underRegistry<T>(fn: (dir: string) => Promise<T>): Promise<T> {
+    const dir = join(tmp.dir, "writers");
+    const stop = recordProcessGroupsIn(dir);
+    try {
+      return await fn(dir);
+    } finally {
+      stop();
+    }
+  }
+
+  it("runs the real command only after its group is recorded, with the same stdio and exit code", async () => {
+    const r = await underRegistry(async (dir) => {
+      const script = `const fs = require("fs"); const d = ${JSON.stringify(dir)};
+        const recorded = fs.readdirSync(d); process.stdin.on("data", (b) => process.stdout.write(b));
+        process.stdin.on("end", () => { process.stderr.write("recorded " + recorded.join(",") + " pgid-leader " + process.ppid); process.exit(3); });`;
+      return runBounded(process.execPath, ["-e", script], { input: "hello" });
+    });
+    expect(r.code).toBe(3);
+    expect(r.stdout).toBe("hello");
+    // The real command saw its group (led by the gate, its parent) already recorded.
+    const m = /recorded (\d+) pgid-leader (\d+)/.exec(r.stderr);
+    expect(m, r.stderr).not.toBeNull();
+    expect(m?.[1]).toBe(m?.[2]);
+    expect(await recordedProcessGroups(join(tmp.dir, "writers"))).toEqual([]);
+  });
+
+  it("a command that cannot be spawned still rejects with its error code", async () => {
+    await underRegistry(async () => {
+      await expect(runBounded(join(tmp.dir, "no-such-command"), [])).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it("a timeout under the gate tears down the real command's whole tree", async () => {
+    const pidFile = join(tmp.dir, "grandchild.pid");
+    const r = await underRegistry(() => runBounded(process.execPath, [fixture("spawn-tree.mjs"), pidFile], { timeoutMs: 1500 }));
+    expect(r.timedOut).toBe(true);
+    const { leader, grandchild } = await readTreePids(pidFile);
+    expect(killProbe(grandchild)).toBe("ESRCH");
+    expect(killProbe(leader)).toBe("ESRCH");
+  });
+
+  it("EOF on the control pipe before authorisation: the gate exits and the command never runs", async () => {
+    const marker = join(tmp.dir, "ran");
+    const gate = spawn(process.execPath, [WRITER_GATE, process.execPath, "-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "")`], {
+      stdio: ["ignore", "ignore", "ignore", "pipe"],
+    });
+    const exited = new Promise<number | null>((r) => gate.once("exit", (code) => r(code)));
+    (gate.stdio[3] as NodeJS.WritableStream & { destroy(): void }).destroy(); // the parent died before authorising
+    expect(await exited).not.toBe(0);
+    await new Promise((r) => setTimeout(r, 300));
+    await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.runIf(process.platform === "linux")("identity (Linux): a live recorded group without its token is unverified: still live, never signalled, entry kept (R21-P1)", async () => {
+    const dir = join(tmp.dir, "writers");
+    const unverified = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    spawnedPids.push(unverified.pid as number);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, String(unverified.pid)), "our-token");
+    expect(await liveRecordedProcessGroups(dir)).toEqual([unverified.pid]);
+    expect(await stopRecordedProcessGroups(dir)).toEqual([unverified.pid]);
+    expect(killProbe(unverified.pid as number)).toBe("alive");
+    expect(await recordedProcessGroups(dir)).toEqual([unverified.pid]);
+    unverified.kill("SIGKILL");
+  });
+
+  it("identity: a live recorded group whose members carry its token is reported live", async () => {
+    const dir = join(tmp.dir, "writers");
+    const ours = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore", env: { ...process.env, [WRITER_TOKEN_ENV]: "tok-2" } });
+    spawnedPids.push(ours.pid as number);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, String(ours.pid)), "tok-2");
+    await new Promise((r) => setTimeout(r, 200)); // let /proc show the new environment
+    expect(await liveRecordedProcessGroups(dir)).toEqual([ours.pid]);
+    ours.kill("SIGKILL");
   });
 });

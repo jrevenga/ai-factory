@@ -140,7 +140,7 @@ export class PiRuntime {
    * local prefix. `npm_config_prefix` is not usable for this — npm reads it only as the *global* prefix
    * (`npm prefix` ignores it), which would need `-g` and a platform-dependent layout.
    */
-  async ensurePinned(paths: FactoryPaths, version: string, opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {}): Promise<string> {
+  async ensurePinned(paths: FactoryPaths, version: string, opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
     if (!PLAIN_SEMVER.test(version)) throw new PiInstallFailed(`Invalid Pi version ${JSON.stringify(version)}: expected an exact semver such as 1.4.0.`);
     const prefix = join(paths.piPrefixes, version);
     const cli = pinnedCliPath(prefix);
@@ -152,7 +152,8 @@ export class PiRuntime {
       await mkdir(staging);
       await writeFile(join(staging, "package.json"), `${JSON.stringify({ name: "factory-pi-runtime", private: true }, null, 2)}\n`);
       const args = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error", `${PI_PACKAGE}@${version}`];
-      const r = await this.deps.npm(args, { env: opts.env, cwd: staging, timeoutMs: opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS });
+      const r = await this.deps.npm(args, { env: opts.env, cwd: staging, timeoutMs: opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS, signal: opts.signal });
+      if (opts.signal?.aborted) throw opts.signal.reason;
       if (r.code !== 0) {
         const how = r.timedOut ? "timed out" : `failed with exit ${r.code}`;
         throw new PiInstallFailed(`npm install of ${PI_PACKAGE}@${version} ${how}. Check network access to the npm registry and retry.\n${r.stderr.trim()}`);
@@ -192,6 +193,7 @@ export class PiRuntime {
     // Pi clones with git: no prompts, and a byte-identical checkout regardless of host autocrlf.
     const env = gitEnv(opts.env ?? process.env);
     const r = await this.run(cli, ["install", ref], { ...opts, env, timeoutMs: opts.timeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS });
+    if (opts.signal?.aborted) throw opts.signal.reason;
     if (r.code !== 0) throw new PiCommandFailed(`install ${ref}`, r);
   }
 

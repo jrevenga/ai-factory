@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RunResult } from "../../src/adapters/platform/process.ts";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
 import { PiRuntime } from "../../src/adapters/pi/runtime.ts";
+import { acquireLock, readLockHolder, writerGroupsPath } from "../../src/adapters/store/lock.ts";
 import type { ApplyContext } from "../../src/cli/commands/apply-release.ts";
 import type { DoctorCheck } from "../../src/cli/commands/doctor.ts";
 import { install, isNpxPath, type InstallDeps } from "../../src/cli/commands/install.ts";
@@ -44,6 +45,7 @@ beforeEach(async () => {
   log = [];
   out = [];
   err = [];
+  globalVersion = manifest.factory;
 });
 afterEach(async () => {
   await tmp.cleanup();
@@ -78,13 +80,21 @@ function ctx(): ApplyContext {
   };
 }
 
+/** Version the fake `npm install -g` leaves in the global root's release.json. */
+let globalVersion: string;
+
 function deps(over: Partial<InstallDeps> = {}): Partial<InstallDeps> {
   return {
     cliPath: GLOBAL_CLI,
     requirements: async () => REQS_OK,
     npm: async (args) => {
       log.push(`npm ${args.join(" ")}`);
-      return args[0] === "root" ? ok(`${join(tmp.dir, "global root")}\n`) : ok();
+      if (args[0] === "root") return ok(`${join(tmp.dir, "global root")}\n`);
+      const holder = await readLockHolder(paths);
+      log.push(`  lock held by us: ${holder?.pid === process.pid}`);
+      await mkdir(join(tmp.dir, "global root", "ai-factory"), { recursive: true });
+      await writeFile(join(tmp.dir, "global root", "ai-factory", "release.json"), JSON.stringify({ ...manifest, factory: globalVersion }));
+      return ok();
     },
     runNode: async (args) => {
       log.push(`node ${args.join(" ")}`);
@@ -143,6 +153,25 @@ describe("install", () => {
     expect(existsSync(paths.state)).toBe(false);
   });
 
+  it("outside npx, a lock release failure after the install committed → reports both, exit 1 (M2)", async () => {
+    const c = ctx();
+    c.deps = {
+      ...c.deps,
+      acquireLock: async (p, o, t) => {
+        const real = await acquireLock(p, o, t);
+        return { ...real, release: async () => {
+          await real.release();
+          throw new Error("lock compromised while installing");
+        } };
+      },
+    };
+    expect(await install(c, { yes: true }, deps())).toBe(1);
+    const text = err.join("\n");
+    expect(text).toContain("factory 0.1.0 is installed, but the factory lock could not be released cleanly: lock compromised while installing");
+    expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe("0.1.0");
+    expect(out.join("\n")).not.toContain("factory 0.1.0 installed.");
+  });
+
   it("outside npx, a failed apply → exit 1", async () => {
     const c = ctx();
     c.pi = new (class extends FakePi {
@@ -154,18 +183,91 @@ describe("install", () => {
     expect(err.join("\n")).toContain("Install did not complete: boom");
   });
 
-  it("under npx → global npm install with --legacy-peer-deps, then runs the global CLI install with the same flags", async () => {
+  async function globalCliStandIn(): Promise<string> {
     const globalCli = join(tmp.dir, "global root", "ai-factory", "bin", "factory.mjs");
     await mkdir(join(globalCli, ".."), { recursive: true });
     await writeFile(globalCli, "// stand-in for the globally installed CLI\n");
-    const code = await install(ctx(), { yes: true, profile: "codex-only" }, deps({ cliPath: NPX_CLI }));
+    return globalCli;
+  }
+
+  it("under npx → under the factory lock: global npm install with --legacy-peer-deps, then the global CLI install borrows the lock (R18)", async () => {
+    const globalCli = await globalCliStandIn();
+    const runNode: InstallDeps["runNode"] = async (args) => {
+      log.push(`node ${args.join(" ")}`);
+      log.push(`  lock held by us: ${(await readLockHolder(paths))?.pid === process.pid}`);
+      return 3;
+    };
+    const code = await install(ctx(), { yes: true, profile: "codex-only" }, deps({ cliPath: NPX_CLI, runNode }));
     expect(code).toBe(3);
     expect(log).toEqual([
       `npm install -g --legacy-peer-deps git+${SOURCE}#v0.1.0`,
+      "  lock held by us: true",
       "npm root -g",
-      `node ${globalCli} install --yes --profile codex-only`,
+      `node ${globalCli} install --yes --profile codex-only --parent-lock ${process.pid}`,
+      "  lock held by us: true",
     ]);
     expect(existsSync(paths.state)).toBe(false);
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("under npx, another factory process holding the lock → exit 1 before the global npm install (R18)", async () => {
+    await globalCliStandIn();
+    const held = await acquireLock(paths);
+    try {
+      expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI }))).toBe(1);
+      expect(err.join("\n")).toContain("Another factory process");
+      expect(log).toEqual([]);
+    } finally {
+      await held.release();
+    }
+  });
+
+  it("under npx, a newer installation that finished before the lock was taken → refused under the lock, global CLI untouched (R18)", async () => {
+    await globalCliStandIn();
+    const newer = JSON.stringify({ schema: 1, version: "0.2.0", installedAt: "2026-10-01T00:00:00.000Z", source: SOURCE, piVersion: "1.4.0", piCli: "/x/cli.js", history: [] });
+    // A concurrent update completes between the unlocked checks and the bootstrap.
+    const requirements: InstallDeps["requirements"] = async () => {
+      await mkdir(paths.home, { recursive: true });
+      await writeFile(paths.state, newer);
+      return REQS_OK;
+    };
+    expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI, requirements }))).toBe(1);
+    expect(err.join("\n")).toContain("Installed factory 0.2.0 is newer than this release (0.1.0). Nothing was changed.");
+    expect(log).toEqual([]);
+    expect(readFileSync(paths.state, "utf8")).toBe(newer);
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("under npx, a journal written before the lock was taken → refused under the lock (R8, R18)", async () => {
+    await globalCliStandIn();
+    const requirements: InstallDeps["requirements"] = async () => {
+      await mkdir(paths.home, { recursive: true });
+      await writeFile(paths.txn, JSON.stringify({ id: "t", kind: "update", from: "0.0.9", to: "0.1.0", snapshot: "s", startedAt: "2026-11-01T09:00:00.000Z" }));
+      return REQS_OK;
+    };
+    expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI, requirements }))).toBe(1);
+    expect(err.join("\n")).toBe('A previous update did not finish. Run "factory rollback".');
+    expect(log).toEqual([]);
+  });
+
+  it("under npx, a global CLI of another version after npm install -g → no hand-over (R18)", async () => {
+    await globalCliStandIn();
+    globalVersion = "0.0.1";
+    expect(await install(ctx(), { yes: true }, deps({ cliPath: NPX_CLI }))).toBe(1);
+    expect(err.join("\n")).toContain("holds factory 0.0.1, not 0.1.0; not handing over to it");
+    expect(log.some((l) => l.startsWith("node "))).toBe(false);
+    expect(await readLockHolder(paths)).toBeUndefined();
+  });
+
+  it("--parent-lock: applies under the borrowed lock of the bootstrapping process and leaves it held", async () => {
+    const held = await acquireLock(paths);
+    try {
+      expect(await install(ctx(), { yes: true, parentLockPid: process.pid }, deps())).toBe(0);
+      expect(JSON.parse(readFileSync(paths.state, "utf8")).version).toBe("0.1.0");
+      expect((await readLockHolder(paths))?.pid).toBe(process.pid);
+    } finally {
+      await held.release();
+    }
   });
 
   it.each([
@@ -174,14 +276,12 @@ describe("install", () => {
     [{ yes: false, profile: "codex-only" }, true, false],
     [{ yes: false }, false, false],
   ] as const)("under npx %j on a terminal=%s → the global CLI install gets the terminal's stdin: %s (R15)", async (opts, isTTY, interactive) => {
-    const globalCli = join(tmp.dir, "global root", "ai-factory", "bin", "factory.mjs");
-    await mkdir(join(globalCli, ".."), { recursive: true });
-    await writeFile(globalCli, "// stand-in for the globally installed CLI\n");
+    await globalCliStandIn();
     const seen: Array<{ interactive?: boolean } | undefined> = [];
     const c = ctx();
     c.io = { ...c.io, isTTY };
     await install(c, opts, deps({ cliPath: NPX_CLI, runNode: async (_args, _env, o) => (seen.push(o), 0) }));
-    expect(seen).toEqual([{ interactive }]);
+    expect(seen).toEqual([{ interactive, writerGroups: writerGroupsPath(paths) }]);
   });
 
   it("under npx, a failed global npm install → exit 1 and the global CLI is not run", async () => {

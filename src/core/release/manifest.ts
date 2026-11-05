@@ -33,8 +33,43 @@ export function sourceOverride(env: Env): string | undefined {
   return v === undefined || v === "" ? undefined : v;
 }
 
+/**
+ * A source URL that embeds credentials (M3): they would be printed, stored in state.json and written into
+ * Pi's package refs. Its message never repeats the URL.
+ */
+export class CredentialsInSourceUrl extends Error {
+  constructor(what: string) {
+    super(
+      `${what} embeds credentials in its URL (user:password@ or token@), which would be printed and stored in the factory state and Pi settings. ` +
+        `Remove them from the URL and let Git supply them: configure a Git credential helper (git config --global credential.helper <helper>, e.g. manager, osxkeychain or libsecret), or use an SSH URL.`,
+    );
+    this.name = "CredentialsInSourceUrl";
+  }
+}
+
+/** True for an http(s) URL (also `git+http(s)`) with a user name or password, or any URL with a password. */
+export function hasEmbeddedCredentials(url: string): boolean {
+  const trimmed = url.trim();
+  let parsed: URL | undefined;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed !== undefined) {
+    if (parsed.password !== "") return true;
+    return /^(?:git\+)?https?:$/i.test(parsed.protocol) && parsed.username !== "";
+  }
+  // Not parseable as a URL: still refuse anything shaped like http(s)://<userinfo>@host.
+  return /^(?:git\+)?https?:\/\/[^/?#]*@/i.test(trimmed);
+}
+
+/** The source this release installs from; refuses one with embedded credentials (CredentialsInSourceUrl). */
 export function effectiveSource(m: ReleaseManifest, env: Env): string {
-  return sourceOverride(env) ?? m.source.git;
+  const override = sourceOverride(env);
+  const source = override ?? m.source.git;
+  if (hasEmbeddedCredentials(source)) throw new CredentialsInSourceUrl(override === undefined ? "release.json source.git" : "FACTORY_SOURCE");
+  return source;
 }
 
 export function tagFor(version: string): string {

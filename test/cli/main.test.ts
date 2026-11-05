@@ -1,5 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { join } from "node:path";
+import { GUARD_FILE_NAME } from "../../guard/factory-guard.ts";
+import type { PiRunOptions } from "../../src/adapters/pi/runtime.ts";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { factoryPaths } from "../../src/adapters/platform/paths.ts";
 import { PiRuntime } from "../../src/adapters/pi/runtime.ts";
 import { acquireLock } from "../../src/adapters/store/lock.ts";
@@ -7,7 +10,7 @@ import { writeState } from "../../src/adapters/store/state-store.ts";
 import { main } from "../../src/cli/main.ts";
 import type { CliIO } from "../../src/cli/io.ts";
 import { isolatedEnv } from "../helpers/isolated-env.ts";
-import { makeWorld, stateAt } from "../helpers/release-world.ts";
+import { makeWorld, realisticApply, stateAt } from "../helpers/release-world.ts";
 import { makeTmp } from "../helpers/tmp.ts";
 
 function capture(): { io: CliIO; out: string[]; err: string[] } {
@@ -43,6 +46,7 @@ describe("main router", () => {
   it.each([
     [["install", "--bogus"]],
     [["install", "extra"]],
+    [["install", "--parent-lock", "abc"]],
     [["_apply-release"]],
     [["_apply-release", "--reason", "bogus"]],
     [["_apply-release", "--reason", "update", "--parent-lock", "abc"]],
@@ -118,6 +122,33 @@ describe("main _apply-release", () => {
       expect(code, c.err.join("\n")).toBe(0);
       expect(asked).toHaveLength(questions);
     } finally {
+      await t.cleanup();
+    }
+  });
+
+  it("install --parent-lock borrows the bootstrapping process's lock and leaves it held (R18)", async () => {
+    const t = await makeTmp("main-install-borrow");
+    const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "http://127.0.0.1:1/x/ai-factory.git", PI_OFFLINE: "1" };
+    const paths = factoryPaths(env);
+    const pi = new (class extends PiRuntime {
+      override async ensurePinned(): Promise<string> {
+        return "/fake/cli.js";
+      }
+      override async installPackage(): Promise<void> {}
+    })();
+    const held = await acquireLock(paths);
+    try {
+      const c = capture();
+      const code = await main(["install", "--yes", "--parent-lock", String(process.pid)], c.io, {
+        env,
+        pi,
+        applyDeps: { detectLogins: async () => ({ claude: "absent", codex: "present" }), runDoctor: async () => [] },
+      });
+      expect(code, c.err.join("\n")).toBe(0);
+      expect(JSON.parse(readFileSync(paths.state, "utf8")).history.at(-1).reason).toBe("install");
+      expect(existsSync(paths.lock)).toBe(true);
+    } finally {
+      await held.release();
       await t.cleanup();
     }
   });
@@ -213,5 +244,130 @@ describe("unexpected errors (top-level catch)", () => {
     } finally {
       await b.cleanup();
     }
+  });
+});
+
+describe("relative directory overrides (I4)", () => {
+  // The process works from yet another directory, so a relative value resolved against it (the bug)
+  // lands in a temp dir, never in the repository.
+  let elsewhere: Awaited<ReturnType<typeof makeTmp>>;
+  let previousCwd: string;
+  beforeEach(async () => {
+    elsewhere = await makeTmp("main-relative-elsewhere");
+    previousCwd = process.cwd();
+    process.chdir(elsewhere.dir);
+  });
+  afterEach(async () => {
+    process.chdir(previousCwd);
+    await elsewhere.cleanup();
+  });
+
+  /** isolatedEnv with FACTORY_HOME and PI_CODING_AGENT_DIR given relative to `dir` (the caller's directory). */
+  function relativeEnv(dir: string): NodeJS.ProcessEnv {
+    return { ...isolatedEnv(dir), FACTORY_HOME: "factory home", PI_CODING_AGENT_DIR: "pi agent", FACTORY_SOURCE: "http://127.0.0.1:1/x/ai-factory.git", PI_OFFLINE: "1" };
+  }
+
+  it("an install from another directory gives Pi absolute directories and installs everything under them", async () => {
+    const t = await makeTmp("main-relative-install");
+    const seen: Array<{ home?: string; agent?: string; cwd?: string }> = [];
+    const pi = new (class extends PiRuntime {
+      override async ensurePinned(_p: unknown, _v: string, o: { env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+        seen.push({ home: o.env?.FACTORY_HOME, agent: o.env?.PI_CODING_AGENT_DIR });
+        return "/fake/cli.js";
+      }
+      override async installPackage(_cli: string, _ref: string, o: PiRunOptions = {}): Promise<void> {
+        seen.push({ home: o.env?.FACTORY_HOME, agent: o.env?.PI_CODING_AGENT_DIR, cwd: o.cwd });
+      }
+    })();
+    try {
+      const c = capture();
+      const code = await main(["_apply-release", "--reason", "install", "--yes"], c.io, {
+        env: relativeEnv(t.dir),
+        cwd: t.dir,
+        pi,
+        applyDeps: { detectLogins: async () => ({ claude: "absent", codex: "present" }), runDoctor: async () => [] },
+      });
+      expect(code, c.err.join("\n")).toBe(0);
+      const home = join(t.dir, "factory home");
+      const agent = join(t.dir, "pi agent");
+      expect(seen).toEqual([
+        { home, agent },
+        { home, agent, cwd: home },
+      ]);
+      expect(existsSync(join(home, "state.json"))).toBe(true);
+      expect(existsSync(join(agent, "extensions", GUARD_FILE_NAME))).toBe(true);
+      expect(existsSync(join(agent, "settings.json"))).toBe(true);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  it("update hands the absolute directories to the new release's _apply-release", async () => {
+    const w = await makeWorld("main-relative-update");
+    try {
+      await writeState(w.paths, stateAt("0.1.0", [{ version: "0.1.0", at: "2026-10-01T00:00:00.000Z", reason: "install" }]));
+      w.tags = ["v0.2.0"];
+      w.releases = { "v0.2.0": {} };
+      const childEnv: Array<{ home?: string; agent?: string }> = [];
+      const deps = w.ctx({
+        runNode: async (args, env) => {
+          childEnv.push({ home: env.FACTORY_HOME, agent: env.PI_CODING_AGENT_DIR });
+          return realisticApply(args, w);
+        },
+      }).deps;
+      const c = capture();
+      const code = await main(["update", "--yes"], c.io, { env: relativeEnv(w.tmp.dir), cwd: w.tmp.dir, releaseDeps: deps });
+      expect(code, c.err.join("\n")).toBe(0);
+      expect(childEnv).toEqual([{ home: w.paths.home, agent: w.paths.piAgentDir }]);
+    } finally {
+      await w.cleanup();
+    }
+  });
+
+  it("the launcher starts Pi with the absolute directories", async () => {
+    const t = await makeTmp("main-relative-launch");
+    try {
+      const env = relativeEnv(t.dir);
+      const home = join(t.dir, "factory home");
+      const report = join(t.dir, "pi env.json");
+      const piCli = join(t.dir, "fake pi.mjs");
+      writeFileSync(
+        piCli,
+        `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(report)}, JSON.stringify({ home: process.env.FACTORY_HOME, agent: process.env.PI_CODING_AGENT_DIR }));\n`,
+      );
+      const paths = factoryPaths({ ...env, FACTORY_HOME: home });
+      await writeState(paths, { ...stateAt("0.1.0", []), piCli });
+      const c = capture();
+      expect(await main([], c.io, { env, cwd: t.dir, doctor: async () => [] }), c.err.join("\n")).toBe(0);
+      expect(JSON.parse(readFileSync(report, "utf8"))).toEqual({ home, agent: join(t.dir, "pi agent") });
+    } finally {
+      await t.cleanup();
+    }
+  });
+});
+
+describe("FACTORY_SOURCE with embedded credentials (M3)", () => {
+  it.each([[["doctor", "--offline"]], [["install", "--yes"]], [["update", "--yes"]], [["rollback", "--yes"]], [[]]])(
+    "%j refuses before doing anything and never prints the URL",
+    async (argv) => {
+      const t = await makeTmp("main-credentials");
+      try {
+        const env = { ...isolatedEnv(t.dir), FACTORY_SOURCE: "https://user:s3cret@github.com/o/ai-factory.git", PI_OFFLINE: "1" };
+        const c = capture();
+        expect(await main([...argv], c.io, { env, doctor: async () => [] })).toBe(1);
+        const text = [...c.out, ...c.err].join("\n");
+        expect(text).toContain("FACTORY_SOURCE embeds credentials");
+        expect(text).toContain("credential helper");
+        expect(text).not.toContain("s3cret");
+        expect(existsSync(factoryPaths(env).home)).toBe(false);
+      } finally {
+        await t.cleanup();
+      }
+    },
+  );
+
+  it("version still works", async () => {
+    const c = capture();
+    expect(await main(["version"], c.io, { env: { FACTORY_SOURCE: "https://user:s3cret@github.com/o/x.git" } })).toBe(0);
   });
 });

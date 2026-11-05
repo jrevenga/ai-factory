@@ -1,11 +1,13 @@
 // Command router and composition root of the `factory` CLI.
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { factoryPaths } from "../adapters/platform/paths.ts";
 import { PiRuntime } from "../adapters/pi/runtime.ts";
-import { ReleaseManifest } from "../core/release/manifest.ts";
+import { withAbsoluteDirs } from "../core/paths/homes.ts";
+import { CredentialsInSourceUrl, effectiveSource, ReleaseManifest } from "../core/release/manifest.ts";
 import { APPLY_REASONS, applyRelease, ApplyFailed, type ApplyContext, type ApplyDeps, type ApplyReason } from "./commands/apply-release.ts";
 import { configExplain } from "./commands/config.ts";
 import { runDoctor, formatDoctor, type DoctorCheck } from "./commands/doctor.ts";
@@ -29,6 +31,7 @@ export interface MainDeps {
   releaseDeps?: Partial<ReleaseDeps>;
   /** Test seams for the launcher and init/config. */
   doctor?: () => Promise<DoctorCheck[]>;
+  /** The caller's directory: the project for init/config, and the base of relative directory overrides. */
   cwd?: string;
 }
 
@@ -54,7 +57,8 @@ const COMMANDS = new Set(["version", "doctor", "install", "_apply-release", "upd
  * unexpected filesystem error) is printed as one line and exits 1; FACTORY_DEBUG=1 adds the stack.
  */
 export async function main(argv: string[], io: CliIO = defaultIO(), deps: MainDeps = {}): Promise<number> {
-  const env = deps.env ?? process.env;
+  // I4: directory overrides are made absolute once, here; every path and every child uses this env.
+  const env = withAbsoluteDirs(deps.env ?? process.env, homedir(), deps.cwd ?? process.cwd());
   try {
     return await run(argv, io, deps, env);
   } catch (e) {
@@ -92,34 +96,44 @@ async function run(argv: string[], io: CliIO, deps: MainDeps, env: NodeJS.Proces
 
   const manifest = ReleaseManifest.parse(JSON.parse(readFileSync(join(root, "release.json"), "utf8")));
 
-  if (toPi !== undefined) {
-    return launch({ paths: factoryPaths(env), env, manifest, io, root, doctor: deps.doctor }, toPi);
-  }
-
   if (cmd === "version") {
     io.out(manifest.factory);
     return 0;
   }
 
+  // M3: a source URL with embedded credentials is refused before any command can print or store it.
+  try {
+    effectiveSource(manifest, env);
+  } catch (e) {
+    if (!(e instanceof CredentialsInSourceUrl)) throw e;
+    io.err(e.message);
+    return 1;
+  }
+
+  if (toPi !== undefined) {
+    return launch({ paths: factoryPaths(env), env, manifest, io, root, doctor: deps.doctor }, toPi);
+  }
+
   if (cmd === "install" || cmd === "_apply-release") {
     let flags: { yes?: boolean; profile?: string; reason?: string; from?: string; "parent-lock"?: string };
     try {
-      const options = { yes: { type: "boolean" }, profile: { type: "string" } } as const;
-      const applyOptions = { ...options, reason: { type: "string" }, from: { type: "string" }, "parent-lock": { type: "string" } } as const;
+      const options = { yes: { type: "boolean" }, profile: { type: "string" }, "parent-lock": { type: "string" } } as const;
+      const applyOptions = { ...options, reason: { type: "string" }, from: { type: "string" } } as const;
       flags = parseArgs({ args: rest, options: cmd === "install" ? options : applyOptions, allowPositionals: false, strict: true }).values;
     } catch (e) {
       return usage((e as Error).message);
-    }
-    const ctx: ApplyContext = { paths: factoryPaths(env), env, manifest, io, pi: deps.pi ?? new PiRuntime(), now: () => new Date(), root, deps: deps.applyDeps };
-    if (cmd === "install") return install(ctx, { yes: flags.yes === true, profile: flags.profile });
-
-    if (flags.reason === undefined || !(APPLY_REASONS as readonly string[]).includes(flags.reason)) {
-      return usage(`_apply-release needs --reason ${APPLY_REASONS.join("|")}`);
     }
     let parentLockPid: number | undefined;
     if (flags["parent-lock"] !== undefined) {
       parentLockPid = /^\d+$/.test(flags["parent-lock"]) ? Number(flags["parent-lock"]) : Number.NaN;
       if (!Number.isSafeInteger(parentLockPid) || parentLockPid <= 0) return usage(`--parent-lock must be a process id, got ${flags["parent-lock"]}`);
+    }
+    const ctx: ApplyContext = { paths: factoryPaths(env), env, manifest, io, pi: deps.pi ?? new PiRuntime(), now: () => new Date(), root, deps: deps.applyDeps };
+    // `install --parent-lock` is the npx bootstrap's hand-over (R18); it is not part of the usage text.
+    if (cmd === "install") return install(ctx, { yes: flags.yes === true, profile: flags.profile, parentLockPid });
+
+    if (flags.reason === undefined || !(APPLY_REASONS as readonly string[]).includes(flags.reason)) {
+      return usage(`_apply-release needs --reason ${APPLY_REASONS.join("|")}`);
     }
     try {
       await applyRelease(ctx, { reason: flags.reason as ApplyReason, from: flags.from, parentLockPid, profile: flags.profile, yes: flags.yes === true });

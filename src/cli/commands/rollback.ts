@@ -3,7 +3,10 @@
 // (ruling 10). Only documents whose schema is newer than the target supports are restored (ruling 11).
 //
 // Recovery mode: a journal left by an unfinished update/rollback is recovered exactly — target is the
-// version it left, and every restorable file of its snapshot is restored (ruling 12). That snapshot is
+// version it left, every restorable file of its snapshot is restored (ruling 12) and every restorable
+// file it recorded as absent is removed (I3). A snapshot holding a document that is not JSON with an
+// integer `schema` cannot be recovered by any release: it is refused before any change, the journal
+// kept, naming the copy to repair (M1). That snapshot is
 // never written to: a new rollback snapshot of the current (half-applied) state is taken first, labelled
 // as leaving the version the unfinished transaction was moving to (`txn.to`), which is also recorded as
 // `from` in history; it is never labelled as leaving `txn.from`, because it may hold newer-schema documents.
@@ -67,6 +70,28 @@ async function compatibleCopies(
   return out;
 }
 
+/**
+ * The JSON documents of a journal's snapshot that no release can read: not JSON, or without an integer
+ * `schema` (every release's preflight refuses those). Other copies are restored as they are.
+ */
+async function unreadableCopies(paths: FactoryPaths, snapshot: SnapshotInfo): Promise<{ path: string; detail: string }[]> {
+  const out: { path: string; detail: string }[] = [];
+  for (const doc of STATE_DOCS) {
+    if (!snapshot.files.includes(doc)) continue;
+    const path = join(snapshotDir(paths, snapshot.id), doc);
+    let raw: unknown;
+    try {
+      raw = await readJson(path);
+    } catch (e) {
+      if (!(e instanceof MalformedJson)) throw e;
+      out.push({ path, detail: `it is not valid JSON (${msg(e.cause)})` });
+      continue;
+    }
+    if (raw !== undefined && schemaOf(raw) === undefined) out.push({ path, detail: 'it has no integer "schema" field' });
+  }
+  return out;
+}
+
 export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Promise<number> {
   const { io, paths, env } = ctx;
   const deps = releaseDeps(ctx);
@@ -122,6 +147,19 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
           io.err(`The unfinished ${txn.kind} ${txn.from} → ${txn.to} names snapshot ${txn.snapshot}, which is missing or incomplete in ${paths.backups}. It cannot be recovered automatically.`);
           return 1;
         }
+        const unreadable = await unreadableCopies(paths, snapshot);
+        if (unreadable.length > 0) {
+          io.err(
+            [
+              `Snapshot ${snapshot.id} of the unfinished ${txn.kind} ${txn.from} → ${txn.to} cannot be recovered automatically: factory ${txn.from} cannot read these copies. Nothing was changed.`,
+              ...unreadable.map(
+                (p) =>
+                  `  ${p.path}: ${p.detail}\n     fix: Repair ${p.path} (your file from before the ${txn.kind}) or remove it if it should not exist, then run "factory rollback" again.`,
+              ),
+            ].join("\n"),
+          );
+          return 1;
+        }
         plan = { target: txn.from, recovery: txn };
         io.out(`Recovering the unfinished ${txn.kind} ${txn.from} → ${txn.to} from snapshot ${snapshot.id}.`);
       } else {
@@ -153,10 +191,13 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
 
       /** Snapshot id → files to restore from it. */
       const restore = new Map<string, string[]>();
+      /** Recovery: restorable files absent from the journal's snapshot, removed after the restore (I3). */
+      let absent: string[] = [];
       const recovering = plan.recovery;
       if (recovering !== undefined) {
-        const snapshot = snapshots.find((s) => s.id === recovering.snapshot);
-        restore.set(recovering.snapshot, (snapshot?.files ?? []).filter((f) => RESTORABLE.includes(f)));
+        const files = snapshots.find((s) => s.id === recovering.snapshot)?.files ?? [];
+        restore.set(recovering.snapshot, files.filter((f) => RESTORABLE.includes(f)));
+        absent = RESTORABLE.filter((f) => !files.includes(f));
       } else {
         // A snapshot taken when leaving the target holds the target's state, whatever release it went to.
         const copies = await compatibleCopies(paths, snapshots, plan.target, release.manifest.stateSchemas);
@@ -185,16 +226,20 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
       held.live();
       const snap = await createSnapshot(paths, { from: current, to: plan.target, kind: "rollback", now: ctx.now() });
       rollbackSnapshot = snap.id;
+      /** The journal this rollback finishes: the one it recovers, or the one it starts now. */
+      const txnId = plan.recovery?.id ?? snap.id;
       if (plan.recovery === undefined) {
         held.live();
         await beginTxn(paths, { id: snap.id, kind: "rollback", from: current, to: plan.target, snapshot: snap.id, now: ctx.now() });
       }
       mutating = true;
       for (const [id, files] of restore) {
-        if (files.length === 0) continue;
+        const removing = id === plan.recovery?.snapshot ? absent : [];
+        if (files.length === 0 && removing.length === 0) continue;
         held.live();
-        // A journal's snapshot is restored as it is (I1); normal-mode copies were chosen by content.
-        await restoreSnapshot(paths, id, files, { verbatim: plan.recovery !== undefined });
+        // A journal's snapshot is restored as it is (I1), absences included (I3); normal-mode copies
+        // were chosen by content. The rollback snapshot above already preserved the failed state.
+        await restoreSnapshot(paths, id, files, { verbatim: plan.recovery !== undefined, absent: removing });
       }
 
       const code = await installAndApply(ctx, deps, held, release.manifest, { reason: "rollback", from: current });
@@ -205,8 +250,8 @@ export async function rollback(ctx: ReleaseContext, opts: RollbackOptions): Prom
       // The target's `_apply-release` clears the journal after writing state.json; make sure it is gone
       // (still under our lock), but only if state.json really records the target.
       if ((await readState(paths))?.version === plan.target) {
-        held.live();
-        await clearTxn(paths);
+        await held.lock.verify();
+        await clearTxn(paths, txnId);
       } else {
         io.err(`factory ${plan.target} reported success but ${paths.state} does not record it. ${failedMessage(plan, rollbackSnapshot)}`);
         return 1;

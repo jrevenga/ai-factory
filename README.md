@@ -47,6 +47,16 @@ factory install
 
 Update and rollback refuse to run while a factory-launched Pi session is open. Every update and rollback keeps an immutable snapshot under `~/.factory/backups/`.
 
+### When the factory lock stays in use
+
+`install`, `update` and `rollback` start npm and Pi in their own process groups and record each group under `~/.factory/factory.lock.writers/`. If a factory command was killed while one of them ran, the lock stays unavailable while that group lives, and the next command refuses with a message that names the group and its record. The factory stops such a group by itself only when it can verify that the group is its own (on Linux, through an identity token in the group's environment; on other POSIX systems it assumes a recorded group is its own). Otherwise recovery is manual:
+
+1. Inspect the group: `ps -o pid,pgid,args -g <group>`.
+2. If it is a factory npm or Pi process, let it finish or stop it with `kill -TERM -- -<group>`.
+3. If it is not (its id was reused by another program), remove its record `~/.factory/factory.lock.writers/<group>`.
+
+Then run the command again.
+
 ## Known limitations
 
 - The global `factory` CLI pins its direct dependencies exactly, but npm does not apply a git dependency's lockfile (or `npm-shrinkwrap.json`) on `npm install -g`, so the CLI's transitive dependencies may resolve to newer versions within their declared ranges. Pi and `pi-claude-bridge` are pinned to exact versions, but their transitive dependencies are also resolved at install time; only the factory's Pi package install (in Pi's checkout) follows `package-lock.json`.

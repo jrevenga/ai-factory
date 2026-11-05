@@ -5,7 +5,9 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { RunResult } from "../../src/adapters/platform/process.ts";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
-import { clearTxn } from "../../src/adapters/store/transaction.ts";
+import { PiRuntime } from "../../src/adapters/pi/runtime.ts";
+import { applyRelease } from "../../src/cli/commands/apply-release.ts";
+import { clearTxn, readTxn } from "../../src/adapters/store/transaction.ts";
 import { readState, writeState } from "../../src/adapters/store/state-store.ts";
 import { GitError } from "../../src/adapters/vcs/git.ts";
 import type { ReleaseContext, ReleaseDeps } from "../../src/cli/commands/release-txn.ts";
@@ -72,8 +74,50 @@ export async function realisticApply(args: string[], w: World, opts: { clear?: b
     version: w.installed,
     history: [...prev.history, { version: w.installed, at: "2026-11-01T10:00:00.000Z", reason, ...(from === undefined ? {} : { from }) }],
   });
-  if (opts.clear !== false) await clearTxn(w.paths);
+  const txn = await readTxn(w.paths);
+  if (opts.clear !== false && txn !== undefined) await clearTxn(w.paths, txn.id);
   return 0;
+}
+
+/** A Pi that is never run: the pinned CLI is a fake path and package installs succeed. */
+class OfflinePi extends PiRuntime {
+  override async ensurePinned(): Promise<string> {
+    return "/fake/cli.js";
+  }
+  override async installPackage(): Promise<void> {}
+}
+
+/**
+ * The real child: runs `applyRelease` in-process as the release `w.installed` (its release.json from
+ * `w.releases`), with an offline Pi, a codex login and the lock borrowed from `--parent-lock`.
+ */
+export async function realApply(args: string[], w: World): Promise<number> {
+  if (w.installed === undefined) throw new Error("real apply needs an installed version");
+  const manifest = manifestFor(w.installed, w.releases[`v${w.installed}`] ?? {});
+  const parent = flag(args, "--parent-lock");
+  const io: CliIO = { out: (s) => void w.out.push(s), err: (s) => void w.err.push(s), confirm: async () => false, isTTY: false };
+  try {
+    await applyRelease(
+      {
+        paths: w.paths,
+        env: w.env,
+        manifest,
+        io,
+        pi: new OfflinePi(),
+        now: () => new Date("2026-11-01T10:00:00.000Z"),
+        deps: { detectLogins: async () => ({ claude: "absent", codex: "present" }), runDoctor: async () => [] },
+      },
+      {
+        reason: flag(args, "--reason") as "update" | "rollback",
+        from: flag(args, "--from"),
+        parentLockPid: parent === undefined ? undefined : Number(parent),
+        yes: args.includes("--yes"),
+      },
+    );
+    return 0;
+  } catch {
+    return 1;
+  }
 }
 
 const ok = (stdout = ""): RunResult => ({ code: 0, stdout, stderr: "", timedOut: false, orphans: false });

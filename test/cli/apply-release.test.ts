@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GUARD_FILE_NAME } from "../../guard/factory-guard.ts";
 import { factoryPaths, type FactoryPaths } from "../../src/adapters/platform/paths.ts";
 import { PiRuntime, UnresolvableRef, type PiRunOptions } from "../../src/adapters/pi/runtime.ts";
-import { acquireLock, readLockHolder } from "../../src/adapters/store/lock.ts";
+import { acquireLock, Locked, readLockHolder } from "../../src/adapters/store/lock.ts";
+import { clearTxn } from "../../src/adapters/store/transaction.ts";
+import { writeState } from "../../src/adapters/store/state-store.ts";
 import { applyRelease, type ApplyContext, type ApplyDeps } from "../../src/cli/commands/apply-release.ts";
 import type { CliIO } from "../../src/cli/io.ts";
 import type { LoginState } from "../../src/core/profiles/propose.ts";
@@ -378,6 +380,97 @@ describe("failure handling", () => {
       expect(err.join("\n")).toMatch(/Install did not complete: Another factory process/);
       expect(existsSync(guardPath())).toBe(false);
       expect(log).toEqual([]);
+    } finally {
+      await held.release();
+    }
+  });
+
+  it("the lender ends during the Pi install: a concurrent rollback is refused while the borrower runs; the borrower commits nothing (R17)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, PREVIOUS_STATE);
+    await writeFile(paths.txn, TXN);
+    const lender = await acquireLock(paths);
+    const signals: boolean[] = [];
+    const attempts: unknown[] = [];
+    const pi = new (class extends FakePi {
+      override async installPackage(cli: string, ref: string, opts: PiRunOptions = {}): Promise<void> {
+        signals.push(opts.signal instanceof AbortSignal && !opts.signal.aborted);
+        await lender.release(); // the lender ends; its borrower (this apply) still holds the lease
+        attempts.push(await acquireLock(paths).catch((e: unknown) => e)); // a concurrent rollback
+        await super.installPackage(cli, ref, opts);
+      }
+    })();
+    const e = await applyRelease(ctx(pi, { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9", parentLockPid: process.pid }).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(Error);
+    expect(signals).toEqual([true]);
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toBeInstanceOf(Locked);
+    expect(readFileSync(paths.state, "utf8")).toBe(PREVIOUS_STATE);
+    expect(readFileSync(paths.txn, "utf8")).toBe(TXN);
+    expect(existsSync(paths.config)).toBe(false);
+    expect(err.join("\n")).toMatch(/Install did not complete: The factory lock .* is no longer held for this process/);
+    // The borrower has finished: now the rollback can take the lock.
+    await (await acquireLock(paths)).release();
+  });
+
+  it("schedule: the lender ends and a rollback tries the lock while state.json is being published → the rollback is refused (R17 amended)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.state, PREVIOUS_STATE);
+    await writeFile(paths.txn, TXN);
+    const lender = await acquireLock(paths);
+    const attempts: unknown[] = [];
+    const publishing: ApplyDeps["writeState"] = async (p, state) => {
+      await lender.release();
+      attempts.push(await acquireLock(p).catch((x: unknown) => x));
+      await writeState(p, state);
+    };
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }, { writeState: publishing }), { reason: "update", from: "0.0.9", parentLockPid: process.pid }).catch(() => undefined);
+    expect(attempts[0]).toBeInstanceOf(Locked);
+    // Nobody else could write meanwhile: state.json is the borrower's, and its journal stays for recovery.
+    expect(readJsonFile(paths.state).version).toBe("0.1.0");
+    expect(readFileSync(paths.txn, "utf8")).toBe(TXN);
+    await (await acquireLock(paths)).release();
+  });
+
+  it("schedule: the lender ends and a rollback tries the lock while the journal is being removed → the rollback is refused (R17 amended)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.txn, TXN);
+    const lender = await acquireLock(paths);
+    const attempts: unknown[] = [];
+    const clearing: ApplyDeps["clearTxn"] = async (p, id) => {
+      await lender.release();
+      const attempt = await acquireLock(p).catch((x: unknown) => x);
+      attempts.push(attempt);
+      if (!(attempt instanceof Locked)) {
+        // What the rollback would do with the lock: start its own journal.
+        await rm(p.txn, { force: true });
+        await writeFile(p.txn, TXN.replace('"id":"t"', '"id":"rollback"'));
+      }
+      await clearTxn(p, id);
+    };
+    await applyRelease(ctx(new FakePi(), { claude: "absent", codex: "present" }, { clearTxn: clearing }), { reason: "update", from: "0.0.9", parentLockPid: process.pid });
+    expect(attempts[0]).toBeInstanceOf(Locked);
+    expect(existsSync(paths.txn)).toBe(false); // its own journal, removed; no other transaction's was touched
+    await (await acquireLock(paths)).release();
+  });
+
+  it("removes only the journal of the transaction it started under: another transaction's journal is kept (R17)", async () => {
+    await mkdir(paths.home, { recursive: true });
+    await writeFile(paths.txn, TXN);
+    const other = TXN.replace('"id":"t"', '"id":"other"');
+    const held = await acquireLock(paths);
+    const pi = new (class extends FakePi {
+      override async installPackage(cli: string, ref: string, opts: PiRunOptions = {}): Promise<void> {
+        await writeFile(paths.txn, other);
+        await super.installPackage(cli, ref, opts);
+      }
+    })();
+    try {
+      const e = await applyRelease(ctx(pi, { claude: "absent", codex: "present" }), { reason: "update", from: "0.0.9", parentLockPid: process.pid }).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(Error);
+      expect(readFileSync(paths.txn, "utf8")).toBe(other);
+      expect(err.join("\n")).toContain("records transaction other, not t");
+      expect(err.join("\n")).not.toContain("remove it");
     } finally {
       await held.release();
     }

@@ -9,7 +9,7 @@ import { readTxn } from "../../src/adapters/store/transaction.ts";
 import { writeState } from "../../src/adapters/store/state-store.ts";
 import { rollback } from "../../src/cli/commands/rollback.ts";
 import { update } from "../../src/cli/commands/update.ts";
-import { makeWorld, realisticApply, SOURCE, stateAt, tree, type World } from "../helpers/release-world.ts";
+import { makeWorld, realApply, realisticApply, SOURCE, stateAt, tree, type World } from "../helpers/release-world.ts";
 
 const at = (d: string): Date => new Date(`${d}T00:00:00.000Z`);
 const INSTALL_010 = { version: "0.1.0", at: "2026-10-01T00:00:00.000Z", reason: "install" as const };
@@ -249,28 +249,78 @@ describe("factory rollback (recovery mode)", () => {
     expect(state.history.at(-1)).toMatchObject({ version: "0.1.0", reason: "rollback", from: "0.2.0" });
   });
 
-  it("recovery restores snapshot files byte for byte even when a reader would reject them, and ignores a broken current state.json", async () => {
+  it("recovery restores the absence of documents the failed transaction created, through the real child (I3)", async () => {
     await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
-    // Hand-edited before the transaction (written by an earlier release without the preflight).
-    const handEdited = '{ "schema": 1, "profile": "codex-only", }\n';
+    expect(existsSync(w.paths.config)).toBe(false);
+    w.tags = ["v0.1.0", "v0.2.0"];
+    w.releases = { "v0.1.0": {}, "v0.2.0": { stateSchemas: { "config.json": 2 } } };
+    // The new CLI creates config.json at schema 2 (and a memory store), then dies before writing state.json.
+    w.onApply = async () => {
+      await writeConfig({ schema: 2, profile: "codex-only", createdByTheFailedUpdate: true });
+      await writeFile(w.paths.memoryDb, "created by the failed update");
+      await writeFile(w.paths.state, "{ half");
+      return 1;
+    };
+    expect(await update(w.ctx(), { yes: true })).toBe(1);
+    const txn = await readTxn(w.paths);
+    const failedConfig = readFileSync(w.paths.config, "utf8");
+
+    // Recovery through the real 0.1.0 `_apply-release` (schema-1 config reader).
+    w.log.length = 0;
+    w.err.length = 0;
+    w.onApply = realApply;
+    const code = await rollback(w.ctx(), { yes: true });
+    expect(code, w.err.join("\n")).toBe(0);
+    expect(existsSync(w.paths.memoryDb)).toBe(false);
+    // The 0.1.0 child created a fresh schema-1 config.json in place of the removed one.
+    expect(JSON.parse(readFileSync(w.paths.config, "utf8"))).toEqual({ schema: 1, profile: "codex-only" });
+    expect(JSON.parse(readFileSync(w.paths.state, "utf8")).version).toBe("0.1.0");
+    expect(existsSync(w.paths.txn)).toBe(false);
+    // The recovery-attempt snapshot preserved the failed state first, the journal's snapshot is untouched.
+    const attempt = (await listSnapshots(w.paths)).find((s) => s.id !== txn!.snapshot);
+    expect(attempt).toMatchObject({ kind: "rollback", from: "0.2.0", to: "0.1.0" });
+    expect(readFileSync(join(w.paths.backups, attempt!.id, "config.json"), "utf8")).toBe(failedConfig);
+    expect(readFileSync(join(w.paths.backups, attempt!.id, "memory.db"), "utf8")).toBe("created by the failed update");
+    expect(readFileSync(join(w.paths.backups, attempt!.id, "state.json"), "utf8")).toBe("{ half");
+  });
+
+  it("a snapshot copy that is JSON with a schema but rejected by the reader is restored byte for byte, through the real child", async () => {
+    await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
+    // Hand-edited before the transaction; the 0.1.0 child never reads an existing config.json.
+    const handEdited = '{ "schema": 1, "profile": 5 }\n';
     await writeFile(w.paths.config, handEdited);
     const snap = await createSnapshot(w.paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: at("2026-10-31") });
     await writeFile(w.paths.txn, JSON.stringify({ id: snap.id, kind: "update", from: "0.1.0", to: "0.2.0", snapshot: snap.id, startedAt: "2026-10-31T00:00:00.000Z" }));
-    // The failed transaction left a half-written state.json and a migrated config.
-    await writeFile(w.paths.state, "{ half");
     await writeConfig({ schema: 2, profile: "codex-only" });
     w.releases = { "v0.1.0": {} };
-    let configAtApply: string | undefined;
-    w.onApply = (args, world) => {
-      configAtApply = readFileSync(world.paths.config, "utf8");
-      return realisticApply(args, world, { clear: false });
-    };
-    const code = await rollback(w.ctx(), { yes: true });
-    expect(code, w.err.join("\n")).toBe(0);
-    expect(configAtApply).toBe(handEdited);
+    w.onApply = realApply;
+    expect(await rollback(w.ctx(), { yes: true }), w.err.join("\n")).toBe(0);
     expect(readFileSync(w.paths.config, "utf8")).toBe(handEdited);
     expect(JSON.parse(readFileSync(w.paths.state, "utf8")).version).toBe("0.1.0");
     expect(existsSync(w.paths.txn)).toBe(false);
+  });
+
+  it("an invalid historical snapshot (a copy that is not JSON) is refused before any change and the journal is kept (M1)", async () => {
+    await writeState(w.paths, stateAt("0.1.0", [INSTALL_010]));
+    // Written by an earlier release without the preflight: no factory release can read it.
+    await writeFile(w.paths.config, '{ "schema": 1, "profile": "codex-only", }\n');
+    const snap = await createSnapshot(w.paths, { from: "0.1.0", to: "0.2.0", kind: "update", now: at("2026-10-31") });
+    const journal = JSON.stringify({ id: snap.id, kind: "update", from: "0.1.0", to: "0.2.0", snapshot: snap.id, startedAt: "2026-10-31T00:00:00.000Z" });
+    await writeFile(w.paths.txn, journal);
+    await writeConfig({ schema: 2, profile: "codex-only" });
+    w.releases = { "v0.1.0": {} };
+    w.onApply = realApply;
+    const before = tree(w.paths.home);
+    expect(await rollback(w.ctx(), { yes: true })).toBe(1);
+    const text = w.err.join("\n");
+    const copy = join(w.paths.backups, snap.id, "config.json");
+    expect(text).toContain(`Snapshot ${snap.id} of the unfinished update 0.1.0 → 0.2.0 cannot be recovered automatically`);
+    expect(text).toContain(`${copy}: it is not valid JSON`);
+    expect(text).toContain("Nothing was changed.");
+    expect(text).toContain(`fix: Repair ${copy}`);
+    expect(tree(w.paths.home)).toEqual(before);
+    expect(readFileSync(w.paths.txn, "utf8")).toBe(journal);
+    expect(w.log.some((l) => l.startsWith("npm ") || l.startsWith("node "))).toBe(false);
   });
 
   it("a journal of a kind this release does not know is recovered like any other (R13)", async () => {
