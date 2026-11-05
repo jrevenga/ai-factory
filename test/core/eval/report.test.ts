@@ -99,7 +99,7 @@ describe("buildReport", () => {
     const r = buildReport(m, recs(m.evalRunId, ["a", "b"], true), THRESHOLDS, {
       incomplete: null,
       now: NOW,
-      confirming: [{ manifest: cm, records: recs(cm.evalRunId, ["h1"], true) }],
+      confirming: [{ manifest: cm, records: recs(cm.evalRunId, ["h1"], true), incomplete: null }],
     });
     const c = r.comparisons[0];
     expect(c?.confirmedBy).toBe(cm.evalRunId);
@@ -112,7 +112,7 @@ describe("buildReport", () => {
     const r = buildReport(m, recs(m.evalRunId, ["a", "b"], true), THRESHOLDS, {
       incomplete: null,
       now: NOW,
-      confirming: [{ manifest: cm, records: recs("conf", ["h1"], false) }],
+      confirming: [{ manifest: cm, records: recs("conf", ["h1"], false), incomplete: null }],
     });
     expect(r.comparisons[0]?.confirmedBy).toBeNull();
     expect(r.comparisons[0]?.verdict.eligible).toBe(false);
@@ -121,11 +121,11 @@ describe("buildReport", () => {
   it("public exposure in the run or the confirming run blocks eligibility", () => {
     const m = manifest({ exposure: "public" });
     const cm = manifest({ id: "conf", taskIds: ["h1"] });
-    const r = buildReport(m, recs(m.evalRunId, ["a", "b"], true), THRESHOLDS, { incomplete: null, now: NOW, confirming: [{ manifest: cm, records: recs("conf", ["h1"], true) }] });
+    const r = buildReport(m, recs(m.evalRunId, ["a", "b"], true), THRESHOLDS, { incomplete: null, now: NOW, confirming: [{ manifest: cm, records: recs("conf", ["h1"], true), incomplete: null }] });
     expect(r.comparisons[0]?.verdict.eligible).toBe(false);
     const m2 = manifest();
     const cm2 = manifest({ id: "conf", taskIds: ["h1"], exposure: "public" });
-    const r2 = buildReport(m2, recs(m2.evalRunId, ["a", "b"], true), THRESHOLDS, { incomplete: null, now: NOW, confirming: [{ manifest: cm2, records: recs("conf", ["h1"], true) }] });
+    const r2 = buildReport(m2, recs(m2.evalRunId, ["a", "b"], true), THRESHOLDS, { incomplete: null, now: NOW, confirming: [{ manifest: cm2, records: recs("conf", ["h1"], true), incomplete: null }] });
     expect(r2.comparisons[0]?.verdict.eligible).toBe(false);
   });
 
@@ -135,10 +135,82 @@ describe("buildReport", () => {
     const r = buildReport(m, recs(m.evalRunId, ["a", "b"], true), THRESHOLDS, {
       incomplete: { reason: "token budget reached" },
       now: NOW,
-      confirming: [{ manifest: cm, records: recs("conf", ["h1"], true) }],
+      confirming: [{ manifest: cm, records: recs("conf", ["h1"], true), incomplete: null }],
     });
     expect(r.incomplete).toEqual({ reason: "token budget reached" });
     expect(r.comparisons[0]?.verdict.eligible).toBe(false);
+  });
+});
+
+describe("confirmation eligibility (R74)", () => {
+  const build = (cm: EvalRunManifest, cr: EvalRunRecord[], m = manifest()) =>
+    buildReport(m, recs(m.evalRunId, ["a", "b"], true), THRESHOLDS, { incomplete: null, now: NOW, confirming: [{ manifest: cm, records: cr, incomplete: null }] }).comparisons[0];
+  const m0 = manifest();
+
+  it("a 1-rep confirmation does not confirm", () => {
+    const cm = manifest({ id: "conf", taskIds: ["h1"], confirms: m0.evalRunId });
+    const one = recs("conf", ["h1"], true, 1).map((r) => (r.contender === "claude-code" ? { ...r, pass: false } : r));
+    const c = build(cm, one);
+    expect(c?.confirmedBy).toBeNull();
+    expect(c?.verdict.eligible).toBe(false);
+  });
+  it("a confirmation with a usageMissing run does not confirm", () => {
+    const cm = manifest({ id: "conf", taskIds: ["h1"], confirms: m0.evalRunId });
+    const cr = recs("conf", ["h1"], true);
+    cr[0] = { ...(cr[0] as EvalRunRecord), usage: {}, usageMissing: true };
+    expect(build(cm, cr)?.confirmedBy).toBeNull();
+  });
+  it("a confirmation whose confirms names another run does not confirm", () => {
+    const cm = manifest({ id: "conf", taskIds: ["h1"], confirms: "other-run" });
+    const c = build(cm, recs("conf", ["h1"], true));
+    expect(c?.confirmedBy).toBeNull();
+    expect(c?.verdict.eligible).toBe(false);
+  });
+  it("an incomplete confirmation does not confirm", () => {
+    const cm = manifest({ id: "conf", taskIds: ["h1"], confirms: m0.evalRunId });
+    const r = buildReport(m0, recs(m0.evalRunId, ["a", "b"], true), THRESHOLDS, {
+      incomplete: null,
+      now: NOW,
+      confirming: [{ manifest: cm, records: recs("conf", ["h1"], true), incomplete: { reason: "token budget reached" } }],
+    });
+    expect(r.comparisons[0]?.confirmedBy).toBeNull();
+  });
+  it("a confirmation with a different profile does not confirm", () => {
+    const cm = { ...manifest({ id: "conf", taskIds: ["h1"], confirms: m0.evalRunId }), profile: "claude-only" } as unknown as EvalRunManifest;
+    expect(build(cm, recs("conf", ["h1"], true))?.confirmedBy).toBeNull();
+  });
+  it("a valid confirmation confirms", () => {
+    const cm = manifest({ id: "conf", taskIds: ["h1"], confirms: m0.evalRunId });
+    const c = build(cm, recs("conf", ["h1"], true));
+    expect(c?.confirmedBy).toBe("conf");
+    expect(c?.verdict.eligible).toBe(true);
+  });
+});
+
+describe("quota summary (R76)", () => {
+  it("counts known, unknown and exhausted runs per provider", () => {
+    const m = manifest();
+    const rs = recs(m.evalRunId, ["a"], true, 3).filter((r) => r.contender === "claude-code");
+    rs[0] = { ...(rs[0] as EvalRunRecord), quota: { claude: { state: "known", utilization: 0.4 } } };
+    rs[1] = { ...(rs[1] as EvalRunRecord), quota: { claude: { state: "exhausted" } } };
+    // rs[2] has claude usage but no quota entry: unknown.
+    const r = buildReport(m, rs, THRESHOLDS, { incomplete: null, now: NOW });
+    expect(r.summaries.find((s) => s.contender === "claude-code")?.quota).toEqual({ claude: { known: 1, unknown: 1, exhausted: 1 } });
+  });
+  it("Markdown states unknown quota in words", () => {
+    const m = manifest();
+    const rs = recs(m.evalRunId, ["a"], true, 3);
+    const md = renderMarkdown(buildReport(m, rs, THRESHOLDS, { incomplete: null, now: NOW }));
+    expect(md).toContain("claude quota: unknown in 3 of 3 runs");
+  });
+  it("Markdown states known and exhausted counts", () => {
+    const m = manifest();
+    const rs = recs(m.evalRunId, ["a"], true, 3).filter((r) => r.contender === "claude-code");
+    rs[0] = { ...(rs[0] as EvalRunRecord), quota: { claude: { state: "known", utilization: 0.4 } } };
+    rs[1] = { ...(rs[1] as EvalRunRecord), quota: { claude: { state: "known", utilization: 0.5 } } };
+    rs[2] = { ...(rs[2] as EvalRunRecord), quota: { claude: { state: "exhausted" } } };
+    const md = renderMarkdown(buildReport(m, rs, THRESHOLDS, { incomplete: null, now: NOW }));
+    expect(md).toContain("claude quota: known in 2, exhausted in 1");
   });
 });
 
@@ -187,6 +259,11 @@ describe("renderMarkdown", () => {
       - Eligible for a claim: no — regression alarm only — no superiority claim
       - Held-out confirmation: none
 
+      ## Quota
+
+      - claude-code (small) claude quota: unknown in 5 of 5 runs
+      - pi-bridge (small) claude quota: unknown in 6 of 6 runs
+
       ## Per task
 
       | Task | Contender | Runs | Passes | Gates hit |
@@ -203,6 +280,11 @@ describe("renderMarkdown", () => {
     const m = manifest();
     const rs = recs(m.evalRunId, ["a"], true, 1).map((x) => ({ ...x, exit: "skipped-budget" as const }));
     const md = renderMarkdown(buildReport(m, rs, THRESHOLDS, { incomplete: null, now: NOW }));
-    expect(md).toContain("n/a");
+    const line = md.split("\n").find((l) => l.startsWith("| claude-code |")) ?? "";
+    const cells = line.slice(2, -2).split(" | ");
+    const col = (name: string): string | undefined => cells[["Contender", "Runs", "Pass rate", "SD", "Escaped defects", "Usage claude", "Usage codex", "Wall median", "Errors", "Gates hit", "Notes"].indexOf(name)];
+    expect(col("Runs")).toBe("0");
+    for (const name of ["Pass rate", "SD", "Escaped defects", "Usage claude", "Usage codex", "Wall median", "Gates hit"]) expect(col(name), name).toBe("n/a");
+    expect(col("Errors")).toBe("0 / 0");
   });
 });

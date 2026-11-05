@@ -42,7 +42,7 @@ export type EvalReport = z.infer<typeof EvalReport>;
 export type ReportOptions = {
   incomplete: { reason: string } | null;
   now: Date;
-  confirming?: { manifest: EvalRunManifest; records: EvalRunRecord[] }[];
+  confirming?: { manifest: EvalRunManifest; records: EvalRunRecord[]; incomplete: { reason: string } | null }[];
 };
 
 const allPrivate = (m: EvalRunManifest): boolean => m.tasks.every((t) => t.exposure === "private");
@@ -62,25 +62,33 @@ export function buildReport(
       for (const { id: candidate } of manifest.contenders) {
         if (candidate === reference) continue;
         const c = pairedComparison(records, candidate, reference, manifest.seed);
-        // Held-out clause ignored: only the confirming run's own `improved` matters (ruling 23).
+        // A confirming run counts only when it names this run, is complete, matches the profile and
+        // contenders, and is itself improved and eligible with the held-out clause bypassed (R74).
         const confirmations = confirming.map((conf) => {
-          const cc = pairedComparison(conf.records, candidate, reference, conf.manifest.seed);
+          const cm = conf.manifest;
+          const applies =
+            cm.confirms === manifest.evalRunId &&
+            conf.incomplete === null &&
+            cm.profile === manifest.profile &&
+            cm.contenders.some((x) => x.id === candidate) &&
+            cm.contenders.some((x) => x.id === reference);
+          if (!applies) return { conf, ok: false };
+          const cc = pairedComparison(conf.records, candidate, reference, cm.seed);
           const v = verdict(cc, thresholds, {
-            suite: conf.manifest.suite,
+            suite: cm.suite,
             complete: true,
-            manifestTaskIds: conf.manifest.tasks.map((t) => t.id),
-            allPrivate: true,
+            manifestTaskIds: cm.tasks.map((t) => t.id),
+            allPrivate: allPrivate(cm),
             heldoutConfirmed: true,
           });
-          return { conf, improved: v.improved };
+          return { conf, ok: v.improved && v.eligible };
         });
-        const confirmed = confirmations.find((x) => x.improved);
-        const privateOnly = allPrivate(manifest) && (confirmed ? allPrivate(confirmed.conf.manifest) : confirming.every((x) => allPrivate(x.manifest)));
+        const confirmed = confirmations.find((x) => x.ok);
         const v = verdict(c, thresholds, {
           suite: manifest.suite,
           complete: opts.incomplete === null,
           manifestTaskIds: manifest.tasks.map((t) => t.id),
-          allPrivate: privateOnly,
+          allPrivate: allPrivate(manifest),
           heldoutConfirmed: confirmed !== undefined,
         });
         comparisons.push({ ...c, verdict: v, confirmedBy: confirmed?.conf.manifest.evalRunId ?? null });
@@ -114,6 +122,12 @@ const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}
 function usageCell(s: ContenderSummary, p: ProviderId): string {
   const u = s.usage[p];
   return u ? `${Math.round(u.median)} (IQR ${Math.round(u.iqr[0])}-${Math.round(u.iqr[1])}, n=${u.n})` : NA;
+}
+type QuotaCounts = { known: number; unknown: number; exhausted: number };
+function quotaText(q: QuotaCounts): string {
+  if (q.known === 0 && q.exhausted === 0) return `unknown in ${q.unknown} of ${q.known + q.unknown + q.exhausted} runs`;
+  const parts = [`known in ${q.known}`, ...(q.exhausted > 0 ? [`exhausted in ${q.exhausted}`] : []), ...(q.unknown > 0 ? [`unknown in ${q.unknown}`] : [])];
+  return parts.join(", ");
 }
 function ratioCell(rec: Partial<Record<ProviderId, number>>): string {
   const parts = PROVIDER_IDS.filter((p) => rec[p] !== undefined).map((p) => `${p} ${(rec[p] as number).toFixed(2)}`);
@@ -186,7 +200,7 @@ export function renderMarkdown(r: EvalReport): string {
         `- Escaped-defects difference: ${c.escapedDefectsDiff.toFixed(2)}`,
         `- Usage ratio per provider: ${c.usageComplete ? ratioCell(c.usageRatio) : `${ratioCell(c.usageRatio)} (usage coverage incomplete)`}`,
         `- Extra usage (providers only the candidate used, median tokens per task): ${ratioCell(c.extraUsage)}`,
-        `- Wall-time ratio: ${c.wallRatio.toFixed(2)}`,
+        `- Wall-time ratio: ${c.wallRatio === null ? `${NA} (no measurable reference wall time)` : c.wallRatio.toFixed(2)}`,
         `- Verdict: ${c.verdict.improved ? `improved (${c.verdict.branch} branch)` : "not improved"}${c.verdict.regressions.length > 0 ? `; regressions: ${c.verdict.regressions.join(", ")}` : ""}`,
         `- Eligible for a claim: ${c.verdict.eligible ? "yes" : "no"} — ${c.verdict.note}`,
         `- Held-out confirmation: ${c.confirmedBy ?? "none"}`,
@@ -194,6 +208,11 @@ export function renderMarkdown(r: EvalReport): string {
       );
     }
   }
+
+  const quotaLines = r.summaries.flatMap((s) =>
+    PROVIDER_IDS.filter((p) => s.quota[p] !== undefined).map((p) => `- ${s.contender} (${s.tier}) ${p} quota: ${quotaText(s.quota[p] as QuotaCounts)}`),
+  );
+  if (quotaLines.length > 0) L.push("## Quota", "", ...quotaLines, "");
 
   L.push("## Per task", "");
   L.push(...table(["Task", "Contender", "Runs", "Passes", "Gates hit"], r.perTask.map((t) => [t.taskId, t.contender, String(t.runs), String(t.passes), String(t.gatesHit)])), "");

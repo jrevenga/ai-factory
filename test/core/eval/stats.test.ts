@@ -231,6 +231,25 @@ function cmp(o: Partial<Comparison> = {}): Comparison {
 }
 const CTX = { suite: "full", complete: true, manifestTaskIds: ["a", "b", "c"], allPrivate: true, heldoutConfirmed: true };
 
+describe("wall ratio fail-safe (R75)", () => {
+  it("is null when a compared task has a non-positive reference wall time", () => {
+    const rs: EvalRunRecord[] = [];
+    for (let k = 0; k < 5; k++) {
+      rs.push(rec("a", "claude-code", k, { wallMs: 0, pass: false, usage: claude(100) }));
+      rs.push(rec("a", "pi-bridge", k, { wallMs: 1000, pass: true, usage: claude(100) }));
+    }
+    const c = pairedComparison(rs, "pi-bridge", "claude-code", 7);
+    expect(c.wallRatio).toBeNull();
+    const v = verdict(c, THRESHOLDS, { ...CTX, manifestTaskIds: ["a"] });
+    expect(v.improved).toBe(false);
+    expect(v.eligible).toBe(false);
+    expect(v.regressions).toContain("wallTimeIncreasePct");
+  });
+  it("is null with no compared tasks", () => {
+    expect(pairedComparison([], "pi-bridge", "claude-code", 7).wallRatio).toBeNull();
+  });
+});
+
 describe("verdict boundaries", () => {
   it("pass-rate branch: 5 is not improved, 5.01 is", () => {
     expect(verdict(cmp({ passRateDiffPp: 5 }), THRESHOLDS, CTX).improved).toBe(false);

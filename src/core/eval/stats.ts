@@ -27,6 +27,8 @@ export const ContenderSummary = z.strictObject({
   gatesHitMean: z.number().nullable(),
   leakSuspect: z.boolean(),
   skippedBudget: z.int().min(0),
+  /** Per provider, counted runs by quota state; a run with usage but no quota entry counts as unknown (R76). */
+  quota: z.partialRecord(ProviderId, z.strictObject({ known: z.int().min(0), unknown: z.int().min(0), exhausted: z.int().min(0) })),
 });
 export type ContenderSummary = z.infer<typeof ContenderSummary>;
 
@@ -43,7 +45,8 @@ export const Comparison = z.strictObject({
   usageRatio: z.partialRecord(ProviderId, z.number()),
   /** Providers only the candidate used: median per-task absolute usage (R73). */
   extraUsage: z.partialRecord(ProviderId, z.number()),
-  wallRatio: z.number(),
+  /** Null when no task has a positive reference wall time to compare against (R75). */
+  wallRatio: z.number().nullable(),
 });
 export type Comparison = z.infer<typeof Comparison>;
 
@@ -99,6 +102,22 @@ export function aggregate(records: EvalRunRecord[], manifest: EvalRunManifest): 
         const totals = runs.filter((r) => !r.usageMissing && r.usage[p]).map((r) => total(r.usage[p] as Usage));
         if (totals.length > 0) usage[p] = { median: median(totals), iqr: [quantile(totals, 0.25), quantile(totals, 0.75)], n: totals.length };
       }
+      const quota: ContenderSummary["quota"] = {};
+      for (const p of PROVIDER_IDS) {
+        const q = { known: 0, unknown: 0, exhausted: 0 };
+        let any = false;
+        for (const r of runs) {
+          const st = r.quota[p];
+          if (st) {
+            q[st.state]++;
+            any = true;
+          } else if (r.usage[p]) {
+            q.unknown++;
+            any = true;
+          }
+        }
+        if (any) quota[p] = q;
+      }
       const has = runs.length > 0;
       out.push({
         contender,
@@ -115,6 +134,7 @@ export function aggregate(records: EvalRunRecord[], manifest: EvalRunManifest): 
         gatesHitMean: has ? mean(runs.map((r) => r.gatesHit)) : null,
         leakSuspect: runs.some((r) => r.leakSuspect),
         skippedBudget: all.length - runs.length,
+        quota,
       });
     }
   }
@@ -198,7 +218,7 @@ export function pairedComparison(
   const extraUsage: Comparison["extraUsage"] = {};
   for (const p of candProviders) extraUsage[p] = median(pairs.map((x) => x.c.usage[p] ?? 0));
 
-  const wallRatios = pairs.filter((x) => x.r.wall > 0).map((x) => x.c.wall / x.r.wall);
+  const wallMeasurable = n > 0 && pairs.every((x) => x.r.wall > 0);
   return {
     candidate,
     reference,
@@ -210,7 +230,7 @@ export function pairedComparison(
     escapedDefectsDiff: n === 0 ? 0 : mean(pairs.map((x) => x.c.escaped - x.r.escaped)),
     usageRatio,
     extraUsage,
-    wallRatio: wallRatios.length === 0 ? 1 : median(wallRatios),
+    wallRatio: wallMeasurable ? median(pairs.map((x) => x.c.wall / x.r.wall)) : null,
   };
 }
 
@@ -224,7 +244,7 @@ export function verdict(c: Comparison, t: EvalThresholds, ctx: VerdictContext): 
 
   const common: string[] = [];
   if (c.escapedDefectsDiff > t.secondary.escapedDefectsIncrease) common.push("escapedDefectsIncrease");
-  if (c.wallRatio > wallCut) common.push("wallTimeIncreasePct");
+  if (c.wallRatio === null || c.wallRatio > wallCut) common.push("wallTimeIncreasePct");
 
   const prRegressions = ratios.some((r) => r > usageUpCut) ? [...common, "usageIncreasePct"] : common;
   const prImproved = c.passRateDiffPp > t.passRatePp && prRegressions.length === 0;
@@ -250,6 +270,7 @@ export function verdict(c: Comparison, t: EvalThresholds, ctx: VerdictContext): 
   else if (!c.usageComplete) note = "not eligible: usage coverage is incomplete";
   else if (!ctx.allPrivate) note = "not eligible: claims rely on private tasks only";
   else if (!ctx.heldoutConfirmed) note = "not eligible: no held-out confirmation";
+  else if (!improved) note = "not eligible: no improvement over the reference";
   else note = "eligible";
 
   return { branch, improved, regressions, eligible: note === "eligible", note };

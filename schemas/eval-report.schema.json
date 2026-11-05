@@ -489,6 +489,42 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991
+          },
+          "quota": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "enum": [
+                "claude",
+                "codex"
+              ]
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "known": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "unknown": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "exhausted": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "known",
+                "unknown",
+                "exhausted"
+              ],
+              "additionalProperties": false
+            }
           }
         },
         "required": [
@@ -505,7 +541,8 @@
           "timeouts",
           "gatesHitMean",
           "leakSuspect",
-          "skippedBudget"
+          "skippedBudget",
+          "quota"
         ],
         "additionalProperties": false
       }
@@ -601,7 +638,10 @@
             }
           },
           "wallRatio": {
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "verdict": {
             "type": "object",
