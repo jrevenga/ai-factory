@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "id": "alpha",
+  "title": "Alpha fixture task",
+  "tier": "small",
+  "split": "dev",
+  "suites": ["smoke"],
+  "snapshot": { "kind": "dir" },
+  "prompt": "Make add() return the sum.",
+  "checks": [{ "name": "sum", "argv": ["node", "test/sum.hidden.mjs"], "timeoutSec": 30 }],
+  "budget": { "wallSec": 120 }
+}

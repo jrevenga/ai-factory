@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "broken",
+  "title": "Missing tier and snapshot",
+  "split": "dev",
+  "suites": ["smoke"],
+  "prompt": "x",
+  "checks": [{ "name": "c", "argv": ["node", "-v"] }],
+  "budget": { "wallSec": 120 }
+}
