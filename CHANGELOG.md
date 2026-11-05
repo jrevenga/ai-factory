@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-11-05
 
 - Hard gates in the Pi `tool_call` hook: command classification, secret and outside-root paths, destructive, remote-mutating and integration operations; ask with a timed human confirmation, deny without a UI.
 - Route state with write roots per route, `.factory/` rules and machine-owned blocks; `set_route` and `task_progress` tools.
