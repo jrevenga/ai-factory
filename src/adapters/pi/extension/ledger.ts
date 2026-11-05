@@ -423,7 +423,55 @@ function lockHolderAlive(view: LockView, isAlive: (pid: number) => boolean): boo
 const sameLock = (a: LockView, b: LockView | undefined): boolean => b !== undefined && a.owner === b.owner && (a.ino === 0 || b.ino === 0 || a.ino === b.ino);
 
 /** Test seam: called after a contender judged the holder dead (`inspected`) and after its takeover rename (`renamed`). */
-export type ReplayLockStep = (step: "inspected" | "renamed") => void;
+export type ReplayLockStep = (step: "inspected" | "displaced" | "renamed" | "acquired") => void;
+
+/**
+ * Fix round 3 (R51): scan the retained `replay.lock.stale-*` directories of `runDir`. A directory whose owner is dead
+ * is pruned; one whose owner is alive, or whose owner record cannot be read, is a replay that may still be running
+ * (a lock displaced by a contender with a stale view), so it blocks admission (true: back off). A directory with no
+ * owner record yet counts as live for the grace period, like the canonical lock.
+ */
+function staleLockBlocks(runDir: string, isAlive: (pid: number) => boolean): boolean {
+  let names: string[];
+  try {
+    names = readdirSync(runDir).filter((n) => n.startsWith(`${REPLAY_LOCK}.stale-`));
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return false;
+    return true;
+  }
+  let blocks = false;
+  for (const name of names) {
+    const dir = join(runDir, name);
+    let text: string | undefined;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = lstatSync(dir).mtimeMs;
+      text = readFileSync(join(dir, LOCK_OWNER), "utf8");
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" && text === undefined && existsSync(dir)) {
+        // No owner record: live while recent, dead after the grace period.
+        if (Date.now() - mtimeMs < OWNERLESS_LOCK_GRACE_MS) blocks = true;
+        else rmSync(dir, { recursive: true, force: true });
+      } else if (code !== "ENOENT") blocks = true; // unreadable: fail closed
+      continue;
+    }
+    let pid: unknown;
+    try {
+      pid = (JSON.parse(text) as { pid?: unknown }).pid;
+    } catch {
+      pid = undefined;
+    }
+    if (typeof pid !== "number") {
+      blocks = true; // unreadable owner: fail closed
+      continue;
+    }
+    if (lockHolderAlive({ ino: 0, owner: text, mtimeMs }, isAlive)) blocks = true;
+    else rmSync(dir, { recursive: true, force: true });
+  }
+  return blocks;
+}
 
 /**
  * Fix round 2 (R50.3): the exclusive right to replay the reconciles of the interrupted run in `runDir`, so two Pi
@@ -440,6 +488,8 @@ export function acquireReplayLock(runDir: string, selfRunId: string, isAlive: (p
   const m = RUN_ID.test(selfRunId) ? /-(\d+)$/.exec(selfRunId) : null;
   const pid = m ? Number(m[1]) : process.pid;
   const start = pid === process.pid ? processStart(pid) : undefined;
+  // Fix round 3 (R51): a retained displaced directory with a live owner means a replay may still be running.
+  if (staleLockBlocks(runDir, isAlive)) return false;
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
     try {
       mkdirSync(lock, { mode: 0o700 });
@@ -457,6 +507,7 @@ export function acquireReplayLock(runDir: string, selfRunId: string, isAlive: (p
         if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw err;
       }
+      step?.("displaced");
       if (!sameLock(seen, viewLock(stale))) {
         // A stale view: the directory renamed is a newer holder's. Give it back; this contender loses.
         try {
@@ -470,17 +521,41 @@ export function acquireReplayLock(runDir: string, selfRunId: string, isAlive: (p
       step?.("renamed");
       continue;
     }
+    const ownerText = `${JSON.stringify({ runId: selfRunId, pid, ...(start !== undefined ? { start } : {}) })}\n`;
     try {
-      writeFileSync(join(lock, LOCK_OWNER), `${JSON.stringify({ runId: selfRunId, pid, ...(start !== undefined ? { start } : {}) })}\n`, { flag: "wx", mode: 0o600 });
+      writeFileSync(join(lock, LOCK_OWNER), ownerText, { flag: "wx", mode: 0o600 });
     } catch (e) {
       const code = (e as NodeJS.ErrnoException).code;
       // The directory was replaced or taken over before the owner record landed: another contender holds it.
       if (code === "EEXIST" || code === "ENOENT") return false;
       throw e;
     }
+    const mine = viewLock(lock);
+    step?.("acquired");
+    // Fix round 3 (R51): recheck that the canonical lock is still ours and that no displaced live owner exists.
+    const now = viewLock(lock);
+    if (mine === undefined || mine.owner !== ownerText || now === undefined || now.ino !== mine.ino || now.owner !== ownerText || staleLockBlocks(runDir, isAlive)) {
+      releaseOwnReplayLock(runDir, mine?.ino, ownerText);
+      return false;
+    }
     return true;
   }
   return false;
+}
+
+/** Remove the directories (canonical or displaced) that are the one this contender created (same inode and owner). */
+function releaseOwnReplayLock(runDir: string, ino: number | undefined, ownerText: string): void {
+  if (ino === undefined) return;
+  let names: string[] = [];
+  try {
+    names = readdirSync(runDir).filter((n) => n === REPLAY_LOCK || n.startsWith(`${REPLAY_LOCK}.stale-`));
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    const v = viewLock(join(runDir, n));
+    if (v !== undefined && v.ino === ino && v.owner === ownerText) rmSync(join(runDir, n), { recursive: true, force: true });
+  }
 }
 
 /** The lock in `runDir` is held by `selfRunId` (a holder re-checks it before each replayed manifest). */

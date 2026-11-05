@@ -253,6 +253,59 @@ describe("acquireReplayLock (fix round 2, R50.3)", () => {
     expect(holdsReplayLock(runDir, B)).toBe(true);
   });
 
+  it("fix round 3 (R51): a third contender cannot admit a replay in the window where a stale-view contender has displaced a live holder's lock", async () => {
+    const runDir = await lockedByDeadX();
+    let b: boolean | undefined;
+    let c: boolean | undefined;
+    // A judges X dead and pauses; B takes over; A renames B's live lock away; C tries in the window.
+    const a = acquireReplayLock(runDir, A, alive, (step) => {
+      if (step === "inspected" && b === undefined) b = acquireReplayLock(runDir, B, alive);
+      if (step === "displaced") c = acquireReplayLock(runDir, C, alive);
+    });
+    expect(b).toBe(true);
+    expect(c).toBe(false);
+    expect(a).toBe(false);
+    expect(holdsReplayLock(runDir, B)).toBe(true);
+    expect(holdsReplayLock(runDir, C)).toBe(false);
+    expect(lockNames(runDir)).toEqual([REPLAY_LOCK]);
+  });
+
+  it("fix round 3 (R51): a displaced live-owner directory that was never given back blocks admission and is never deleted", async () => {
+    const runDir = await lockedByDeadX();
+    expect(acquireReplayLock(runDir, B, alive)).toBe(true);
+    renameSync(join(runDir, REPLAY_LOCK), join(runDir, `${REPLAY_LOCK}.stale-aaaa`));
+    expect(acquireReplayLock(runDir, C, alive)).toBe(false);
+    expect(lockNames(runDir)).toEqual([`${REPLAY_LOCK}.stale-aaaa`]);
+    expect(JSON.parse(readFileSync(join(runDir, `${REPLAY_LOCK}.stale-aaaa`, "owner"), "utf8")).runId).toBe(B);
+  });
+
+  it("fix round 3 (R51): the lock is rechecked after acquiring; if it was displaced meanwhile the contender releases and backs off", async () => {
+    const runDir = join(await home(), "run");
+    mkdirSync(runDir, { recursive: true });
+    const a = acquireReplayLock(runDir, A, alive, (step) => {
+      if (step === "acquired") renameSync(join(runDir, REPLAY_LOCK), join(runDir, `${REPLAY_LOCK}.stale-bbbb`));
+    });
+    expect(a).toBe(false);
+    expect(holdsReplayLock(runDir, A)).toBe(false);
+    expect(lockNames(runDir)).toEqual([]);
+  });
+
+  it("fix round 3 (R51): stale directories whose owner is dead are pruned, and admission proceeds", async () => {
+    const runDir = join(await home(), "run");
+    mkdirSync(join(runDir, `${REPLAY_LOCK}.stale-dead1`), { recursive: true });
+    writeFileSync(join(runDir, `${REPLAY_LOCK}.stale-dead1`, "owner"), JSON.stringify({ runId: X, pid: 40 }));
+    expect(acquireReplayLock(runDir, A, alive)).toBe(true);
+    expect(lockNames(runDir)).toEqual([REPLAY_LOCK]);
+  });
+
+  it("fix round 3 (R51): an unreadable owner file in a stale directory blocks admission (fail closed)", async () => {
+    const runDir = join(await home(), "run");
+    mkdirSync(join(runDir, `${REPLAY_LOCK}.stale-junk`), { recursive: true });
+    writeFileSync(join(runDir, `${REPLAY_LOCK}.stale-junk`, "owner"), "{not json");
+    expect(acquireReplayLock(runDir, A, alive)).toBe(false);
+    expect(lockNames(runDir)).toEqual([`${REPLAY_LOCK}.stale-junk`]);
+  });
+
   it("an ownerless lock directory counts as held while recent, and as dead after the grace period", async () => {
     const runDir = join(await home(), "run");
     mkdirSync(join(runDir, REPLAY_LOCK), { recursive: true });
