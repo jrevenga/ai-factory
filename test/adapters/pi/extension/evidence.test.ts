@@ -285,9 +285,14 @@ describe("fingerprint (ruling 11)", () => {
     writeFileSync(index, "old entries");
     utimesSync(index, old, old);
     copyIndexKeepingMtime(index, copy, () => {
-      // Git writes `index.lock` and renames it over the index.
+      // Git writes `index.lock` and renames it over the index. Windows refuses to replace a file that is open, so there
+      // the replacement cannot happen while the copy is taken.
       writeFileSync(join(t.dir, "index.lock"), "new entries, newer time");
-      renameSync(join(t.dir, "index.lock"), index);
+      try {
+        renameSync(join(t.dir, "index.lock"), index);
+      } catch (e) {
+        if (!isWin || (e as NodeJS.ErrnoException).code !== "EPERM") throw e;
+      }
     });
     expect(readFileSync(copy, "utf8")).toBe("old entries");
     expect(statSync(copy).mtimeMs).toBeLessThanOrEqual(old.getTime());
