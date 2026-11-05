@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensurePrivateDir, evalPaths } from "../../../src/adapters/eval/paths.ts";
@@ -80,6 +80,25 @@ describe("loadTasks", () => {
     expect(() => loadTasks([{ dir: root, source: "private" }])).toThrow(/other/);
   });
 
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fails on an unreadable root or entry instead of skipping it, naming the path", async () => {
+    const parent = join(tmp.dir, "parent");
+    const root = join(parent, "root");
+    await mkdir(join(root, "alpha", "repo"), { recursive: true });
+    await writeFile(join(root, "alpha", "task.json"), await readFile(join(FIX, "good", "alpha", "task.json")));
+    try {
+      // entries cannot be stat-ed: the root lists but is not searchable
+      await chmod(root, 0o600);
+      expect(() => loadTasks([{ dir: root, source: "private" }])).toThrow(new RegExp(esc(join(root, "alpha"))));
+      await chmod(root, 0o700);
+      // the root itself cannot be stat-ed: its parent is not searchable
+      await chmod(parent, 0o000);
+      expect(() => loadTasks([{ dir: root, source: "private" }])).toThrow(new RegExp(esc(root)));
+    } finally {
+      await chmod(parent, 0o700);
+      await chmod(root, 0o700);
+    }
+  });
+
   it("accepts a git snapshot without repo/ and without solution/", async () => {
     const root = join(tmp.dir, "root");
     await mkdir(join(root, "gamma"), { recursive: true });
@@ -116,6 +135,16 @@ describe("hashTree", () => {
     await writeFile(join(a, "f"), "X");
     await writeFile(join(a, "g"), "Y");
     await writeFile(join(b, "f"), "Xg\0Y");
+    expect(hashTree(a)).not.toBe(hashTree(b));
+  });
+
+  it.skipIf(process.platform === "win32")("hashes symlink targets verbatim: a\\b and a/b differ", async () => {
+    const a = join(tmp.dir, "a");
+    const b = join(tmp.dir, "b");
+    await mkdir(a);
+    await mkdir(b);
+    await symlink("a\\b", join(a, "l"));
+    await symlink("a/b", join(b, "l"));
     expect(hashTree(a)).not.toBe(hashTree(b));
   });
 

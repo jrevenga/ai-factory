@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,6 +6,7 @@ import { runBounded } from "../../../src/adapters/platform/process.ts";
 import { bwrapUsable, type SandboxSpec } from "../../../src/adapters/eval/sandbox.ts";
 import { loadTasks, type LoadedTask } from "../../../src/adapters/eval/tasks.ts";
 import { controllerGit, controllerGitEnv } from "../../../src/adapters/eval/git-isolated.ts";
+import { CheckResult } from "../../../src/core/eval/records.ts";
 import { EvalTask } from "../../../src/core/eval/task.ts";
 import { buildVerifyTree, diffStat, materialize, overlayChecks, runChecks } from "../../../src/adapters/eval/workspace.ts";
 import { makeTmp, type Tmp } from "../../helpers/tmp.ts";
@@ -15,18 +16,26 @@ const win = process.platform === "win32";
 const bwrap = await bwrapUsable();
 
 let tmp: Tmp;
+let fixHome: Tmp;
+let fixEnv: NodeJS.ProcessEnv;
 beforeEach(async () => {
   tmp = await makeTmp("eval-ws");
+  fixHome = await makeTmp("eval-ws-home");
+  const emptyConfig = join(fixHome.dir, "empty-gitconfig");
+  await writeFile(emptyConfig, "");
+  fixEnv = { PATH: process.env.PATH, HOME: fixHome.dir, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: emptyConfig, ...IDENT };
+  for (const k of ["SystemRoot", "ComSpec", "TEMP", "TMP", "PATHEXT"]) if (process.env[k] !== undefined) fixEnv[k] = process.env[k];
 });
 afterEach(async () => {
   await tmp.cleanup();
+  await fixHome.cleanup();
 });
 
 const IDENT = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t.invalid" };
 
-/** Plain git for building fixtures; never used on anything an agent controls. */
+/** Plain git for building fixtures with an isolated HOME and git config; never used on anything an agent controls. */
 async function plainGit(cwd: string, args: string[]): Promise<string> {
-  const r = await runBounded("git", args, { cwd, env: { ...process.env, ...IDENT }, timeoutMs: 30_000 });
+  const r = await runBounded("git", args, { cwd, env: fixEnv, timeoutMs: 30_000 });
   if (r.code !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
   return r.stdout.trim();
 }
@@ -148,7 +157,7 @@ describe("materialize", () => {
 });
 
 describe("buildVerifyTree and diffStat", () => {
-  it("counts one modified and one new file, unchanged by overlayChecks", async () => {
+  it("counts one modified and one new file; the result measures the agent's changes (diffStat is called before overlayChecks)", async () => {
     const s = await setup();
     await writeFile(join(s.ws, "add.mjs"), "export const add = (a, b) => a + b;\nexport const extra = 1;\n");
     await writeFile(join(s.ws, "new.txt"), "n1\nn2\nn3\n");
@@ -160,8 +169,8 @@ describe("buildVerifyTree and diffStat", () => {
     await overlayChecks(dirTask(), s.verify, "all done\n");
     expect(existsSync(join(s.verify, "test", "sum.hidden.mjs"))).toBe(true);
     expect(await readFile(join(s.verify, ".eval", "final-message.txt"), "utf8")).toBe("all done\n");
-    // Order matters: recomputing after the overlay would also count the withheld check files.
-    expect(await diffStat(s.verify, s.baseSha)).toEqual({ files: 3, insertions: 7, deletions: 1 });
+    // the earlier result is the agent-only count; it is a plain value that the overlay cannot change
+    expect(before).toEqual({ files: 2, insertions: 5, deletions: 1 });
   });
 
   it("excludes .eval from the stat", async () => {
@@ -289,7 +298,7 @@ describe("C1 regression: agent-planted git configuration never executes on the c
     const markers = join(tmp.dir, "markers");
     await plantTraps(s.ws, markers);
     await writeFile(join(s.ws, "add.mjs"), "export const add = 1;\n");
-    await runBounded("git", ["-C", s.ws, "add", "-A"], { env: { ...process.env, ...IDENT }, timeoutMs: 30_000 });
+    await runBounded("git", ["-C", s.ws, "add", "-A"], { env: fixEnv, timeoutMs: 30_000 });
     expect(existsSync(join(markers, "filter-clean"))).toBe(true);
   });
 
@@ -343,13 +352,13 @@ describe("runChecks", () => {
     const dir = join(tmp.dir, "v");
     await mkdir(dir);
     const t = taskWith([
-      { name: "cwd", argv: [process.execPath, "-e", "require('fs').writeFileSync('cwd.txt', process.cwd() + '|' + process.argv.slice(1).join('|'))", "a b", "$HOME;x"] },
+      { name: "cwd", argv: [process.execPath, "-e", "require('fs').writeFileSync('cwd.json', JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(1) }))", "a b", "$HOME;x"] },
     ]);
     const res = await runChecks(t, dir, null);
     expect(res[0]?.pass).toBe(true);
-    const [cwd, args] = (await readFile(join(dir, "cwd.txt"), "utf8")).split("|");
-    expect(await realpathOf(cwd as string)).toBe(await realpathOf(dir));
-    expect(args).toBe("a b");
+    const seen = JSON.parse(await readFile(join(dir, "cwd.json"), "utf8")) as { cwd: string; args: string[] };
+    expect(await realpathOf(seen.cwd)).toBe(await realpathOf(dir));
+    expect(seen.args).toEqual(["a b", "$HOME;x"]);
   });
 
   it("does not hand the controller's environment to the check", async () => {
@@ -385,6 +394,33 @@ describe("runChecks", () => {
     expect(alive).toBe(false);
   });
 
+  it("reports a check that cannot start as a canonical failed result plus one diagnostic (R80)", async () => {
+    const dir = join(tmp.dir, "v");
+    await mkdir(dir);
+    const t = taskWith([{ name: "missing", argv: [join(tmp.dir, "no-such-program")] }]);
+    const diagnostics: [string, string][] = [];
+    const res = await runChecks(t, dir, null, (name, message) => diagnostics.push([name, message]));
+    expect(res).toHaveLength(1);
+    const parsed = CheckResult.safeParse(res[0]);
+    expect(parsed.success).toBe(true);
+    expect(res[0]).toMatchObject({ name: "missing", pass: false, exitCode: null, timedOut: false });
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.[0]).toBe("missing");
+    expect(diagnostics[0]?.[1]).not.toBe("");
+  });
+
+  it.skipIf(!bwrap.ok)("runs sandboxed checks in the verify dir whatever cwd the spec carries", async () => {
+    const dir = join(tmp.dir, "v");
+    const other = join(tmp.dir, "other");
+    await mkdir(dir);
+    await mkdir(other);
+    await writeFile(join(dir, "only-in-verify.txt"), "v");
+    const spec: SandboxSpec = { hide: [], roBinds: [], rwBinds: [other], cwd: other, network: false };
+    const t = taskWith([{ name: "here", argv: [process.execPath, "-e", "process.exit(require('fs').existsSync('only-in-verify.txt') ? 0 : 6)"] }]);
+    const res = await runChecks(t, dir, spec);
+    expect(res.map((r) => [r.name, r.pass, r.exitCode])).toEqual([["here", true, 0]]);
+  });
+
   it.skipIf(!bwrap.ok)("runs under bubblewrap without network when given a sandbox spec", async () => {
     const dir = join(tmp.dir, "v");
     await mkdir(dir);
@@ -402,6 +438,21 @@ describe("runChecks", () => {
       ["net", true],
     ]);
     expect(await readFile(join(dir, "w.txt"), "utf8")).toBe("y");
+  });
+});
+
+describe("run directory modes", () => {
+  it.skipIf(win)("materialize and buildVerifyTree create runDir, scratch, base, ws and verify as 0700 under a permissive umask", async () => {
+    const old = process.umask(0o022);
+    try {
+      const s = await setup("modes");
+      await buildVerifyTree(s.base, s.ws, s.verify);
+      for (const d of [s.runDir, join(s.runDir, ".ctl-git"), s.base, s.ws, s.verify]) {
+        expect([d, (await stat(d)).mode & 0o777]).toEqual([d, 0o700]);
+      }
+    } finally {
+      process.umask(old);
+    }
   });
 });
 

@@ -6,10 +6,11 @@
 //
 // Nothing here runs git inside ws. Files are copied with lstat-based recursion: directories are recreated,
 // regular files copied, symlinks recreated from their readlink text (never followed), anything else skipped.
-import { copyFile, lstat, mkdir, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { controllerGit } from "./git-isolated.ts";
+import { ensurePrivateDir } from "./paths.ts";
 import { sandboxArgs, type SandboxSpec } from "./sandbox.ts";
 import type { LoadedTask } from "./tasks.ts";
 import { ProcessTeardownFailed, runBounded, type RunResult } from "../platform/process.ts";
@@ -102,11 +103,11 @@ export async function materialize(t: LoadedTask, runDir: string): Promise<Materi
   const base = join(runDir, "base");
   const ws = join(runDir, "ws");
   const scratch = scratchFor(base);
-  await mkdir(runDir, { recursive: true });
+  await ensurePrivateDir(runDir);
   if ((await lstatOrNull(base)) || (await lstatOrNull(ws))) throw new Error(`run directory already materialized: ${runDir}`);
-  await mkdir(scratch, { recursive: true });
+  await ensurePrivateDir(scratch);
   const git = (args: string[], cwd: string, env?: Record<string, string>) => controllerGit(args, { cwd, scratch, env });
-  await mkdir(base);
+  await ensurePrivateDir(base);
 
   const snap = t.task.snapshot;
   if (snap.kind === "dir") {
@@ -135,7 +136,7 @@ export async function materialize(t: LoadedTask, runDir: string): Promise<Materi
   await must("git commit", git(["commit", "-q", "--allow-empty", "--no-verify", "--no-gpg-sign", "-m", "factory eval snapshot"], base, COMMIT_ENV));
   const baseSha = (await must("git rev-parse", git(["rev-parse", "HEAD"], base))).stdout.trim();
 
-  await mkdir(ws);
+  await ensurePrivateDir(ws);
   await copyTree(base, ws, { skipGit: false }, { skippedSymlinks: 0, skippedSpecial: 0 });
   return { base, ws, baseSha };
 }
@@ -147,9 +148,10 @@ export async function materialize(t: LoadedTask, runDir: string): Promise<Materi
  */
 export async function buildVerifyTree(base: string, ws: string, verifyDir: string): Promise<CopyStats> {
   const scratch = scratchFor(verifyDir);
-  await mkdir(scratch, { recursive: true });
+  await ensurePrivateDir(scratch);
   await rm(verifyDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   await must("git clone", controllerGit(["clone", "--no-hardlinks", "-q", "--", base, verifyDir], { cwd: scratch, scratch }));
+  if (process.platform !== "win32") await chmod(verifyDir, 0o700);
   for (const name of await readdir(verifyDir)) {
     if (name !== ".git") await rm(join(verifyDir, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
@@ -164,7 +166,11 @@ export interface DiffStat {
   deletions: number;
 }
 
-/** What the agent changed against `baseSha`, `.eval/` excluded. Call it before `overlayChecks`. A binary file counts as one file, no lines. */
+/**
+ * What the agent changed against `baseSha`, `.eval/` excluded. A binary file counts as one file, no lines.
+ * Contract: measure the agent's changes, so call it BEFORE `overlayChecks`; after the overlay the withheld
+ * check files would be counted too (the orchestrator pins this order).
+ */
 export async function diffStat(verifyDir: string, baseSha: string): Promise<DiffStat> {
   const scratch = scratchFor(verifyDir);
   const git = (args: string[]) => controllerGit(args, { cwd: verifyDir, scratch });
@@ -202,8 +208,6 @@ export interface CheckResult {
   exitCode: number | null;
   timedOut: boolean;
   ms: number;
-  /** Set when the check could not be started at all (e.g. the program is missing). */
-  error?: string;
 }
 
 function checkEnv(): NodeJS.ProcessEnv {
@@ -214,25 +218,44 @@ function checkEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+const covers = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+
 /**
  * Runs each check's argv (no shell) in `verifyDir`, one at a time. With a sandbox spec the command runs
- * under `bwrap` with the network off; with `null` it runs directly (tests, hosts without bubblewrap).
- * The checks see a minimal environment, never the controller's.
+ * under `bwrap` with the network off and its cwd pinned to `verifyDir` (bound read-write if the spec does
+ * not already cover it, whatever cwd the spec carries); with `null` it runs directly (tests, hosts without
+ * bubblewrap). The checks see a minimal environment, never the controller's.
+ * Returns only canonical `CheckResult` objects: a check that cannot start is `exitCode: null, pass: false`
+ * and the reason goes to `onDiagnostic` (the caller redacts it before it is persisted).
  */
-export async function runChecks(t: LoadedTask, verifyDir: string, sandbox: SandboxSpec | null): Promise<CheckResult[]> {
+export async function runChecks(
+  t: LoadedTask,
+  verifyDir: string,
+  sandbox: SandboxSpec | null,
+  onDiagnostic?: (checkName: string, message: string) => void,
+): Promise<CheckResult[]> {
+  const pinned: SandboxSpec | null =
+    sandbox === null
+      ? null
+      : (() => {
+          const dir = resolve(verifyDir);
+          const rw = sandbox.rwBinds.map((p) => resolve(p));
+          return { ...sandbox, network: false, cwd: dir, rwBinds: rw.some((p) => covers(p, dir)) ? sandbox.rwBinds : [...sandbox.rwBinds, dir] };
+        })();
   const results: CheckResult[] = [];
   for (const check of t.task.checks) {
     const [cmd, ...args] = check.argv as [string, ...string[]];
     const started = Date.now();
     try {
       const r =
-        sandbox === null
+        pinned === null
           ? await runBounded(cmd, args, { cwd: verifyDir, env: checkEnv(), timeoutMs: check.timeoutSec * 1000 })
-          : await runBounded("bwrap", sandboxArgs({ ...sandbox, network: false }, cmd, args), { cwd: verifyDir, env: checkEnv(), timeoutMs: check.timeoutSec * 1000 });
+          : await runBounded("bwrap", sandboxArgs(pinned, cmd, args), { cwd: verifyDir, env: checkEnv(), timeoutMs: check.timeoutSec * 1000 });
       results.push({ name: check.name, pass: r.code === 0 && !r.timedOut, exitCode: r.code, timedOut: r.timedOut, ms: Date.now() - started });
     } catch (e) {
       if (e instanceof ProcessTeardownFailed) throw e;
-      results.push({ name: check.name, pass: false, exitCode: null, timedOut: false, ms: Date.now() - started, error: e instanceof Error ? e.message : String(e) });
+      results.push({ name: check.name, pass: false, exitCode: null, timedOut: false, ms: Date.now() - started });
+      onDiagnostic?.(check.name, e instanceof Error ? e.message : String(e));
     }
   }
   return results;

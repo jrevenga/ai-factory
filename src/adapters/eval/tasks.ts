@@ -19,11 +19,13 @@ export interface TaskRoot {
   source: TaskSource;
 }
 
+/** Whether `path` is a directory. Only a missing path counts as "no"; any other failure (e.g. EACCES) propagates with the path. */
 function isDir(path: string): boolean {
   try {
     return statSync(path).isDirectory();
-  } catch {
-    return false;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new Error(`${path}: cannot inspect: ${(e as Error).message}`, { cause: e });
   }
 }
 
@@ -82,16 +84,21 @@ function collect(dir: string, prefix: string, out: HashEntry[]): void {
     const abs = join(dir, name);
     const rel = prefix === "" ? name : `${prefix}/${name}`;
     const st = lstatSync(abs);
-    if (st.isSymbolicLink()) out.push({ rel, kind: "L", data: Buffer.from(readlinkSync(abs).replace(/\\/g, "/")) });
+    if (st.isSymbolicLink()) out.push({ rel, kind: "L", data: Buffer.from(readlinkSync(abs)) });
     else if (st.isDirectory()) collect(abs, rel, out);
     else if (st.isFile()) out.push({ rel, kind: "F", data: readFileSync(abs) });
   }
 }
 
 /**
- * sha256 over the entries of a tree sorted by POSIX relative path. Each entry is `relpath\0<bytes>` (a
- * symlink contributes its target text and is never followed; directories are implied), framed with a kind
- * tag and the byte length so that file boundaries cannot be confused with file content.
+ * sha256 over the entries of a tree sorted by POSIX relative path. A symlink contributes its target text,
+ * verbatim and never followed; directories are implied.
+ *
+ * Encoding (ruling R78, deliberately framed): each entry is `<kind><relpath>\0<byteLength>\0<bytes>` where
+ * kind is `F` (file) or `L` (symlink). The kind tag and the byte length frame every entry so that a file
+ * boundary cannot be confused with file content, which the unframed `relpath\0<bytes>` concatenation allows.
+ * The digest is only ever compared with another digest of this function (run manifest), never with an
+ * external hash.
  */
 export function hashTree(dir: string): string {
   if (!existsSync(dir)) throw new Error(`cannot hash a missing directory: ${dir}`);
