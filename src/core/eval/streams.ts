@@ -86,7 +86,7 @@ export function parseClaudeStream(text: string): ParsedStream {
       if (e.is_error === true || (e.subtype !== undefined && e.subtype !== "success")) {
         const sub = e.subtype !== "success" ? str(e.subtype) : null;
         const text = str(e.result);
-        out.error = sub !== null && text !== null && e.is_error === true ? `${sub}: ${text}` : (sub ?? text ?? "error");
+        out.error = sub !== null && text !== null ? `${sub}: ${text}` : (sub ?? text ?? "error");
       }
     }
   }

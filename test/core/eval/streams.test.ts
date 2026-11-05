@@ -151,6 +151,14 @@ describe("fix round 1 regressions", () => {
     expect(p.error).toBe("error_during_execution: Rate limit exceeded");
     expect(p.limitHit).toBe("claude");
   });
+  it("I2: a non-success subtype keeps its result text even without is_error", () => {
+    for (const isError of [undefined, false]) {
+      const line = JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: isError, result: "Rate limit exceeded" });
+      const p = parseClaudeStream(line);
+      expect(p.error).toBe("error_during_execution: Rate limit exceeded");
+      expect(p.limitHit).toBe("claude");
+    }
+  });
   it("I2: success subtype with is_error uses the result text", () => {
     const line = JSON.stringify({ type: "result", subtype: "success", is_error: true, result: "Usage limit reached" });
     const p = parseClaudeStream(line);
