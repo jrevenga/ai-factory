@@ -149,3 +149,5 @@ npx vitest run test/e2e/roundtrip.e2e.test.ts
 ```
 
 The last command is the install and update/rollback round-trip (CI workflow `e2e`). It builds its releases from the committed `HEAD`, so commit your changes before running it.
+
+`scripts/ci-local.sh [REF] [NODE_VERSION...]` runs the same steps as the `ci` and `e2e` workflows on a fresh clone of `REF` (default `HEAD`) for each Node version (default `22.19.0 24`, downloaded from nodejs.org and checksum-verified), in a directory whose name contains a space and with an empty global git config. Use it on Linux, macOS or Windows (Git Bash) when hosted CI is not available; it prints a pass/fail table and exits non-zero on any failure.

@@ -44,6 +44,8 @@ At every turn the orchestrator classifies the request before acting:
 - Prototypes, spikes and experiments go to a **disposable exploration worktree** (created on first need), where anything may be written. It is deleted at the end of the exploration unless the user wants to keep it, in which case it is promoted (§4).
 - Still gated as everywhere: destructive operations, publishing or mutating remote state, secrets (architecture §8.1).
 
+**Interim implementation until Phase 4 [owner]** (acknowledged 2026-11-05): Phases 2–3 ship without the exploration worktree, so the answer route is narrower than the list above. Only read tools, read-only commands and allowlisted runners run; every other command is denied, except destructive and remote-mutating commands, which ask as on every route. Reconciliation after a runner reverts every changed tracked or pre-existing untracked file, including a concurrent edit by the user, instead of reporting it as a conflict. Each replaced file is kept in the run's `reconcile/<toolCallId>/after/` directory and named in the tool result. Phase 4 restores the behaviour above.
+
 "I may stop and resume later" is not a request to stop; it is a hint to keep resumable state.
 
 ### 3.2 Announcement
