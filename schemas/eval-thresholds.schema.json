@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "passRatePp": {
+      "type": "number",
+      "minimum": 0
+    },
+    "usageReductionPct": {
+      "type": "number",
+      "minimum": 0
+    },
+    "secondary": {
+      "type": "object",
+      "properties": {
+        "escapedDefectsIncrease": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wallTimeIncreasePct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "usageIncreasePct": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "escapedDefectsIncrease",
+        "wallTimeIncreasePct",
+        "usageIncreasePct"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema",
+    "passRatePp",
+    "usageReductionPct",
+    "secondary"
+  ],
+  "additionalProperties": false
+}

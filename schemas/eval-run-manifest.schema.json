@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "v": {
+      "type": "number",
+      "const": 1
+    },
+    "evalRunId": {
+      "type": "string"
+    },
+    "createdAt": {
+      "type": "string"
+    },
+    "suite": {
+      "type": "string"
+    },
+    "profile": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "claude-codex",
+            "codex-only"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "contenders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "claude-code-superpowers",
+              "pi-bridge",
+              "codex",
+              "codex-superpowers",
+              "pi-codex",
+              "oracle",
+              "noop"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "claude",
+                  "codex"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "argvTemplate": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "envKeys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "model",
+          "provider",
+          "argvTemplate",
+          "envKeys"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "reps": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "seed": {
+      "type": "number"
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "answer",
+              "small",
+              "feature",
+              "project"
+            ]
+          },
+          "split": {
+            "type": "string",
+            "enum": [
+              "dev",
+              "heldout"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ]
+          },
+          "exposure": {
+            "type": "string",
+            "enum": [
+              "public",
+              "private"
+            ]
+          },
+          "snapshotSha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "taskSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "checksSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "solutionSha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "tier",
+          "split",
+          "source",
+          "exposure",
+          "snapshotSha",
+          "taskSha256",
+          "checksSha256",
+          "solutionSha256"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "pins": {
+      "type": "object",
+      "properties": {
+        "claude": {
+          "type": "string"
+        },
+        "codex": {
+          "type": "string"
+        },
+        "pi": {
+          "type": "string"
+        },
+        "bridge": {
+          "type": "string"
+        },
+        "superpowersCommit": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pi",
+        "bridge"
+      ],
+      "additionalProperties": false
+    },
+    "drift": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "factory": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "commit"
+      ],
+      "additionalProperties": false
+    },
+    "host": {
+      "type": "object",
+      "properties": {
+        "platform": {
+          "type": "string"
+        },
+        "bwrap": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "platform",
+        "bwrap"
+      ],
+      "additionalProperties": false
+    },
+    "thresholds": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "type": "number",
+          "const": 1
+        },
+        "passRatePp": {
+          "type": "number",
+          "minimum": 0
+        },
+        "usageReductionPct": {
+          "type": "number",
+          "minimum": 0
+        },
+        "secondary": {
+          "type": "object",
+          "properties": {
+            "escapedDefectsIncrease": {
+              "type": "number",
+              "minimum": 0
+            },
+            "wallTimeIncreasePct": {
+              "type": "number",
+              "minimum": 0
+            },
+            "usageIncreasePct": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "escapedDefectsIncrease",
+            "wallTimeIncreasePct",
+            "usageIncreasePct"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "schema",
+        "passRatePp",
+        "usageReductionPct",
+        "secondary"
+      ],
+      "additionalProperties": false
+    },
+    "confirms": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "v",
+    "evalRunId",
+    "createdAt",
+    "suite",
+    "profile",
+    "contenders",
+    "reps",
+    "seed",
+    "tasks",
+    "pins",
+    "drift",
+    "factory",
+    "host",
+    "thresholds",
+    "confirms"
+  ],
+  "additionalProperties": false
+}

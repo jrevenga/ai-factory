@@ -66,6 +66,13 @@ export const PersonalConfig = z.looseObject({
   gates: z.looseObject({ soften: z.array(openEnum(SOFT_GATES)).optional() }).optional(),
   budgets: z.record(z.string(), Budget).optional(),
   machine: z.record(z.string(), z.string()).optional(),
+  /** Evaluation harness settings (Phase 3): per-provider token budgets and the quota fraction at which a suite stops. */
+  eval: z
+    .looseObject({
+      tokenBudget: z.looseObject({ claude: z.number().optional(), codex: z.number().optional() }).optional(),
+      quotaStopAt: z.number().min(0).max(1).optional(),
+    })
+    .optional(),
 });
 export type PersonalConfig = z.infer<typeof PersonalConfig>;
 

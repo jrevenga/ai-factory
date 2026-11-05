@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "type": "number",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,62}$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "answer",
+        "small",
+        "feature",
+        "project"
+      ]
+    },
+    "split": {
+      "type": "string",
+      "enum": [
+        "dev",
+        "heldout"
+      ]
+    },
+    "suites": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "smoke",
+          "full",
+          "memory"
+        ]
+      }
+    },
+    "snapshot": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "dir"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "git"
+            },
+            "url": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ref": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          },
+          "required": [
+            "kind",
+            "url",
+            "ref"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "checks": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "argv": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "timeoutSec": {
+            "default": 300,
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1800
+          }
+        },
+        "required": [
+          "name",
+          "argv"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "rubric": {
+      "type": "string"
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "wallSec": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 7200
+        },
+        "maxTurns": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "wallSec"
+      ],
+      "additionalProperties": false
+    },
+    "gate": {
+      "default": {
+        "reply": "Proceed with your best judgment and complete the task without asking further questions.",
+        "maxContinuations": 3
+      },
+      "type": "object",
+      "properties": {
+        "reply": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maxContinuations": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        }
+      },
+      "required": [
+        "reply",
+        "maxContinuations"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema",
+    "id",
+    "title",
+    "tier",
+    "split",
+    "suites",
+    "snapshot",
+    "prompt",
+    "checks",
+    "budget"
+  ],
+  "additionalProperties": false
+}

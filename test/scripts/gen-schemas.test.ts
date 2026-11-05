@@ -9,6 +9,12 @@ describe("gen-schemas", () => {
   it("generates all schemas", () => {
     expect(Object.keys(generateSchemas()).sort()).toEqual([
       "check-record.schema.json",
+      "eval-contenders.schema.json",
+      "eval-run-manifest.schema.json",
+      "eval-run-record.schema.json",
+      "eval-task.schema.json",
+      "eval-thresholds.schema.json",
+      "eval-tools-lock.schema.json",
       "managed-settings.schema.json",
       "personal-config.schema.json",
       "profile.schema.json",
@@ -23,6 +29,6 @@ describe("gen-schemas", () => {
     expect(checkSchemas(resolve(root, "schemas"))).toEqual([]);
   });
   it("reports a stale directory", () => {
-    expect(checkSchemas(resolve(root, "test"))).toHaveLength(9);
+    expect(checkSchemas(resolve(root, "test"))).toHaveLength(15);
   });
 });

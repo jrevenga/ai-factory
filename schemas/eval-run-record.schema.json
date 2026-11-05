@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "v": {
+      "type": "number",
+      "const": 1
+    },
+    "evalRunId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "contender": {
+      "type": "string",
+      "enum": [
+        "claude-code",
+        "claude-code-superpowers",
+        "pi-bridge",
+        "codex",
+        "codex-superpowers",
+        "pi-codex",
+        "oracle",
+        "noop"
+      ]
+    },
+    "rep": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "startedAt": {
+      "type": "string"
+    },
+    "wallMs": {
+      "type": "number"
+    },
+    "exit": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "error",
+        "timeout",
+        "skipped-budget"
+      ]
+    },
+    "exitCode": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "turns": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "gatesHit": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "pass": {
+            "type": "boolean"
+          },
+          "exitCode": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "timedOut": {
+            "type": "boolean"
+          },
+          "ms": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "pass",
+          "exitCode",
+          "timedOut",
+          "ms"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "pass": {
+      "type": "boolean"
+    },
+    "escapedDefects": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "usage": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "output": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cacheRead": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cacheWrite": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "input",
+          "output",
+          "cacheRead",
+          "cacheWrite"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "usageMissing": {
+      "type": "boolean"
+    },
+    "quota": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "enum": [
+          "claude",
+          "codex"
+        ]
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "const": "known"
+              },
+              "utilization": {
+                "type": "number"
+              },
+              "window": {
+                "type": "string"
+              },
+              "resetsAt": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "state",
+              "utilization"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "const": "exhausted"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "type": "string",
+                "const": "unknown"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "diffStat": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "insertions": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "deletions": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "files",
+            "insertions",
+            "deletions"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reviewFindings": {
+      "type": "null"
+    },
+    "corrections": {
+      "type": "null"
+    },
+    "authWriteBack": {
+      "anyOf": [
+        {
+          "type": "string",
+          "enum": [
+            "unchanged",
+            "written",
+            "rejected"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "leakSuspect": {
+      "type": "boolean"
+    },
+    "errorSummary": {
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 500
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "v",
+    "evalRunId",
+    "taskId",
+    "contender",
+    "rep",
+    "startedAt",
+    "wallMs",
+    "exit",
+    "exitCode",
+    "turns",
+    "gatesHit",
+    "checks",
+    "pass",
+    "escapedDefects",
+    "usage",
+    "usageMissing",
+    "quota",
+    "diffStat",
+    "reviewFindings",
+    "corrections",
+    "authWriteBack",
+    "leakSuspect",
+    "errorSummary"
+  ],
+  "additionalProperties": false
+}

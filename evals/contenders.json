@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "claude": { "version": "2.1.318" },
+  "codex": { "version": "0.166.0" },
+  "superpowers": { "git": "https://github.com/obra/superpowers.git", "tag": "v7.0.0", "version": "7.0.0" }
+}

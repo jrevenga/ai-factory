@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { PersonalConfig, ProjectConfig } from "../src/core/config/schema.ts";
 import { CheckRecord, ReviewDisposition } from "../src/core/evidence/records.ts";
+import { ContenderPins, ToolsLock } from "../src/core/eval/contenders.ts";
+import { EvalRunManifest, EvalRunRecord } from "../src/core/eval/records.ts";
+import { EvalTask } from "../src/core/eval/task.ts";
+import { EvalThresholds } from "../src/core/eval/thresholds.ts";
 import { RunEvent } from "../src/core/ledger/events.ts";
 import { Profile } from "../src/core/profiles/schema.ts";
 import { ReleaseManifest } from "../src/core/release/manifest.ts";
@@ -21,6 +25,12 @@ const SOURCES: Record<string, z.ZodType> = {
   "run-event.schema.json": RunEvent,
   "check-record.schema.json": CheckRecord,
   "review-disposition.schema.json": ReviewDisposition,
+  "eval-task.schema.json": EvalTask,
+  "eval-run-record.schema.json": EvalRunRecord,
+  "eval-run-manifest.schema.json": EvalRunManifest,
+  "eval-thresholds.schema.json": EvalThresholds,
+  "eval-contenders.schema.json": ContenderPins,
+  "eval-tools-lock.schema.json": ToolsLock,
 };
 
 export function generateSchemas(): Record<string, string> {

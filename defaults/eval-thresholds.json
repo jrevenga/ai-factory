@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "passRatePp": 5,
+  "usageReductionPct": 15,
+  "secondary": {
+    "escapedDefectsIncrease": 0,
+    "wallTimeIncreasePct": 25,
+    "usageIncreasePct": 10
+  }
+}

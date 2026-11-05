@@ -87,6 +87,29 @@
       "additionalProperties": {
         "type": "string"
       }
+    },
+    "eval": {
+      "type": "object",
+      "properties": {
+        "tokenBudget": {
+          "type": "object",
+          "properties": {
+            "claude": {
+              "type": "number"
+            },
+            "codex": {
+              "type": "number"
+            }
+          },
+          "additionalProperties": {}
+        },
+        "quotaStopAt": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": {}
     }
   },
   "required": [
