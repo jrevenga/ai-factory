@@ -263,6 +263,17 @@ describe("sessionInterruptedRuns (Task 13, review M5)", () => {
     expect(sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A }, dead)).toEqual([]);
   });
 
+  it("picks the session's latest earlier run by run_start.ts, not by run id (same-second ids tie-break on pid text)", async () => {
+    const home = await factoryHome();
+    const dir = ledgerDirFor(home, PROJECT);
+    const older = "20261105T100000Z-900";
+    const newer = "20261105T100000Z-1000"; // lexically before `older`, but started later
+    for (const [id, ts] of [[older, "2026-11-05T10:00:00.100Z"], [newer, "2026-11-05T10:00:00.200Z"]] as const) {
+      new RunLedger(dir, id).append({ ...start(id, 4242), ts, piSession: A });
+    }
+    expect(sessionInterruptedRuns(home, PROJECT, SELF, { piSession: A }, dead).map((r) => r.runId)).toEqual([newer]);
+  });
+
   it("the run named by the last route entry is checked too (entries without a piSession match), and a live unmarked run is not interrupted", async () => {
     const home = await factoryHome();
     const dir = ledgerDirFor(home, PROJECT);

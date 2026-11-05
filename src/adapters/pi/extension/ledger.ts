@@ -268,8 +268,8 @@ function summarize(runId: string, events: RunEvent[]): InterruptedRun {
 /** A run id as `runIdFor` makes it (`<yyyymmddThhmmssZ>-<pid>`): anything else read from a session entry is ignored. */
 const RUN_ID = /^\d{8}T\d{6}Z-\d+$/;
 
-/** The `piSession` of a run's `run_start` (its first event), read from the first line only. */
-function piSessionOf(file: string): string | undefined {
+/** The `piSession` and start `ts` of a run's `run_start` (its first event), read from the first line only. */
+function runStartOf(file: string): { piSession?: string; ts: string } | undefined {
   let text: string;
   try {
     text = readFileSync(file, "utf8");
@@ -279,7 +279,7 @@ function piSessionOf(file: string): string | undefined {
   const nl = text.indexOf("\n");
   try {
     const first = parseRunEvent(JSON.parse(nl === -1 ? text : text.slice(0, nl)));
-    return first.known && first.event.type === "run_start" ? first.event.piSession : undefined;
+    return first.known && first.event.type === "run_start" ? { piSession: first.event.piSession, ts: first.event.ts } : undefined;
   } catch {
     return undefined;
   }
@@ -288,7 +288,7 @@ function piSessionOf(file: string): string | undefined {
 /**
  * Review M5 (Task 8, carry-forward Task 13): the interrupted earlier runs of *this* Pi session, independent of the
  * `interrupted.claim` marker (another session in the project may have claimed and reported them first). Two runs
- * are checked: the latest earlier run whose `run_start.piSession` is `piSession`, and `routeRunId`, the run that
+ * are checked: the latest earlier run (by `run_start.ts`, run id as tie-break) whose `run_start.piSession` is `piSession`, and `routeRunId`, the run that
  * wrote the session branch's last `factory-route` entry (when it names a run of this project). Either one counts
  * as interrupted when it has no `run_end` and is marked `run_interrupted` or its pid is not alive; an unreadable
  * ledger counts as interrupted too (the caller only flags the route, which fails safe). Nothing is written.
@@ -308,7 +308,13 @@ export function sessionInterruptedRuns(
     .sort();
   const candidates = new Set<string>();
   if (opts.piSession !== undefined && opts.piSession !== "") {
-    const latest = runIds.filter((r) => piSessionOf(new RunLedger(dir, r).file) === opts.piSession).at(-1);
+    // Latest by `run_start.ts` (run ids have one-second resolution, so same-second ids tie-break on pid text);
+    // the run id only breaks ts ties, and a run without a readable `run_start` sorts first (oldest).
+    const mine = runIds
+      .map((r) => ({ r, start: runStartOf(new RunLedger(dir, r).file) }))
+      .filter((x) => x.start?.piSession === opts.piSession)
+      .sort((a, b) => (a.start?.ts ?? "").localeCompare(b.start?.ts ?? "") || a.r.localeCompare(b.r));
+    const latest = mine.at(-1)?.r;
     if (latest !== undefined) candidates.add(latest);
   }
   if (opts.routeRunId !== undefined && RUN_ID.test(opts.routeRunId) && runIds.includes(opts.routeRunId)) candidates.add(opts.routeRunId);
