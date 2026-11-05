@@ -354,6 +354,14 @@ function gitPathOf(git: Git, top: string, name: string): string {
   return path.resolve(top, out);
 }
 
+/** The repository's common git dir (the main one for a linked worktree), without resolving symlinks below it. */
+function commonDirOf(git: Git, top: string): string {
+  const r = git(top, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const out = r.stdout.trim();
+  if (r.status !== 0 || out === "" || out.includes("\n") || out.startsWith("-")) throw new ReconcileRefusal(gitFailureText("git rev-parse --git-common-dir", r));
+  return path.resolve(top, out);
+}
+
 function objectFormatOf(git: Git, top: string): "sha1" | "sha256" {
   const r = git(top, ["rev-parse", "--show-object-format"]);
   return r.status === 0 && r.stdout.trim() === "sha256" ? "sha256" : "sha1";
@@ -403,6 +411,32 @@ const isIgnoreFile = (rel: string) => !rel.endsWith("/") && rel.split("/").at(-1
 /** The name `info/exclude` has in results, notes and the journal. */
 const INFO_EXCLUDE = "(.git/info/exclude)";
 
+/**
+ * R64: why `info/exclude` (`file`) cannot be trusted to lie in the repository, or undefined. Every directory from the
+ * work tree (for a linked worktree, from the parent of the common git dir) down to `info/` must be a real directory:
+ * a symlink or a Windows junction (both lstat as links) would send a read, write or delete elsewhere. A missing
+ * component is fine (the file is then missing too).
+ */
+function infoExcludeProblem(root: string, file: string): string | undefined {
+  const dir = path.dirname(file);
+  const rel = path.relative(root, dir);
+  const inside = rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  const base = inside ? root : path.dirname(path.dirname(dir));
+  let cur = base;
+  for (const part of path.relative(base, dir).split(path.sep).filter((x) => x !== "")) {
+    cur = path.join(cur, part);
+    let st;
+    try {
+      st = lstatSync(cur);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      return `${cur} cannot be inspected: ${(e as Error).message}`;
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) return `${cur} is not a real directory (a symlink, junction or file)`;
+  }
+  return undefined;
+}
+
 // --- Snapshot ---------------------------------------------------------------------------------------------------
 
 /** Read-only git against the backed-up index, never writing an optional lock or a refreshed index. */
@@ -450,7 +484,10 @@ function snapshotIn(git: Git, gitBytes: GitBytes, top: string, backupDir: string
   const env = readEnv(backupDir);
 
   // R60: the ignore rules outside the tracked files: info/exclude, and ignored `.gitignore` files git still reads.
-  const excludeFile = gitPathOf(git, top, "info/exclude");
+  // Built from the common git dir: `--git-path` prints the symlink-resolved path, which would hide a linked `info/`.
+  const excludeFile = path.join(commonDirOf(git, top), "info", "exclude");
+  const excludeProblem = infoExcludeProblem(top, excludeFile);
+  if (excludeProblem !== undefined) throw new ReconcileRefusal(`the ignore rules cannot be snapshotted: ${excludeProblem}`);
   const excludeKind = kindOf(excludeFile);
   if (excludeKind !== "missing" && excludeKind !== "file") throw new ReconcileRefusal(`${excludeFile} is not a regular file`);
   let excludeState: EntryState = { kind: "missing" };
@@ -930,6 +967,12 @@ class Restorer {
    * `after/info-exclude` first). Throws when it cannot: new files could not be judged under the snapshot's rules.
    */
   restoreInfoExclude(want: { file: string; state: EntryState }): void {
+    const problem = infoExcludeProblem(this.s.root, want.file);
+    if (problem !== undefined) {
+      // R64: neither read, written nor deleted; reported, so the result says the ignore rules were not reconciled.
+      this.result.notRestored.push(`${INFO_EXCLUDE} (ignore rules not reconciled, file left untouched: ${problem})`);
+      return;
+    }
     const curKind = kindOf(want.file);
     if (curKind !== "missing" && curKind !== "file") throw new Error(`${want.file} is not a regular file: the ignore rules cannot be restored`);
     const cur: EntryState = curKind === "missing" ? { kind: "missing" } : (() => {

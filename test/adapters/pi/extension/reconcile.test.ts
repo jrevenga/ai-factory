@@ -983,4 +983,36 @@ describe("R60: new files are judged under the snapshot's ignore rules", () => {
     expect(res.moved).toContain("secret-drop.txt");
     expect(res.reverted).toContain("(.git/info/exclude)");
   });
+
+  for (const snapshotHasExclude of [true, false]) {
+    it.skipIf(isWin)(`R64: .git/info replaced by a symlink is never followed (${snapshotHasExclude ? "overwrite" : "delete"}); the result says the ignore rules were not reconciled`, async () => {
+      const r = await repo();
+      const info = join(r.root, ".git", "info");
+      mkdirSync(info, { recursive: true });
+      const exclude = join(info, "exclude");
+      if (snapshotHasExclude) writeFileSync(exclude, "# snapshot rules\n");
+      else rmSync(exclude, { force: true });
+      const snap = takeSnapshot(r.root, r.backupDir());
+      const outside = join(r.dir, "outside-info");
+      mkdirSync(outside);
+      writeFileSync(join(outside, "exclude"), "outside rules\n");
+      rmSync(info, { recursive: true });
+      symlinkSync(outside, info);
+      const res = reconcileAfter(r.root, snap);
+      expect(read(join(outside, "exclude"))).toBe("outside rules\n");
+      expect(readdirSync(outside)).toEqual(["exclude"]);
+      expect(res.notRestored.some((x) => x.startsWith("(.git/info/exclude)") && x.includes("not reconciled"))).toBe(true);
+      expect(res.reverted).not.toContain("(.git/info/exclude)");
+    });
+  }
+
+  it.skipIf(isWin)("R64: a snapshot refuses when .git/info is a symlink", async () => {
+    const r = await repo();
+    const info = join(r.root, ".git", "info");
+    const outside = join(r.dir, "outside-info");
+    mkdirSync(outside);
+    rmSync(info, { recursive: true, force: true });
+    symlinkSync(outside, info);
+    expect(() => takeSnapshot(r.root, r.backupDir())).toThrow(/not a real directory/);
+  });
 });
