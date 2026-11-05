@@ -432,13 +432,24 @@ function realGitDirOf(file: string): { real: string } | { problem: string } | { 
  * real directory: a symlink or a Windows junction (both lstat as links) would send a read, write or delete elsewhere.
  * A missing component is fine (the file is then missing too). With `recordedReal` (restore time), the real path of the
  * git dir must also equal the one recorded at the snapshot, which catches any ancestor replaced by a link since; a
- * missing record or a git dir that cannot be resolved fails closed.
+ * missing record, a missing git dir or one that cannot be resolved fails closed; it is checked before the walk.
  */
 function infoExcludeProblem(root: string, file: string, recordedReal?: { value: string | undefined }): string | undefined {
   const dir = path.dirname(file);
   const rel = path.relative(root, dir);
   const inside = rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
   const base = inside ? root : path.dirname(path.dirname(dir));
+  // Restore time: the git dir's identity is checked first, so a missing component below cannot excuse a redirected
+  // ancestor (R65); a git dir that is gone since the snapshot fails closed.
+  if (recordedReal !== undefined) {
+    if (recordedReal.value === undefined) return "the snapshot did not record where the git directory really is";
+    const now = realGitDirOf(file);
+    if ("problem" in now) return now.problem;
+    if ("missing" in now) return `the git directory ${path.dirname(dir)} is missing since the snapshot`;
+    if (comparablePath(now.real) !== comparablePath(recordedReal.value)) {
+      return `the git directory moved since the snapshot (was ${recordedReal.value}, now ${now.real})`;
+    }
+  }
   let cur = base;
   const parts = ["", ...path.relative(base, dir).split(path.sep).filter((x) => x !== "")];
   for (const part of parts) {
@@ -451,14 +462,6 @@ function infoExcludeProblem(root: string, file: string, recordedReal?: { value: 
       return `${cur} cannot be inspected: ${(e as Error).message}`;
     }
     if (st.isSymbolicLink() || !st.isDirectory()) return `${cur} is not a real directory (a symlink, junction or file)`;
-  }
-  if (recordedReal !== undefined) {
-    if (recordedReal.value === undefined) return "the snapshot did not record where the git directory really is";
-    const now = realGitDirOf(file);
-    if ("problem" in now) return now.problem;
-    if ("real" in now && comparablePath(now.real) !== comparablePath(recordedReal.value)) {
-      return `the git directory moved since the snapshot (was ${recordedReal.value}, now ${now.real})`;
-    }
   }
   return undefined;
 }

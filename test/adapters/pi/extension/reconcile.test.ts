@@ -1029,6 +1029,24 @@ describe("R60: new files are judged under the snapshot's ignore rules", () => {
     expect(loadSnapshot(bd).status).not.toBe("done");
   });
 
+  it.skipIf(isWin)("N1: a redirected ancestor whose copy has no info/ is caught by the git dir identity before the walk; no outside exclude is created", async () => {
+    const r = await repo();
+    const wt = join(r.dir, "linked");
+    git(r.root, "worktree", "add", "-q", "-b", "side", wt);
+    mkdirSync(join(r.root, ".git", "info"), { recursive: true });
+    writeFileSync(join(r.root, ".git", "info", "exclude"), "# snapshot rules\n");
+    const bd = r.backupDir();
+    const snap = takeSnapshot(wt, bd);
+    const moved = join(r.dir, "project-moved");
+    const outside = join(r.dir, "outside-copy");
+    renameSync(r.root, moved);
+    mkdirSync(join(outside, ".git"), { recursive: true });
+    symlinkSync(outside, r.root);
+    expect(() => reconcileAfter(wt, snap)).toThrow(/git directory moved/);
+    expect(existsSync(join(outside, ".git", "info"))).toBe(false);
+    expect(loadSnapshot(bd).status).not.toBe("done");
+  });
+
   it.skipIf(isWin)("R64: a snapshot refuses when .git/info is a symlink", async () => {
     const r = await repo();
     const info = join(r.root, ".git", "info");
