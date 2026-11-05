@@ -37,8 +37,10 @@ afterAll(() => {
   vi.unstubAllEnvs();
 });
 
+/** No automatic maintenance: its detached run holds `objects/maintenance.lock` and makes object-store comparisons racy. */
 function git(cwd: string, ...args: string[]): string {
-  return execFileSync("git", ["-c", "init.defaultBranch=main", "-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", ...args], {
+  const noMaintenance = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+  return execFileSync("git", ["-c", "init.defaultBranch=main", "-c", "user.name=Factory Test", "-c", "user.email=factory-test@example.invalid", ...noMaintenance, ...args], {
     cwd,
     encoding: "utf8",
     env: GIT_ENV,
