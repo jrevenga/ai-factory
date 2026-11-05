@@ -209,6 +209,7 @@ describe("main update/rollback", () => {
       expect(await main(["rollback", `v${RELEASE}`, "--yes"], r.io, { env: w.env, releaseDeps: w.ctx().deps }), r.err.join("\n")).toBe(0);
       expect(w.log).toContain(`clone v${RELEASE}`);
       expect(w.log.at(-1)).toMatch(/_apply-release --reason rollback --from \d+\.\d+\.\d+ --parent-lock \d+ --yes$/);
+      expect(w.log.at(-1)).toContain(`--reason rollback --from ${NEWER} --parent-lock `);
     } finally {
       await w.cleanup();
     }
