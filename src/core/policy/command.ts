@@ -123,6 +123,8 @@ interface Verdict {
   absentPaths?: string[];
   logicalPaths?: string[];
   trackedContent?: boolean;
+  /** R64: the git grammar parsed both `--no-ext-diff` and `--no-textconv` as options (not as values or after `--`). */
+  diffHelpersOff?: boolean;
 }
 
 const readOnly = (reason: string): Verdict => ({ class: "read-only", allowlisted: true, reasons: [reason], pathArgs: [] });
@@ -536,6 +538,7 @@ function classifyGitRead(sub: string, rest: readonly string[], g: R.Grammar): Ve
     ...factFields(r.facts),
     ...(logical.length > 0 ? { logicalPaths: logical } : {}),
     ...(content ? { trackedContent: true } : {}),
+    ...(opts.includes("--no-ext-diff") && opts.includes("--no-textconv") ? { diffHelpersOff: true } : {}),
   };
 }
 
@@ -986,11 +989,10 @@ function classifySegment(seg: Segment, ctx: CommandContext): Verdict & { inputPa
     const name = commandName(argv0);
     v = name === undefined ? unknown("empty command word") : classifyByName(name, seg.argv.slice(1));
     if (name === "git" && v.class === "read-only" && ctx.gitHelpers !== undefined) {
-      const args = seg.argv.slice(1);
       const h = ctx.gitHelpers;
       if (h.fsmonitor) {
         v = { ...v, class: "unknown", allowlisted: false, reasons: ["git is configured with a core.fsmonitor program that read commands would run (R58)"] };
-      } else if (h.diff && !(args.includes("--no-ext-diff") && args.includes("--no-textconv"))) {
+      } else if (h.diff && v.diffHelpersOff !== true) {
         v = {
           ...v,
           class: "unknown",

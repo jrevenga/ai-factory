@@ -261,6 +261,9 @@ describe("configured git helpers (R58)", () => {
       expect(decide("git diff --no-textconv HEAD", w, ctx).decision).not.toBe("allow");
       expect(decide("git diff --no-ext-diff --no-textconv HEAD", w, ctx).decision).toBe("allow");
       expect(decide("git status", w, ctx).decision).not.toBe("allow");
+      // The disabling flags count only when git parses them as options (R64).
+      expect(decide("git diff --src-prefix --no-ext-diff --dst-prefix --no-textconv document.pdf", w, ctx).decision).not.toBe("allow");
+      expect(decide("git diff -- --no-ext-diff --no-textconv", w, ctx).decision).not.toBe("allow");
     }
     expect(decide("git diff HEAD", w, small).decision).toBe("ask");
     expect(decide("git diff HEAD", w, answer).decision).toBe("deny");
